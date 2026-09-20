@@ -4,3 +4,4 @@ data/*.sqlite-wal
 data/*.sqlite-shm
 .env
 *.log
+data/family.json
