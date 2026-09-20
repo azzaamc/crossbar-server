@@ -1,0 +1,36 @@
+{
+  "users": [
+    {
+      "id": "abdullah",
+      "tailscaleLogin": "abdullah@dev",
+      "displayName": "Abdullah",
+      "relationship": "Me",
+      "avatar": ""
+    },
+    {
+      "id": "dad",
+      "tailscaleLogin": "dad@dev",
+      "displayName": "Dad",
+      "relationship": "Father",
+      "avatar": ""
+    },
+    {
+      "id": "mum",
+      "tailscaleLogin": "mum@dev",
+      "displayName": "Mum",
+      "relationship": "Mother",
+      "avatar": ""
+    }
+  ],
+  "contacts": [
+    { "ownerId": "abdullah", "contactId": "dad", "sortOrder": 1 },
+    { "ownerId": "abdullah", "contactId": "mum", "sortOrder": 2 },
+    { "ownerId": "dad", "contactId": "abdullah", "sortOrder": 1 },
+    { "ownerId": "dad", "contactId": "mum", "sortOrder": 2 },
+    { "ownerId": "mum", "contactId": "abdullah", "sortOrder": 1 },
+    { "ownerId": "mum", "contactId": "dad", "sortOrder": 2 }
+  ],
+  "groups": [
+    { "id": "family", "displayName": "Family", "memberIds": ["abdullah", "dad", "mum"] }
+  ]
+}

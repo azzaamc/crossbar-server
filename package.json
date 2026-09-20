@@ -1,0 +1,23 @@
+{
+  "name": "crossbar-server",
+  "version": "0.1.0",
+  "description": "The Crossbar server: identity, calls, and signalling for the family calling app.",
+  "main": "src/server.js",
+  "directories": {
+    "test": "test"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "node --test"
+  },
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "web-push": "^3.6.7",
+    "ws": "^8.21.3"
+  },
+  "private": true,
+  "engines": {
+    "node": ">=22.5.0"
+  }
+}

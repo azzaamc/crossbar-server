@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Crossbar call</title>
+  <link rel="stylesheet" href="/call/call.css">
+</head>
+<body>
+  <main class="stage" id="stage">
+    <div class="tiles" id="tiles"></div>
+    <section class="status" id="status" aria-live="polite">
+      <p class="status-headline" id="status-headline">Connecting…</p>
+      <p class="status-detail" id="status-detail"></p>
+    </section>
+  </main>
+
+  <footer class="controls" id="controls">
+    <button id="toggle-mute" class="control" type="button" aria-pressed="false">
+      <span class="glyph" aria-hidden="true">●</span><span>Mute</span>
+    </button>
+    <button id="toggle-camera" class="control" type="button" aria-pressed="false">
+      <span class="glyph" aria-hidden="true">▣</span><span>Camera</span>
+    </button>
+    <button id="end" class="control danger" type="button">
+      <span class="glyph" aria-hidden="true">✕</span><span>End</span>
+    </button>
+  </footer>
+
+  <script src="/call/call.js"></script>
+</body>
+</html>
