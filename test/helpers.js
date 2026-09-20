@@ -45,6 +45,7 @@ function baseConfig(dataDir, familyConfigPath, overrides = {}) {
         familyConfigPath,
         webRoot: path.join(__dirname, '..', 'public'),
         trustTailscaleHeaders: true,
+        autoEnrolIdentities: true,
         allowDevIdentity: true,
         devIdentities: DEV_USERS,
         callRingSeconds: 90,

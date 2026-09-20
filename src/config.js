@@ -87,6 +87,10 @@ function loadConfig() {
 
         // Identity
         trustTailscaleHeaders: bool('TRUST_TAILSCALE_HEADERS', true),
+        // A login that arrives from the tailnet is enrolled on first sight, which is
+        // what the service this replaces did. Turn it off to require every member to
+        // be written into the household file first.
+        autoEnrolIdentities: bool('AUTO_ENROL_IDENTITIES', true),
         allowDevIdentity,
         devIdentities: text('DEV_IDENTITIES', '')
             .split(',')

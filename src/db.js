@@ -206,16 +206,37 @@ class Store {
     }
 
     /**
-     * Records a trusted authentication and returns the user. A login that is in the
-     * file is enrolled on first sight; a login that is not is refused, because
-     * otherwise anyone who joins the tailnet becomes callable family.
+     * Records a trusted authentication and returns the user.
+     *
+     * Two ways to become a member:
+     *
+     * * an entry in the household file pins a person's id, name and avatar before
+     *   they have ever signed in — which is what gives them a stable identity in
+     *   everyone else's directory;
+     * * with `autoEnrol` (the default, and what the service this replaces did), a
+     *   login that arrives from the tailnet is enrolled on first sight under a
+     *   derived id.
+     *
+     * Auto-enrolment means the tailnet is the perimeter: anyone who can reach this
+     * listener has already passed Tailscale's own admission, and the alternative —
+     * requiring every device's login to be written into a file first — is how a
+     * household ends up with members who cannot call anybody because nobody
+     * updated the file. Set `AUTO_ENROL_IDENTITIES=false` to require the file.
      */
-    observeIdentity(identity, now) {
+    observeIdentity(identity, now, { autoEnrol = true } = {}) {
         const login = String(identity.login || '').trim().toLowerCase();
         if (!login) throw new Error('A login is required');
         const displayName = identityDisplayName(identity.name, login);
         const avatar = safeAvatar(identity.profilePic);
+
         let existing = this.userByLogin(login);
+        if (!existing) {
+            const row = this.db.prepare(
+                'SELECT id FROM users WHERE tailscale_login = ? COLLATE NOCASE',
+            ).get(login);
+            if (row) existing = { id: row.id };
+        }
+        if (!existing && !autoEnrol) return null;
 
         this.transaction(() => {
             if (existing) {
@@ -226,16 +247,14 @@ class Store {
                     WHERE id = ?
                 `).run(displayName, avatar, avatar, now, now, identity.source || 'tailscale', existing.id);
             } else {
-                const configured = this.db.prepare(
-                    'SELECT id FROM users WHERE tailscale_login = ? COLLATE NOCASE',
-                ).get(login);
-                if (!configured) return; // unknown login: not enrolled, nothing recorded
-                existing = { id: configured.id };
+                const id = `ts_${crypto.createHash('sha256').update(login).digest('hex').slice(0, 24)}`;
                 this.db.prepare(`
-                    UPDATE users SET display_name = ?, avatar = ?, first_seen_at = ?,
-                      last_authenticated_at = ?, identity_source = ?
-                    WHERE id = ?
-                `).run(displayName, avatar, now, now, identity.source || 'tailscale', existing.id);
+                    INSERT INTO users
+                      (id, tailscale_login, display_name, relationship, avatar, enabled,
+                       first_seen_at, last_authenticated_at, identity_source)
+                    VALUES (?, ?, ?, '', ?, 1, ?, ?, ?)
+                `).run(id, login, displayName, avatar, now, now, identity.source || 'tailscale');
+                existing = { id };
             }
 
             // Everyone who has actually signed in becomes mutually discoverable.

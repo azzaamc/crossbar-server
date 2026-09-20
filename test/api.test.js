@@ -53,10 +53,20 @@ test('a request with no trusted identity is refused', async (t) => {
     assert.equal(bootstrap.data.error.code, 'IDENTITY_MISSING');
 });
 
-test('an identity that is not part of the household is refused, not enrolled', async (t) => {
-    // Trusted by the tailnet (here: allowed by the development identity list) but
-    // absent from the household file.
+test('a login the household file pins is the identity that person gets', async (t) => {
+    const { server, base } = await startTestServer();
+    t.after(() => server.close());
+
+    const session = await api(base, 'dad@dev', '/api/session');
+    assert.equal(session.data.authenticated, true);
+    assert.equal(session.data.configured, true);
+    assert.equal(session.data.user.id, 'dad', 'the configured id, not a derived one');
+    assert.equal(session.data.user.displayName, 'Dad');
+});
+
+test('with auto-enrolment off, an unknown login is refused rather than enrolled', async (t) => {
     const { server, base } = await startTestServer({
+        autoEnrolIdentities: false,
         devIdentities: ['abdullah@dev', 'dad@dev', 'mum@dev', 'stranger@dev'],
     });
     t.after(() => server.close());
@@ -66,8 +76,26 @@ test('an identity that is not part of the household is refused, not enrolled', a
     assert.equal(stranger.data.error.code, 'IDENTITY_NOT_ENROLLED');
 
     const session = await api(base, 'stranger@dev', '/api/session');
-    assert.equal(session.data.authenticated, true, 'the tailnet identity is trusted');
+    assert.equal(session.data.authenticated, true, 'the identity is trusted');
     assert.equal(session.data.configured, false, 'but it is not a member of this household');
+});
+
+test('with auto-enrolment on, a new tailnet login joins and becomes discoverable', async (t) => {
+    const { server, base } = await startTestServer({
+        devIdentities: ['abdullah@dev', 'dad@dev', 'mum@dev', 'newphone@dev'],
+    });
+    t.after(() => server.close());
+
+    await api(base, 'abdullah@dev', '/api/session');
+    const enrolled = await api(base, 'newphone@dev', '/api/session');
+    assert.equal(enrolled.data.configured, true, 'the tailnet is the perimeter');
+    assert.match(enrolled.data.user.id, /^ts_[0-9a-f]{24}$/, 'enrolled under a derived id');
+
+    const abdullahsView = await api(base, 'abdullah@dev', '/api/bootstrap');
+    assert.ok(
+        abdullahsView.data.contacts.some((contact) => contact.id === enrolled.data.user.id),
+        'and is now in the directory of everyone who has signed in',
+    );
 });
 
 test('bootstrap carries the directory, the groups and the calls of the person asking', async (t) => {

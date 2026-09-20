@@ -77,7 +77,9 @@ function createRequestHandler({ config, store, bus, push, lifecycle, log, client
     function currentUser(req) {
         const identity = resolveIdentity(req, config);
         if (!identity) return { identity: null, user: null };
-        const user = store.observeIdentity(identity, new Date().toISOString());
+        const user = store.observeIdentity(identity, new Date().toISOString(), {
+            autoEnrol: config.autoEnrolIdentities,
+        });
         return { identity, user };
     }
 
