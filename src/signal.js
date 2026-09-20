@@ -257,6 +257,8 @@ function createSignalServer({ config, store, log, onAdmitted, onClosed }) {
         }
 
         const room = rooms.get(session.room);
+        // The end of a peer's candidates has nothing to forward and no target.
+        if (relay.endOfCandidates) return;
         const target = room?.get(relay.peerId);
         // Scoped to the sender's own call: an id from anywhere else is refused and
         // the sender is told nothing, so probing learns nothing.

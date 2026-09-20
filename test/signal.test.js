@@ -334,6 +334,34 @@ test('with self-calls enabled, a person can ring their own other devices', async
     assert.equal(toLaptop.payload.should_create_offer, true, 'the second device offers');
 });
 
+test('the end of a peer candidates is accepted and ignored, not counted against it', async (t) => {
+    // WebKit marks the end of its candidates with an RTCIceCandidate whose
+    // `candidate` string is empty, rather than a null candidate. Treating that as
+    // malformed would, after ten of them, close a connection that is working.
+    const { server, base } = await startTestServer();
+    t.after(() => server.close());
+    const { first, second } = await joinedPair(base);
+    t.after(() => {
+        first.close();
+        second.close();
+    });
+
+    for (let i = 0; i < 12; i += 1) {
+        second.emit('relayICE', { peer_id: first.sid, ice_candidate: { sdpMLineIndex: 0, candidate: '' } });
+    }
+    await new Promise((resolve) => setTimeout(resolve, 250));
+
+    assert.equal(first.received('iceCandidate').length, 0, 'an end-of-candidates is not forwarded');
+    assert.equal(second.closed, false, 'and well past the malformed budget the socket is still open');
+
+    second.emit('relayICE', {
+        peer_id: first.sid,
+        ice_candidate: { sdpMLineIndex: 0, candidate: 'candidate:1 1 UDP 1 127.0.0.1 1 typ host' },
+    });
+    const delivered = await first.waitForEvent('iceCandidate');
+    assert.equal(delivered.payload.peer_id, second.sid, 'a real candidate still gets through');
+});
+
 test('a departing peer is announced to the peers left behind', async (t) => {
     const { server, base } = await startTestServer();
     t.after(() => server.close());

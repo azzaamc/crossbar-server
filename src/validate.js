@@ -88,13 +88,21 @@ function validateRelaySdp(payload, { maxSdpBytes }) {
     };
 }
 
-/** `relayICE` — a single trickled candidate. */
+/** `relayICE` — a single trickled candidate, or the end of them. */
 function validateRelayIce(payload, { maxIceBytes }) {
     if (!isPlainObject(payload)) throw new Invalid('payload_not_an_object');
     const candidate = payload.ice_candidate;
     if (!isPlainObject(candidate)) throw new Invalid('ice_candidate_missing');
     const value = candidate.candidate;
-    if (typeof value !== 'string' || !value) throw new Invalid('candidate_missing');
+
+    // An absent or empty candidate string is how a browser marks the end of its
+    // candidates — WebKit sends an `RTCIceCandidate` with `candidate: ''` rather
+    // than null. That is a legal, expected message and a no-op, not a malformed
+    // one; counting it as malformed would eventually close a healthy connection.
+    if (value === undefined || value === null || (typeof value === 'string' && value.trim() === '')) {
+        return { peerId: requireString(payload, 'peer_id', { max: 64 }), endOfCandidates: true };
+    }
+    if (typeof value !== 'string') throw new Invalid('candidate_not_a_string');
     if (value.length > maxIceBytes) throw new Invalid('candidate_too_long');
     if (!value.startsWith('candidate:')) throw new Invalid('candidate_not_a_candidate');
     const index = candidate.sdpMLineIndex ?? 0;

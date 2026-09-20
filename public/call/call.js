@@ -254,7 +254,10 @@ async function handleAddPeer(payload) {
     for (const track of state.localStream.getTracks()) pc.addTrack(track, state.localStream);
 
     pc.onicecandidate = (event) => {
-        if (!event.candidate) return;
+        // `event.candidate` is null for the end of candidates, but WebKit sends an
+        // object whose `candidate` string is empty instead — neither is worth a
+        // message to the server.
+        if (!event.candidate || !event.candidate.candidate) return;
         emit('relayICE', {
             peer_id: peerId,
             ice_candidate: {
