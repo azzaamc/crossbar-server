@@ -35,15 +35,19 @@ function createRequestHandler({ config, store, bus, push, lifecycle, log, client
 
     function securityHeaders(contentType = '') {
         const headers = {
+            // `frame-ancestors 'self'` rather than 'none': the PWA loads the call
+            // client in its call frame, and both are served from this origin. `self`
+            // still refuses every other site, which is the protection that matters.
             'content-security-policy':
                 `default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: https:; `
                 + `connect-src 'self' ${websocketOrigin}; frame-src 'self'; media-src 'self' blob:; `
-                + `object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'`,
+                + `object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'self'`,
             'cross-origin-opener-policy': 'same-origin-allow-popups',
             'permissions-policy': 'camera=(self), microphone=(self), display-capture=(self)',
             'referrer-policy': 'no-referrer',
             'x-content-type-options': 'nosniff',
-            'x-frame-options': 'DENY',
+            // The legacy spelling of the same rule, for anything that does not read CSP.
+            'x-frame-options': 'SAMEORIGIN',
         };
         if (contentType) headers['content-type'] = contentType;
         return headers;
