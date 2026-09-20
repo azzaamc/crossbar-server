@@ -290,7 +290,51 @@ test('a device that reconnects replaces its own previous connection', async (t) 
     assert.equal(arrival.payload.should_create_offer, false);
 });
 
-test('a departure is announced to the peers left behind', async (t) => {
+test('inviting yourself is refused unless self-calls are enabled', async (t) => {
+    const { server, base } = await startTestServer();
+    t.after(() => server.close());
+    await enrol(base, 'abdullah@dev');
+
+    const refused = await api(base, 'abdullah@dev', '/api/calls', {
+        method: 'POST',
+        body: { inviteeIds: ['abdullah'] },
+    });
+    assert.equal(refused.status, 400);
+    assert.equal(refused.data.error.code, 'INVALID_INVITEES');
+});
+
+test('with self-calls enabled, a person can ring their own other devices', async (t) => {
+    // One Tailscale account means every device of one person presents the same
+    // identity, so this is the only way to place a call between two of them.
+    const { server, base } = await startTestServer({ allowSelfCalls: true });
+    t.after(() => server.close());
+    await enrol(base, 'abdullah@dev');
+
+    const created = await createCall(base, 'abdullah@dev', ['abdullah']);
+    assert.equal(created.call.status, 'active', 'nobody to ring, so there is nothing to wait for');
+    assert.equal(created.call.participants.length, 1, 'the caller is the only participant');
+    const room = new URL(created.joinUrl).searchParams.get('room');
+
+    const other = await api(base, 'abdullah@dev', '/api/bootstrap');
+    assert.equal(other.data.ongoingCalls.length, 1, 'the second device finds it and can join');
+
+    const phone = await TestPeer.connect(base, 'abdullah@dev', { deviceId: 'device-aaaaaaaa' });
+    const laptop = await TestPeer.connect(base, 'abdullah@dev', { deviceId: 'device-bbbbbbbb' });
+    t.after(() => {
+        phone.close();
+        laptop.close();
+    });
+    await phone.join({ channel: room, peerName: 'Abdullah' });
+    await laptop.join({ channel: room, peerName: 'Abdullah' });
+
+    const toPhone = await phone.waitForEvent('addPeer');
+    assert.equal(toPhone.payload.peer_id, laptop.sid);
+    assert.equal(toPhone.payload.should_create_offer, false);
+    const toLaptop = await laptop.waitForEvent('addPeer');
+    assert.equal(toLaptop.payload.should_create_offer, true, 'the second device offers');
+});
+
+test('a departing peer is announced to the peers left behind', async (t) => {
     const { server, base } = await startTestServer();
     t.after(() => server.close());
     const { first, second } = await joinedPair(base);

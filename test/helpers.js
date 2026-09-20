@@ -50,6 +50,7 @@ function baseConfig(dataDir, familyConfigPath, overrides = {}) {
         devIdentities: DEV_USERS,
         callRingSeconds: 90,
         maxParticipants: 4,
+        allowSelfCalls: false,
         signalPath: '/socket.io/',
         messageBytes: 131072,
         sdpBytes: 65536,

@@ -98,9 +98,37 @@ function createLifecycle({ config, store, bus, push, log }) {
     function createCall({ user, inviteeIds, deviceId, kind = 'video' }) {
         if (!limiter.take(`${user.id}:create`, 6, 60000)) return { ok: false, reason: 'RATE_LIMITED' };
         const ids = validIds(inviteeIds);
-        if (!ids || ids.includes(user.id)) return { ok: false, reason: 'INVALID_INVITEES' };
-        const allowed = store.allowedContacts(user.id, ids);
-        if (allowed.length !== ids.length) return { ok: false, reason: 'CONTACT_NOT_ALLOWED' };
+        if (!ids) return { ok: false, reason: 'INVALID_INVITEES' };
+
+        // Including yourself is how a person rings their own other devices — the
+        // phone ringing the laptop. It is off unless the operator turns it on,
+        // because a call nobody else can answer is not a call.
+        const others = ids.filter((id) => id !== user.id);
+        if (others.length !== ids.length && !config.allowSelfCalls) {
+            return { ok: false, reason: 'INVALID_INVITEES' };
+        }
+
+        if (!others.length) {
+            const callId = crypto.randomUUID();
+            const call = store.createCall({
+                id: callId,
+                roomId: crypto.randomUUID(),
+                callerId: user.id,
+                deviceId,
+                inviteeIds: [],
+                kind,
+                // Nobody to ring, so there is nothing to wait for: the call is up
+                // and the person's other devices can join it.
+                status: 'active',
+                now: now(),
+            });
+            announceOngoing(call);
+            log.info('call_created', { callId, callerId: user.id, inviteeIds: [], deviceId: deviceId || null, self: true });
+            return { ok: true, call, allowed: [] };
+        }
+
+        const allowed = store.allowedContacts(user.id, others);
+        if (allowed.length !== others.length) return { ok: false, reason: 'CONTACT_NOT_ALLOWED' };
 
         const callId = crypto.randomUUID();
         const roomId = crypto.randomUUID();
@@ -109,14 +137,14 @@ function createLifecycle({ config, store, bus, push, log }) {
             roomId,
             callerId: user.id,
             deviceId,
-            inviteeIds: ids,
+            inviteeIds: others,
             kind,
             now: now(),
         });
 
         for (const invitee of allowed) bus.emit(invitee.id, 'incoming-call', publicCall(call));
-        void pushIncoming(call, ids).catch((error) => log.warn('push_failed', { message: String(error.message).slice(0, 120) }));
-        log.info('call_created', { callId, callerId: user.id, inviteeIds: ids, deviceId: deviceId || null });
+        void pushIncoming(call, others).catch((error) => log.warn('push_failed', { message: String(error.message).slice(0, 120) }));
+        log.info('call_created', { callId, callerId: user.id, inviteeIds: others, deviceId: deviceId || null });
         return { ok: true, call, allowed };
     }
 

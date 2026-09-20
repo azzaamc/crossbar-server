@@ -100,6 +100,10 @@ function loadConfig() {
         // Call behaviour
         callRingSeconds: integer('CALL_RING_SECONDS', 90, 30, 300),
         maxParticipants: integer('MAX_PARTICIPANTS', 4, 2, 8),
+        // Ringing your own other devices. Off by default: a call with only you in
+        // it is not a call, and a household that never needs it should not be able
+        // to create one by accident.
+        allowSelfCalls: bool('ALLOW_SELF_CALLS', false),
 
         // Signalling
         signalPath: text('SIGNAL_PATH', '/socket.io/'),

@@ -361,19 +361,24 @@ class Store {
 
     // ── Calls ───────────────────────────────────────────────────────────────────
 
-    createCall({ id, roomId, callerId, deviceId, inviteeIds, kind = 'video', now }) {
+    createCall({ id, roomId, callerId, deviceId, inviteeIds, kind = 'video', status = 'ringing', now }) {
         this.transaction(() => {
             this.db.prepare(`
-                INSERT INTO calls (id, room_id, caller_user_id, status, kind, created_at)
-                VALUES (?, ?, ?, 'ringing', ?, ?)
-            `).run(id, roomId, callerId, kind, now);
+                INSERT INTO calls (id, room_id, caller_user_id, status, kind, created_at, answered_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            `).run(id, roomId, callerId, status, kind, now, status === 'active' ? now : null);
             const insert = this.db.prepare(`
                 INSERT INTO call_participants
                   (call_id, user_id, invited_by_user_id, status, invited_at, responded_at, joined_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
             `);
             insert.run(id, callerId, callerId, 'accepted', now, now, now);
-            for (const inviteeId of inviteeIds) insert.run(id, inviteeId, callerId, 'invited', now, null, null);
+            // The caller is already in the call; an invitation to themselves is not
+            // a second participant.
+            for (const inviteeId of inviteeIds) {
+                if (inviteeId === callerId) continue;
+                insert.run(id, inviteeId, callerId, 'invited', now, null, null);
+            }
             if (deviceId) {
                 this.db.prepare(`
                     INSERT OR REPLACE INTO call_devices (call_id, device_id, user_id, joined_at, left_at)
