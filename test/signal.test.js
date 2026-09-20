@@ -73,6 +73,33 @@ test('knowing a room name that does not exist gets nowhere', async (t) => {
     assert.equal(refusal.payload.reason, 'room_not_found');
 });
 
+test('the caller reaching the room does not answer the call', async (t) => {
+    const { server, base } = await startTestServer();
+    t.after(() => server.close());
+    await enrol(base, 'abdullah@dev', 'dad@dev');
+    const created = await createCall(base, 'abdullah@dev', ['dad'], { deviceId: 'device-aaaaaaaa' });
+    const room = new URL(created.joinUrl).searchParams.get('room');
+
+    // The caller is `accepted` from the moment the call exists, so this join is
+    // admitted. It is also the moment the call used to be marked answered — with
+    // Dad's phone still ringing and nobody at the other end — which is what the
+    // caller then reported to CallKit as a connected call.
+    const caller = await TestPeer.connect(base, 'abdullah@dev', { deviceId: 'device-aaaaaaaa' });
+    t.after(() => caller.close());
+    await caller.join({ channel: room, peerName: 'Abdullah' });
+    await caller.waitForEvent('serverInfo');
+
+    const ringing = await api(base, 'abdullah@dev', `/api/calls/${created.call.id}`);
+    assert.equal(ringing.data.call.status, 'ringing', 'the room is occupied by the caller alone');
+    assert.equal(ringing.data.call.answeredAt, null, 'nobody has answered');
+
+    await accept(base, 'dad@dev', created.call.id);
+
+    const answered = await api(base, 'abdullah@dev', `/api/calls/${created.call.id}`);
+    assert.equal(answered.data.call.status, 'active');
+    assert.ok(answered.data.call.answeredAt, 'answering is what records when');
+});
+
 test('the second peer to arrive is the offerer, and both are told the ICE configuration', async (t) => {
     const { server, base } = await startTestServer();
     t.after(() => server.close());

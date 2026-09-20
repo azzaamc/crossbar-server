@@ -527,6 +527,13 @@ class Store {
      * Admits a person, and — when the client says which device it is — that device,
      * to a call. `joined_at` is written once, because the first join is the fact
      * that matters; later re-attaches only refresh the device row.
+     *
+     * A join does not answer the call. The caller is a participant with `accepted`
+     * from the moment the call exists, so treating a join as an answer marked every
+     * outgoing call active — and stamped `answered_at` — the instant the person who
+     * placed it reached the room, with nobody at the other end. The caller was then
+     * told the call had connected while it was still ringing. Answering is `respond`;
+     * only `respond` makes a ringing call active.
      */
     joinCall(callId, userId, deviceId, now) {
         return this.transaction(() => {
@@ -549,11 +556,6 @@ class Store {
                     ON CONFLICT(call_id, device_id) DO UPDATE SET joined_at=excluded.joined_at, left_at=NULL
                 `).run(callId, deviceId, userId, now);
             }
-
-            this.db.prepare(`
-                UPDATE calls SET status = ?, answered_at = COALESCE(answered_at, ?)
-                WHERE id = ? AND status = 'ringing'
-            `).run(machine.statusAfterAccept(call), now, callId);
 
             return { ok: true, call: this.callById(callId) };
         });
