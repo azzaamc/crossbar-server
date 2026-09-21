@@ -24,7 +24,11 @@ settings that matter are `CROSSBAR_NETWORK_MODE=public`, `CROSSBAR_PUBLIC_HOSTNA
 | `Caddyfile` | `/etc/caddy/Caddyfile` | the only public listener |
 | `crossbar.service` | `/etc/systemd/system/` | the Crossbar server, unchanged |
 | `crossbar-turn.service` | `/etc/systemd/system/` | runs coturn, hardened |
-| `coturn.conf` | stays here | a template; the unit above renders it |
+| `coturn.conf` | `/etc/crossbar/coturn.conf` | a template; the unit above renders it |
+
+The templates are read from `/etc`, not from the checkout: the unit runs as `turnserver`,
+and a home directory is mode 0700, so it cannot open anything under `/home/admin` at all.
+Install both files, then hand Caddy and coturn the same environment file the server reads.
 
 Caddy comes from the project's own package repository (`apt install caddy`). It needs
 `CROSSBAR_PUBLIC_HOSTNAME` in its own environment — the Caddyfile's placeholder is read from
@@ -101,7 +105,8 @@ copy lives on a tmpfs.
 ```
 sudo apt install coturn gettext-base
 sudo systemctl disable --now coturn              # the package's own unit; this one replaces it
-sudo cp deploy/crossbar-turn.service /etc/systemd/system/
+sudo install -m 644 deploy/crossbar-turn.service /etc/systemd/system/
+sudo install -D -m 644 deploy/coturn.conf /etc/crossbar/coturn.conf
 sudo systemctl daemon-reload
 sudo systemctl enable --now crossbar-turn
 journalctl -u crossbar-turn -f
