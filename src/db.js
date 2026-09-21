@@ -186,6 +186,24 @@ const MIGRATIONS = [
             `);
         },
     },
+    {
+        version: 2,
+        apply(db) {
+            // Anyone already holding an active device has arrived, whatever the old rule
+            // said. Being present used to be established by `observeIdentity` — a login
+            // read out of a proxy header the local reverse proxy injects — and a public
+            // deployment refuses that header outright. So a server with two phones enrolled
+            // in it had nobody marked as present, and showed no contacts at all. Enrolment
+            // sets this now; this is the same statement, for the people who enrolled before
+            // it did.
+            db.exec(`
+                UPDATE users
+                   SET first_seen_at = COALESCE(first_seen_at, last_authenticated_at, CURRENT_TIMESTAMP)
+                 WHERE enabled = 1
+                   AND id IN (SELECT user_id FROM devices WHERE status = 'active')
+            `);
+        },
+    },
 ];
 
 class Store {
@@ -392,6 +410,23 @@ class Store {
         });
 
         return this.userByLogin(login);
+    }
+
+    /**
+     * Records that a person has actually arrived.
+     *
+     * `first_seen_at` is what every contact, group and callable list is filtered on, and
+     * until now the only thing that set it was `observeIdentity` — which reads a login out
+     * of a header the local proxy injected. A public deployment refuses that header
+     * outright, so nobody could ever be marked present: the household read as empty and the
+     * app connected to a server that knew no one. Enrolling a device is the strongest
+     * evidence of arrival a server like this has, which is why that is what sets it.
+     */
+    markSeen(userId, now) {
+        return this.db.prepare(`
+            UPDATE users SET first_seen_at = COALESCE(first_seen_at, ?), last_authenticated_at = ?
+            WHERE id = ?
+        `).run(now, now, userId).changes;
     }
 
     contactsFor(userId) {

@@ -115,6 +115,24 @@ test('an invitation admits one device, and then cannot be used again', async (t)
     assert.equal(replay.data.error.code, 'ENROLLMENT_USED');
 });
 
+/// The rule every list of people is filtered on.
+///
+/// A public server refuses the network identity header, so a device enrolling is the only
+/// way anyone can be marked as having arrived — and for a while it was not: the household
+/// read as empty on a server that had just accepted two phones.
+test('enrolling a device makes that person visible to the household', async (t) => {
+    const { server, base } = await startTestServer(AVAILABLE);
+    t.after(() => server.close());
+
+    const before = server.store.contactsFor('abdullah').map((c) => c.id);
+    assert.ok(!before.includes('dad'), 'nobody has arrived yet');
+
+    await enrolledDevice(base, 'dad');
+
+    const after = server.store.contactsFor('abdullah').map((c) => c.id);
+    assert.ok(after.includes('dad'), 'the person whose device enrolled is a contact now');
+});
+
 test('a token that is not an invitation gets nowhere', async (t) => {
     const { server, base } = await startTestServer(AVAILABLE);
     t.after(() => server.close());

@@ -251,7 +251,7 @@ function enroll({ store, config, now, token, publicKey, algorithm, deviceName, p
     const deviceId = newDeviceId();
     const device = store.transaction(() => {
         if (!store.useEnrollment(enrollment.id, deviceId, now)) return null;
-        return store.registerEnrolledDevice({
+        const registered = store.registerEnrolledDevice({
             id: deviceId,
             userId: user.id,
             label: deviceName,
@@ -260,6 +260,12 @@ function enroll({ store, config, now, token, publicKey, algorithm, deviceName, p
             algorithm: ALGORITHM,
             now,
         });
+        // Enrolling a device is someone arriving, and on a public server it is the only
+        // arrival there is: the network identity header that used to mark a person present
+        // is refused there. Without this the household looks empty, which is how a
+        // deployment with two phones in it came to show no contacts at all.
+        if (registered) store.markSeen(user.id, now);
+        return registered;
     });
     if (!device) return { ok: false, reason: 'ENROLLMENT_USED' };
 
