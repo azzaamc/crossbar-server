@@ -15,6 +15,7 @@ http://{$CROSSBAR_PUBLIC_HOSTNAME} {
 	# Caddy's automatic HTTPS writes this redirect on its own; it is spelled out so the
 	# requirement is visible in the file an operator actually reads. Port 80 has to be
 	# reachable for it to work.
+	bind {$CROSSBAR_BIND_ADDRESS}
 	redir https://{host}{uri} permanent
 }
 
@@ -22,6 +23,18 @@ http://{$CROSSBAR_PUBLIC_HOSTNAME} {
 	# Certificates come from Let's Encrypt over ACME, which needs the DNS record for this
 	# hostname to point here. Nothing below sets a scheme: a site address with a hostname
 	# is HTTPS, and plain HTTP is the redirect above.
+
+	# Which address to listen on, and it is not the wildcard.
+	#
+	# Something else on a host like this may already hold the port on a specific address —
+	# Tailscale does, on its own tailnet address, for the private-mode path — and a wildcard
+	# bind beside a specific one is either refused outright or resolved by the kernel's
+	# discretion, which is not a thing to leave a public listener to. Naming the address the
+	# router forwards to is the version that cannot be argued with. It has to be a fixed
+	# address: reserve it on the router, or this breaks the next time it moves.
+	#
+	# The same file is read here and by the server, so the value lives in ../.env.
+	bind {$CROSSBAR_BIND_ADDRESS}
 
 	header {
 		# Public mode is only ever reached over TLS, so a browser can be told to refuse

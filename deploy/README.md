@@ -42,6 +42,12 @@ EnvironmentFile=/home/admin/crossbar/.env
 Then `sudo systemctl restart caddy`. Nothing else from `.env` is used by Caddy, and `PORT`
 only matters if the server does not listen on 3003.
 
+`CROSSBAR_BIND_ADDRESS` is the other value Caddy reads: the address it listens on. Set it to
+the address the router forwards to — never the wildcard. A host that already serves the same
+ports over a tailnet holds `:443` on its own address, and a wildcard bind beside a specific
+one is either refused outright or resolved by the kernel's discretion, which is not a thing
+to leave a public listener to. It has to be stable, so reserve it on the router.
+
 ## DNS
 
 One record matters: `CROSSBAR_PUBLIC_HOSTNAME` must resolve to the home connection.
