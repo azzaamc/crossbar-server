@@ -93,7 +93,19 @@ function checkWebSocket(origin, signalPath) {
             finish({ ok: text.startsWith('0'), detail: text.startsWith('0') ? 'engine open' : `unexpected frame ${text.slice(0, 40)}` });
         });
         socket.on('error', (error) => finish({ ok: false, detail: String(error.message).slice(0, 160) }));
-        socket.on('unexpected-response', (_request, response) => finish({ ok: false, detail: `HTTP ${response.statusCode}` }));
+        socket.on('unexpected-response', (_request, response) => {
+            // A refusal is an answer, and in public mode it is the expected one: the
+            // socket requires a device session, so a probe that presents none is
+            // *supposed* to be turned away. Being turned away proves the upgrade
+            // reached the server, which is the whole question this check asks.
+            // Anything else — a 404, a 502, a gateway that never forwards the upgrade
+            // — means it did not, and that is what should be reported as a failure.
+            const reachable = response.statusCode === 401 || response.statusCode === 403;
+            finish({
+                ok: reachable,
+                detail: `HTTP ${response.statusCode}${reachable ? ', authentication required' : ''}`,
+            });
+        });
     });
 }
 
