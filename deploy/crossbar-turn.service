@@ -26,7 +26,7 @@ EnvironmentFile=/home/admin/crossbar/.env
 # `grep` is the guard: coturn with `use-auth-secret` and an empty secret starts happily and
 # then refuses every client, which presents as calls failing to connect rather than as a
 # configuration error. Failing here says which it was.
-ExecStartPre=/bin/sh -c '/usr/bin/envsubst < /home/admin/crossbar/deploy/coturn.conf > /run/coturn/turnserver.conf && /bin/chmod 0600 /run/coturn/turnserver.conf && /bin/grep -q "^static-auth-secret=." /run/coturn/turnserver.conf'
+ExecStartPre=/bin/sh -c '/usr/bin/envsubst < /home/admin/crossbar/deploy/coturn.conf | /bin/grep -v "^external-ip=$" > /run/coturn/turnserver.conf && /bin/chmod 0600 /run/coturn/turnserver.conf && /bin/grep -q "^static-auth-secret=." /run/coturn/turnserver.conf'
 ExecStart=/usr/bin/turnserver -c /run/coturn/turnserver.conf
 
 Restart=on-failure
