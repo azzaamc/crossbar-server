@@ -11,6 +11,17 @@
 # it is not 3003. README.md shows the systemd drop-in that hands Caddy the same .env the
 # server uses, so there is one copy of each value.
 
+{
+	# One issuer, stated.
+	#
+	# Caddy falls back to ZeroSSL when Let's Encrypt fails, and in this version that
+	# fallback cannot succeed: ZeroSSL's legacy ACME account was removed, so every
+	# attempt logs a second failure (`caddy_legacy_user_removed`) that can never do
+	# anything but add noise. Naming the CA makes Let's Encrypt the only issuer, which
+	# is what a failed attempt should report.
+	acme_ca https://acme-v02.api.letsencrypt.org/directory
+}
+
 http://{$CROSSBAR_PUBLIC_HOSTNAME} {
 	# Caddy's automatic HTTPS writes this redirect on its own; it is spelled out so the
 	# requirement is visible in the file an operator actually reads. Port 80 has to be
