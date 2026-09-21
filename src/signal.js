@@ -22,6 +22,8 @@ const crypto = require('node:crypto');
 const { WebSocketServer } = require('ws');
 const machine = require('./calls');
 const { resolveIdentity } = require('./identity');
+const auth = require('./auth');
+const { iceConfigFor } = require('./ice');
 const validate = require('./validate');
 
 const ENGINE_OPEN = '0';
@@ -126,13 +128,15 @@ function createSignalServer({ config, store, log, onAdmitted, onClosed }) {
                 peer_id: session.id,
                 should_create_offer: false,
                 peer_name: session.peerName,
-                iceServers: config.iceServers,
+                // Each side is told what *it* may use, not what the other side may:
+                // a relay credential belongs to the device it was issued to.
+                iceServers: peer.ice || config.iceServers,
             });
             emit(session, 'addPeer', {
                 peer_id: peer.id,
                 should_create_offer: true,
                 peer_name: peer.peerName,
-                iceServers: config.iceServers,
+                iceServers: session.ice || config.iceServers,
             });
         }
     }
@@ -181,7 +185,7 @@ function createSignalServer({ config, store, log, onAdmitted, onClosed }) {
         if (session.admitted) return refuse(session, 'already_joined');
 
         if (!session.identity) return refuse(session, 'no_identity');
-        const user = store.userByLogin(session.identity.login);
+        const user = userForIdentity(session.identity);
         if (!user) return refuse(session, 'not_enrolled');
 
         let joined;
@@ -223,6 +227,10 @@ function createSignalServer({ config, store, log, onAdmitted, onClosed }) {
 
         session.admitted = true;
         const joinedCall = store.joinCall(call.id, user.id, deviceId, now);
+        // What this device should use to reach the others, decided per device rather
+        // than once for the deployment: relay credentials expire, and they carry the
+        // name of whoever they were issued to.
+        session.ice = iceConfigFor({ config, now, name: deviceId || user.id }).iceServers;
         addPeer(session);
 
         emit(session, 'serverInfo', {
@@ -381,13 +389,18 @@ function createSignalServer({ config, store, log, onAdmitted, onClosed }) {
         }
     }
 
-    function connection(ws, req, identity) {
+    function connection(ws, req, admission) {
         const url = new URL(req.url, 'http://localhost');
+        // A device that authenticated with its own key is named by that session; the
+        // query parameter is the older path, for clients that have no key yet.
+        const deviceId = admission.device?.id || validDeviceId(url.searchParams.get('device'));
         const session = {
             id: crypto.randomBytes(15).toString('base64url').slice(0, 20),
             ws,
-            identity,
-            deviceId: validDeviceId(url.searchParams.get('device')),
+            identity: admission.identity,
+            deviceId,
+            // Filled in at admission, once the person behind the socket is known.
+            ice: null,
             admitted: false,
             departed: false,
             namespaceConnected: false,
@@ -467,6 +480,18 @@ function createSignalServer({ config, store, log, onAdmitted, onClosed }) {
         return typeof value === 'string' && /^[A-Za-z0-9_-]{8,64}$/.test(value) ? value : null;
     }
 
+    /**
+     * The person a socket proved itself to be.
+     *
+     * A device session names the person by id, because that is what the key was
+     * enrolled to; a transport identity names them by login, which is how a private
+     * deployment has always worked and must keep working.
+     */
+    function userForIdentity(identity) {
+        if (!identity) return null;
+        return identity.userId ? store.userById(identity.userId) : store.userByLogin(identity.login);
+    }
+
     function handleUpgrade(req, socket, head) {
         let url;
         try {
@@ -480,8 +505,53 @@ function createSignalServer({ config, store, log, onAdmitted, onClosed }) {
             return socket.destroy();
         }
 
-        const identity = resolveIdentity(req, config);
-        wss.handleUpgrade(req, socket, head, (ws) => connection(ws, req, identity));
+        // A browser sends an Origin on a WebSocket handshake and one that is not this
+        // deployment's is refused. A native client sends none at all, and an absent
+        // header is not a claim — it is the absence of one, which is why it is allowed.
+        const origin = req.headers.origin;
+        if (origin && origin !== config.publicOrigin) {
+            log.warn('signal_origin_refused', { origin: String(origin).slice(0, 120) });
+            socket.write('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n');
+            return socket.destroy();
+        }
+
+        const now = new Date().toISOString();
+        const transport = resolveIdentity(req, config);
+        const deviceSession = auth.sessionFromRequest(req, { store, config, now });
+
+        // The socket is where calls actually happen, so it cannot be the way around the
+        // rule the API enforces.
+        if (config.requireDeviceAuth && !deviceSession) {
+            socket.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n');
+            return socket.destroy();
+        }
+
+        // What the transport says about a device that has a key of its own is recorded
+        // as additional evidence, never as the identity: the key is what decides.
+        if (deviceSession && transport?.login) {
+            store.rememberAuthenticator({
+                id: `auth_${auth.randomId(12)}`,
+                deviceId: deviceSession.device.id,
+                type: 'tailscale',
+                externalSubject: transport.login,
+                metadata: { name: transport.name || '', at: 'socket' },
+                now,
+            });
+        }
+
+        const admission = deviceSession
+            ? {
+                identity: {
+                    source: 'device',
+                    name: deviceSession.user.displayName,
+                    userId: deviceSession.user.id,
+                    deviceId: deviceSession.device.id,
+                },
+                device: deviceSession.device,
+            }
+            : { identity: transport, device: null };
+
+        wss.handleUpgrade(req, socket, head, (ws) => connection(ws, req, admission));
     }
 
     function start() {

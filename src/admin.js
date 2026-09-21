@@ -1,0 +1,215 @@
+'use strict';
+
+// Operator commands.
+//
+// There is no admin web UI on purpose. The household is small, whoever runs this has a
+// shell, and a second network surface to secure is a second surface to get wrong. These
+// commands open the same database the server uses — SQLite in WAL mode, so both can work
+// at once — and the HTTP admin routes exist for the same operations when a browser is
+// more convenient.
+//
+// Usage: node src/admin.js <command> [options]
+
+const { loadConfig } = require('./config');
+const { Store } = require('./db');
+const auth = require('./auth');
+const { diagnose } = require('./diagnostics');
+
+const USAGE = `Crossbar administration
+
+  users                                  List the people in the household file
+  devices [--user <id>]                  List devices, optionally for one person
+  enroll --user <id> [--ttl <seconds>]   Create a one-time invitation for a device
+  enrollments                            List invitations and their state
+  revoke-enrollment <id>                 Withdraw an invitation that has not been used
+  rename-device <deviceId> <label>       Give a device a name a person recognises
+  revoke-device <deviceId>               Take a device's key out of use
+  status                                 Configuration and counts
+  doctor                                 Reachability checks
+`;
+
+function parseArgs(argv) {
+    const [command, ...rest] = argv;
+    const options = {};
+    const positional = [];
+    for (let index = 0; index < rest.length; index += 1) {
+        const value = rest[index];
+        if (value.startsWith('--')) {
+            const name = value.slice(2);
+            const next = rest[index + 1];
+            if (next === undefined || next.startsWith('--')) {
+                options[name] = true;
+            } else {
+                options[name] = next;
+                index += 1;
+            }
+        } else {
+            positional.push(value);
+        }
+    }
+    return { command, options, positional };
+}
+
+function pad(value, width) {
+    const text = String(value ?? '');
+    return text.length >= width ? `${text.slice(0, width - 1)}…` : text.padEnd(width);
+}
+
+function printPeople(store) {
+    const rows = store.listUsers();
+    if (!rows.length) return console.log('No people are configured.');
+    console.log(`${pad('ID', 14)}${pad('NAME', 22)}${pad('ADMIN', 7)}${pad('LOGIN', 34)}DEVICES  LAST AUTHENTICATED`);
+    for (const row of rows) {
+        console.log(
+            pad(row.id, 14) + pad(row.displayName, 22) + pad(row.admin ? 'yes' : '-', 7)
+            + pad(row.login, 34) + pad(row.activeDevices, 9) + (row.lastAuthenticated || 'never'),
+        );
+    }
+}
+
+function printDevices(store, userId = null) {
+    const rows = store.allDevices(userId);
+    if (!rows.length) return console.log('No devices are registered.');
+    console.log(`${pad('DEVICE', 26)}${pad('OWNER', 20)}${pad('LABEL', 18)}${pad('PLATFORM', 10)}${pad('STATE', 9)}${pad('KEY', 5)}LAST SEEN`);
+    for (const row of rows) {
+        console.log(
+            pad(row.id, 26) + pad(row.userName || row.userId, 20) + pad(row.label || '-', 18)
+            + pad(row.platform || '-', 10) + pad(row.status, 9) + pad(row.hasKey ? 'yes' : '-', 5)
+            + (row.lastSeenAt || 'never'),
+        );
+    }
+}
+
+function printEnrollments(store) {
+    const now = new Date().toISOString();
+    const rows = store.enrollments(now);
+    if (!rows.length) return console.log('No invitations have been created.');
+    console.log(`${pad('ID', 20)}${pad('FOR', 14)}${pad('STATE', 9)}${pad('EXPIRES', 26)}CREATED BY`);
+    for (const row of rows) {
+        console.log(
+            pad(row.id, 20) + pad(row.intendedUserId || '-', 14) + pad(row.state, 9)
+            + pad(row.expiresAt, 26) + (row.createdBy || 'cli'),
+        );
+    }
+}
+
+async function main(argv) {
+    const { command, options, positional } = parseArgs(argv);
+    if (!command || command === 'help' || command === '--help') {
+        console.log(USAGE);
+        return 0;
+    }
+
+    const config = loadConfig();
+    const store = new Store(config.dataDir, config.familyConfigPath);
+    const now = new Date().toISOString();
+
+    try {
+        switch (command) {
+            case 'users':
+                printPeople(store);
+                return 0;
+
+            case 'devices':
+                printDevices(store, typeof options.user === 'string' ? options.user : null);
+                return 0;
+
+            case 'enroll': {
+                if (typeof options.user !== 'string') {
+                    console.error('enroll needs --user <id>. An invitation always names the person it is for.');
+                    return 1;
+                }
+                const result = auth.createInvitation({
+                    store,
+                    config,
+                    now,
+                    userId: options.user,
+                    ttlSeconds: Number(options.ttl) || null,
+                });
+                if (!result.ok) {
+                    console.error(`Could not create an invitation: ${result.reason}`);
+                    if (result.reason === 'DEVICE_AUTH_DISABLED') {
+                        console.error('Set CROSSBAR_SESSION_SECRET first; invitations are useless without it.');
+                    }
+                    return 1;
+                }
+                // The token appears here and nowhere else: only its hash is stored, so
+                // this output is the one chance to hand it over.
+                console.log(`Invitation ${result.enrollment.id} for ${options.user}, expires ${result.enrollment.expiresAt}`);
+                console.log('Give this to the device (it accepts the JSON or just the token):');
+                console.log(JSON.stringify(result.payload));
+                return 0;
+            }
+
+            case 'enrollments':
+                printEnrollments(store);
+                return 0;
+
+            case 'revoke-enrollment': {
+                const [id] = positional;
+                if (!id) { console.error('revoke-enrollment needs an invitation id.'); return 1; }
+                const revoked = store.revokeEnrollment(id, now);
+                console.log(revoked ? `Revoked ${id}.` : `${id} was not open; nothing to revoke.`);
+                return revoked ? 0 : 1;
+            }
+
+            case 'rename-device': {
+                const [deviceId, ...labelParts] = positional;
+                const label = labelParts.join(' ');
+                if (!deviceId || !label) { console.error('rename-device needs a device id and a label.'); return 1; }
+                const renamed = store.renameDevice(deviceId, label, now);
+                console.log(renamed ? `Renamed ${deviceId} to "${label}".` : `No device ${deviceId}.`);
+                return renamed ? 0 : 1;
+            }
+
+            case 'revoke-device': {
+                const [deviceId] = positional;
+                if (!deviceId) { console.error('revoke-device needs a device id.'); return 1; }
+                const device = store.deviceIdentity(deviceId);
+                if (!device) { console.error(`No device ${deviceId}.`); return 1; }
+                const revoked = store.revokeDevice(deviceId, now);
+                // The person keeps their other devices, and their account: revoking a
+                // phone is not revoking a person.
+                console.log(revoked
+                    ? `Revoked ${deviceId} (${device.label || 'unlabelled'}). They keep their other devices.`
+                    : `${deviceId} was already revoked.`);
+                return revoked ? 0 : 1;
+            }
+
+            case 'status': {
+                const openEnrollments = store.enrollments(now).filter((item) => item.state === 'open');
+                console.log(`Mode              ${config.networkMode}`);
+                console.log(`Origin            ${config.publicOrigin}`);
+                console.log(`Listener          ${config.host}:${config.port}`);
+                console.log(`Device auth       ${config.sessionSecret ? (config.requireDeviceAuth ? 'required' : 'available') : 'not configured'}`);
+                console.log(`TURN              ${config.turn?.host ? `${config.turn.host}:${config.turn.port} relays ${config.turn.minPort}-${config.turn.maxPort}` : 'not configured'}`);
+                console.log(`People            ${store.listUsers().length}`);
+                console.log(`Devices           ${store.allDevices().length}`);
+                console.log(`Open invitations  ${openEnrollments.length}${openEnrollments.length ? ` (${openEnrollments.map((item) => item.id).join(', ')})` : ''}`);
+                return 0;
+            }
+
+            case 'doctor': {
+                const results = await diagnose({ config, store });
+                for (const result of results) {
+                    console.log(`${result.ok ? 'OK  ' : 'FAIL'}  ${pad(result.name, 22)}${result.detail}`);
+                }
+                return results.every((result) => result.ok) ? 0 : 1;
+            }
+
+            default:
+                console.error(`Unknown command: ${command}\n`);
+                console.log(USAGE);
+                return 1;
+        }
+    } finally {
+        store.close();
+    }
+}
+
+main(process.argv.slice(2))
+    .then((code) => { process.exitCode = code; })
+    .catch((error) => {
+        console.error(String(error && error.message) || error);
+        process.exitCode = 1;
+    });

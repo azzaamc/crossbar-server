@@ -1,0 +1,60 @@
+[Unit]
+Description=Crossbar TURN relay (coturn)
+Documentation=man:turnserver(1)
+After=network-online.target
+Wants=network-online.target
+# The distribution's own coturn unit would race this one for the same listening ports, and
+# whichever loses is the one that appears not to work. Installing this unit means this unit
+# is the one that runs.
+Conflicts=coturn.service
+
+[Service]
+Type=simple
+User=turnserver
+Group=turnserver
+# coturn does not fork unless told to, so it is the unit's main process and its output
+# reaches the journal directly.
+RuntimeDirectory=coturn
+RuntimeDirectoryMode=0750
+UMask=0077
+
+# The same .env the Crossbar server reads. systemd reads it and puts the values in this
+# unit's environment; coturn cannot read it and cannot interpret it, which is why the
+# template is rendered into /run first. The secret exists in that rendered file and
+# nowhere else, and /run is a tmpfs that does not survive a reboot.
+EnvironmentFile=/home/admin/crossbar/.env
+# `grep` is the guard: coturn with `use-auth-secret` and an empty secret starts happily and
+# then refuses every client, which presents as calls failing to connect rather than as a
+# configuration error. Failing here says which it was.
+ExecStartPre=/bin/sh -c '/usr/bin/envsubst < /home/admin/crossbar/deploy/coturn.conf > /run/coturn/turnserver.conf && /bin/chmod 0600 /run/coturn/turnserver.conf && /bin/grep -q "^static-auth-secret=." /run/coturn/turnserver.conf'
+ExecStart=/usr/bin/turnserver -c /run/coturn/turnserver.conf
+
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=10
+
+# One descriptor per allocation and per relayed peer, and each relayed session also takes a
+# UDP port from the configured range: the default of 1024 is reachable by a handful of
+# simultaneous calls.
+LimitNOFILE=1048576
+
+# Hardening. coturn needs exactly one privilege -- binding 3478, which is below 1024 -- and
+# the relay ports it opens above that need nothing.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+# Read-only rather than inaccessible: the template lives in the checkout under /home, and
+# nothing this service does needs to write there.
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+# AF_NETLINK is how the host's own interfaces are enumerated, and AF_UNIX because a system
+# resolver may answer over a socket instead of a name server.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK AF_UNIX
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target

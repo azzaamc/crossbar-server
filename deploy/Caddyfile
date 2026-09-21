@@ -1,0 +1,70 @@
+# Caddy for a Crossbar public-mode deployment.
+#
+# One job: terminate TLS for the public hostname and hand everything to the Crossbar
+# server on its loopback listener. The backend is deliberately never exposed -- it is the
+# loopback connection that lets the server treat "arrived from the proxy" as a fact, which
+# is the only reason the Tailscale path can be trusted in private mode and the only reason
+# a stripped header means anything in public mode.
+#
+# Caddy reads its own environment, not ../.env, so CROSSBAR_PUBLIC_HOSTNAME has to be set
+# for the Caddy process; PORT is the same PORT the server reads and only needs setting when
+# it is not 3003. README.md shows the systemd drop-in that hands Caddy the same .env the
+# server uses, so there is one copy of each value.
+
+http://{$CROSSBAR_PUBLIC_HOSTNAME} {
+	# Caddy's automatic HTTPS writes this redirect on its own; it is spelled out so the
+	# requirement is visible in the file an operator actually reads. Port 80 has to be
+	# reachable for it to work.
+	redir https://{host}{uri} permanent
+}
+
+{$CROSSBAR_PUBLIC_HOSTNAME} {
+	# Certificates come from Let's Encrypt over ACME, which needs the DNS record for this
+	# hostname to point here. Nothing below sets a scheme: a site address with a hostname
+	# is HTTPS, and plain HTTP is the redirect above.
+
+	header {
+		# Public mode is only ever reached over TLS, so a browser can be told to refuse
+		# plain HTTP for this host from now on.
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		# Caddy announces itself by default. Nothing on the public internet needs to know
+		# what is terminating TLS here.
+		-Server
+	}
+
+	# The identity headers must not survive this point.
+	#
+	# In private mode the server believes `Tailscale-User-Login` only because the request
+	# arrived on loopback, where nothing but the local Tailscale proxy can reach it. Behind
+	# Caddy that reasoning no longer holds: the connection does come from loopback, but the
+	# header inside it was typed by whoever is calling. `Tailscale-User-Name` and
+	# `Tailscale-User-Profile-Pic` are the same claim by other names, and `X-Dev-Identity`
+	# is the development stand-in the server accepts when an operator has turned it on.
+	#
+	# This is a security requirement rather than tidiness: without it, anyone on the
+	# internet becomes any family member by sending one header, and every device-key check
+	# behind it is bypassed by a request that never had a key.
+	request_header -Tailscale-User-Login
+	request_header -Tailscale-User-Name
+	request_header -Tailscale-User-Profile-Pic
+	request_header -X-Dev-Identity
+
+	reverse_proxy 127.0.0.1:{$PORT:3003} {
+		# Set rather than left to the default. The defaults happen to produce these
+		# values here, but what they do depends on the Caddy version and on global options
+		# such as `trusted_proxies`, which decides whose incoming X-Forwarded-* headers are
+		# believed -- and these are the values the server reads when it decides where a
+		# request came from. Stated, they cannot drift.
+		#
+		# Caddy warns that X-Forwarded-Proto is unnecessary, which is true today: it is
+		# here so that both forwarded values are visible in one place.
+		header_up X-Forwarded-For {client_ip}
+		header_up X-Forwarded-Proto {scheme}
+
+		# The signalling socket is an HTTP upgrade on /socket.io/ -- with the session token
+		# in the query string, because a browser cannot set a header on an upgrade. It
+		# arrives as an ordinary request for this same site and so takes this same handler:
+		# Caddy turns an upgrade into a raw tunnel by itself, and wss:// is that tunnel
+		# over the TLS already terminated here.
+	}
+}

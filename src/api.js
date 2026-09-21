@@ -11,6 +11,8 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { resolveIdentity, isLoopback } = require('./identity');
 const { DEVICE_ID_PATTERN } = require('./db');
+const auth = require('./auth');
+const { iceConfigFor } = require('./ice');
 
 const MIME = {
     '.css': 'text/css; charset=utf-8',
@@ -25,6 +27,45 @@ const MIME = {
 };
 
 const BODY_LIMIT = 16384;
+
+/**
+ * What a refusal from `auth.js` means to a client.
+ *
+ * `DEVICE_AUTH_DISABLED` is a 404 deliberately: a client that finds no `/api/auth/*`
+ * should read "this server does not use device authentication", and from the outside
+ * that has to look the same as a server that does not implement the routes at all.
+ */
+const AUTH_STATUS = {
+    DEVICE_AUTH_DISABLED: 404,
+    ENROLLMENT_INVALID: 401,
+    ENROLLMENT_REVOKED: 403,
+    ENROLLMENT_USED: 409,
+    ENROLLMENT_EXPIRED: 410,
+    DEVICE_KEY_INVALID: 400,
+    DEVICE_UNKNOWN: 404,
+    DEVICE_REVOKED: 403,
+    CHALLENGE_INVALID: 401,
+    CHALLENGE_EXPIRED: 410,
+    SIGNATURE_INVALID: 401,
+    USER_UNKNOWN: 404,
+    RATE_LIMITED: 429,
+};
+
+const AUTH_MESSAGE = {
+    DEVICE_AUTH_DISABLED: 'This server does not use device authentication.',
+    ENROLLMENT_INVALID: 'That enrolment code is not valid.',
+    ENROLLMENT_REVOKED: 'That enrolment code was withdrawn.',
+    ENROLLMENT_USED: 'That enrolment code has already been used.',
+    ENROLLMENT_EXPIRED: 'That enrolment code has expired.',
+    DEVICE_KEY_INVALID: 'That device key is not a P-256 public key.',
+    DEVICE_UNKNOWN: 'That device is not enrolled with this server.',
+    DEVICE_REVOKED: 'That device has been revoked.',
+    CHALLENGE_INVALID: 'That challenge is not valid.',
+    CHALLENGE_EXPIRED: 'That challenge has expired.',
+    SIGNATURE_INVALID: 'That signature does not match this device.',
+    USER_UNKNOWN: 'That person is not in this household.',
+    RATE_LIMITED: 'Too many attempts. Try again shortly.',
+};
 
 function createRequestHandler({ config, store, bus, push, lifecycle, log, clientRoot }) {
     const websocketOrigin = (() => {
@@ -78,23 +119,86 @@ function createRequestHandler({ config, store, bus, push, lifecycle, log, client
         }
     }
 
+    /**
+     * Who this request is, and how that was decided.
+     *
+     * A device session wins outright: it is a device that has already answered a
+     * challenge, so nothing the transport says can make it more true. Only then is the
+     * transport consulted — the identity header a local proxy injects, which means
+     * something because the listener is loopback-only and nothing else can reach it.
+     */
     function currentUser(req) {
+        const now = new Date().toISOString();
+        const session = auth.sessionFromRequest(req, { store, config, now });
+        if (session) {
+            return {
+                identity: {
+                    source: 'device',
+                    name: session.user.displayName,
+                    login: session.user.id,
+                    deviceId: session.device.id,
+                },
+                user: session.user,
+                device: session.device,
+            };
+        }
         const identity = resolveIdentity(req, config);
-        if (!identity) return { identity: null, user: null };
-        const user = store.observeIdentity(identity, new Date().toISOString(), {
-            autoEnrol: config.autoEnrolIdentities,
-        });
-        return { identity, user };
+        if (!identity) return { identity: null, user: null, device: null };
+        const user = store.observeIdentity(identity, now, { autoEnrol: config.autoEnrolIdentities });
+        return { identity, user, device: null };
+    }
+
+    /**
+     * Who is calling, as far as rate limiting is concerned.
+     *
+     * Behind the reverse proxy every connection arrives from loopback, so the address
+     * that distinguishes anybody is the one the proxy appended. Only the last entry is
+     * read: a client may send an `X-Forwarded-For` of its own, and it lands at the
+     * front of the list, where it is not believed.
+     */
+    function clientAddress(req) {
+        const direct = req.socket?.remoteAddress || 'unknown';
+        if (!isLoopback(direct)) return direct;
+        const forwarded = req.headers['x-forwarded-for'];
+        if (typeof forwarded !== 'string' || !forwarded) return direct;
+        return forwarded.split(',').pop().trim() || direct;
+    }
+
+    function authFailure(res, reason) {
+        sendError(res, AUTH_STATUS[reason] || 400, reason, AUTH_MESSAGE[reason] || 'The request was refused.');
+    }
+
+    /** A body that is too large or is not JSON is a refusal, not an exception. */
+    async function readJsonOrRefuse(req, res) {
+        try {
+            const body = await readJson(req);
+            return body && typeof body === 'object' ? body : {};
+        } catch (error) {
+            sendError(res, error.status || 400, 'INVALID_REQUEST', error.message);
+            return null;
+        }
     }
 
     function requireUser(req, res) {
-        const { identity, user } = currentUser(req);
+        const { identity, user, device } = currentUser(req);
         if (!identity) {
-            sendError(res, 401, 'IDENTITY_MISSING', 'Open Crossbar through its private Tailscale URL.');
+            // A public deployment has no other way in, so it says what is actually
+            // missing rather than naming a Tailscale URL that does not apply there.
+            if (config.networkMode === 'public') {
+                sendError(res, 401, 'DEVICE_AUTH_REQUIRED', 'This device is not enrolled with this server.');
+            } else {
+                sendError(res, 401, 'IDENTITY_MISSING', 'Open Crossbar through its private Tailscale URL.');
+            }
             return null;
         }
         if (!user) {
             sendError(res, 403, 'IDENTITY_NOT_ENROLLED', 'This identity is not a member of this household.');
+            return null;
+        }
+        // Where a device key is required, being reachable is not enough. This is the
+        // line that stops "arrived over the tailnet" from meaning "is that person".
+        if (config.requireDeviceAuth && !device) {
+            sendError(res, 401, 'DEVICE_AUTH_REQUIRED', 'This device is not enrolled with this server.');
             return null;
         }
         return user;
@@ -179,10 +283,267 @@ function createRequestHandler({ config, store, bus, push, lifecycle, log, client
             });
         }
 
+        // ── Health ──────────────────────────────────────────────────────────────
+        //
+        // Unauthenticated on purpose, so a browser, a monitor or a `curl` can answer
+        // "is this server up" before anything else works. It says which mode this is
+        // and nothing an unwelcome visitor could use.
+        if (req.method === 'GET' && pathname === '/api/health') {
+            return sendJson(res, 200, { status: 'ok', mode: config.networkMode });
+        }
+
+        // ── Device identity ─────────────────────────────────────────────────────
+        //
+        // The only routes reached without a session, because they are how a session is
+        // obtained. Each is limited by address as well as by device: an invitation code
+        // is high-entropy, but a server that answers unlimited guesses is a server that
+        // is one bad code away from being somebody else's.
+        if (req.method === 'POST' && pathname === '/api/auth/enroll') {
+            if (!lifecycle.limiter.take(`enroll:${clientAddress(req)}`, 10, 60000)) {
+                return authFailure(res, 'RATE_LIMITED');
+            }
+            const body = await readJsonOrRefuse(req, res);
+            if (!body) return;
+            const result = auth.enroll({
+                store,
+                config,
+                now: new Date().toISOString(),
+                token: body.token,
+                publicKey: body.publicKey,
+                algorithm: body.algorithm,
+                deviceName: body.deviceName,
+                platform: body.platform,
+                // Where the device arrived from, when that is something we know. It
+                // becomes an authenticator on the new device, never the device itself.
+                transportIdentity: resolveIdentity(req, config),
+            });
+            if (!result.ok) return authFailure(res, result.reason);
+            log.info('device_enrolled', {
+                deviceId: result.device.id,
+                userId: result.user.id,
+                platform: result.device.platform,
+            });
+            return sendJson(res, 200, {
+                device: {
+                    id: result.device.id,
+                    name: result.device.label,
+                    platform: result.device.platform,
+                },
+                user: { id: result.user.id, displayName: result.user.displayName },
+                session: result.session,
+            });
+        }
+
+        if (req.method === 'POST' && pathname === '/api/auth/challenge') {
+            const body = await readJsonOrRefuse(req, res);
+            if (!body) return;
+            const deviceId = String(body.deviceId || '');
+            if (!lifecycle.limiter.take(`challenge:${deviceId}`, 20, 60000)
+                || !lifecycle.limiter.take(`challenge-ip:${clientAddress(req)}`, 60, 60000)) {
+                return authFailure(res, 'RATE_LIMITED');
+            }
+            const result = auth.challenge({ store, config, now: new Date().toISOString(), deviceId });
+            if (!result.ok) return authFailure(res, result.reason);
+            return sendJson(res, 200, {
+                challengeId: result.challengeId,
+                nonce: result.nonce,
+                expiresAt: result.expiresAt,
+            });
+        }
+
+        if (req.method === 'POST' && pathname === '/api/auth/session') {
+            const body = await readJsonOrRefuse(req, res);
+            if (!body) return;
+            const deviceId = String(body.deviceId || '');
+            if (!lifecycle.limiter.take(`session:${deviceId}`, 30, 60000)) {
+                return authFailure(res, 'RATE_LIMITED');
+            }
+            const result = auth.completeSession({
+                store,
+                config,
+                now: new Date().toISOString(),
+                deviceId,
+                challengeId: body.challengeId,
+                signature: body.signature,
+            });
+            if (!result.ok) return authFailure(res, result.reason);
+            return sendJson(res, 200, {
+                device: { id: result.device.id, name: result.device.label },
+                user: { id: result.user.id, displayName: result.user.displayName },
+                session: result.session,
+            });
+        }
+
         const user = requireUser(req, res);
         if (!user) return;
 
         if (deviceId) store.touchDevice(deviceId, new Date().toISOString());
+
+        // ── This device ─────────────────────────────────────────────────────────
+        //
+        // What a device may know about itself: its identity and the other ways this
+        // server recognises it. Not its key material — a device already holds the only
+        // part of that which matters.
+        if (req.method === 'GET' && pathname === '/api/device') {
+            const { device, identity } = currentUser(req);
+            if (!device) {
+                return sendJson(res, 200, {
+                    enrolled: false,
+                    via: identity?.source || null,
+                    mode: config.networkMode,
+                });
+            }
+            return sendJson(res, 200, {
+                enrolled: true,
+                device: {
+                    id: device.id,
+                    name: device.label,
+                    platform: device.platform,
+                    createdAt: device.createdAt,
+                },
+                authenticators: store.authenticatorsForDevice(device.id).map((item) => ({
+                    type: item.type,
+                    subject: item.externalSubject,
+                    createdAt: item.createdAt,
+                    lastVerifiedAt: item.lastVerifiedAt,
+                    revokedAt: item.revokedAt,
+                })),
+                mode: config.networkMode,
+            });
+        }
+
+        // ── Where to send media ─────────────────────────────────────────────────
+        //
+        // Credentials that expire, handed to a device that has proved itself. A client
+        // never carries a relay password it could leak, and the operator can change the
+        // relay's secret without touching a single phone.
+        if (req.method === 'GET' && pathname === '/api/webrtc/ice') {
+            const { device } = currentUser(req);
+            return sendJson(res, 200, iceConfigFor({
+                config,
+                now: new Date().toISOString(),
+                name: device?.id || user.id,
+            }));
+        }
+
+        // ── Administration ──────────────────────────────────────────────────────
+        //
+        // Admitting a phone and taking one away is something a household has to be able
+        // to do, and the person who does it is the one the household file marks as an
+        // administrator. There is no second kind of account and no admin UI: the CLI
+        // drives these same routes, and the same identity rules apply to both.
+        if (pathname.startsWith('/api/admin/')) {
+            if (!user.admin) {
+                return sendError(res, 403, 'NOT_ADMIN', 'Only an administrator may manage devices.');
+            }
+
+            /** A device as an operator sees it. The public key is not part of that. */
+            function adminDevice(device) {
+                return {
+                    id: device.id,
+                    userId: device.userId,
+                    userName: device.userName,
+                    label: device.label,
+                    platform: device.platform,
+                    status: device.status,
+                    algorithm: device.keyAlgorithm || null,
+                    hasKey: Boolean(device.hasKey ?? device.publicKey),
+                    hasPushToken: Boolean(device.hasPushToken),
+                    createdAt: device.createdAt,
+                    lastSeenAt: device.lastSeenAt,
+                    revokedAt: device.revokedAt || null,
+                };
+            }
+
+            if (req.method === 'GET' && pathname === '/api/admin/status') {
+                const now = new Date().toISOString();
+                return sendJson(res, 200, {
+                    mode: config.networkMode,
+                    hostname: config.publicHostname || null,
+                    origin: config.publicOrigin,
+                    requireDeviceAuth: config.requireDeviceAuth,
+                    deviceAuthEnabled: Boolean(config.sessionSecret),
+                    turn: config.turn?.host
+                        ? {
+                            host: config.turn.host,
+                            port: config.turn.port,
+                            relayPorts: [config.turn.minPort, config.turn.maxPort],
+                            ttlSeconds: config.turn.ttlSeconds,
+                        }
+                        : null,
+                    users: store.listUsers().length,
+                    devices: store.allDevices().length,
+                    openEnrollments: store.enrollments(now).filter((item) => item.state === 'open').length,
+                });
+            }
+
+            if (req.method === 'GET' && pathname === '/api/admin/users') {
+                return sendJson(res, 200, { users: store.listUsers() });
+            }
+
+            if (req.method === 'GET' && pathname === '/api/admin/devices') {
+                return sendJson(res, 200, { devices: store.allDevices().map(adminDevice) });
+            }
+
+            if (req.method === 'GET' && pathname === '/api/admin/enrollments') {
+                return sendJson(res, 200, { enrollments: store.enrollments(new Date().toISOString()) });
+            }
+
+            if (req.method === 'POST' && pathname === '/api/admin/enrollments') {
+                const body = await readJsonOrRefuse(req, res);
+                if (!body) return;
+                const result = auth.createInvitation({
+                    store,
+                    config,
+                    now: new Date().toISOString(),
+                    userId: String(body.userId || ''),
+                    createdBy: user.id,
+                    ttlSeconds: Number(body.ttlSeconds) || null,
+                });
+                if (!result.ok) return authFailure(res, result.reason);
+                log.info('enrollment_created', {
+                    enrollmentId: result.enrollment.id,
+                    intendedUserId: result.enrollment.intendedUserId,
+                    createdBy: user.id,
+                });
+                // The plaintext token is in this response and nowhere else; only its
+                // hash exists server-side, so it cannot be read back later.
+                return sendJson(res, 201, {
+                    enrollment: {
+                        id: result.enrollment.id,
+                        expiresAt: result.enrollment.expiresAt,
+                        intendedUserId: result.enrollment.intendedUserId,
+                    },
+                    payload: result.payload,
+                });
+            }
+
+            const deviceMatch = pathname.match(/^\/api\/admin\/devices\/([A-Za-z0-9_-]{8,64})\/(revoke|rename)$/);
+            if (req.method === 'POST' && deviceMatch) {
+                const target = store.deviceIdentity(deviceMatch[1]);
+                if (!target) return sendError(res, 404, 'DEVICE_UNKNOWN', 'That device is not enrolled with this server.');
+                const now = new Date().toISOString();
+                if (deviceMatch[2] === 'revoke') {
+                    store.revokeDevice(target.id, now);
+                    log.info('device_revoked', { deviceId: target.id, userId: target.userId, by: user.id });
+                    return sendJson(res, 200, { device: adminDevice(store.deviceIdentity(target.id)) });
+                }
+                const body = await readJsonOrRefuse(req, res);
+                if (!body) return;
+                store.renameDevice(target.id, body.label, now);
+                return sendJson(res, 200, { device: adminDevice(store.deviceIdentity(target.id)) });
+            }
+
+            const enrollmentMatch = pathname.match(/^\/api\/admin\/enrollments\/(enr_[A-Za-z0-9_-]{1,32})\/revoke$/);
+            if (req.method === 'POST' && enrollmentMatch) {
+                const revoked = store.revokeEnrollment(enrollmentMatch[1], new Date().toISOString());
+                if (!revoked) return sendError(res, 404, 'ENROLLMENT_INVALID', 'That enrolment code is not open.');
+                log.info('enrollment_revoked', { enrollmentId: enrollmentMatch[1], by: user.id });
+                return sendJson(res, 200, { revoked: true });
+            }
+
+            return sendError(res, 404, 'NOT_FOUND', 'No such administrative route.');
+        }
 
         if (req.method === 'GET' && pathname === '/api/bootstrap') {
             const contacts = store.contactsFor(user.id).map((contact) => ({

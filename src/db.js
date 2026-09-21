@@ -108,13 +108,107 @@ CREATE INDEX IF NOT EXISTS idx_push_subscriptions_user ON push_subscriptions(use
 const ID_PATTERN = /^[a-z0-9][a-z0-9_-]{0,63}$/i;
 const DEVICE_ID_PATTERN = /^[A-Za-z0-9_-]{8,64}$/;
 
+function addColumnIfMissing(db, table, column, definition) {
+    const columns = db.prepare(`PRAGMA table_info(${table})`).all().map((row) => row.name);
+    if (columns.includes(column)) return false;
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+    return true;
+}
+
+/**
+ * Schema changes that have to land on a database which already exists.
+ *
+ * `SCHEMA` above is what a new install starts with; this is how an older one catches
+ * up. Columns are added only when they are missing and tables are created
+ * idempotently, so running this every start is safe, and `user_version` records how
+ * far a database has come.
+ */
+const MIGRATIONS = [
+    {
+        version: 1,
+        apply(db) {
+            // A device's own key. The private half never leaves the device; this is the
+            // half the server checks a challenge signature against. `status` exists so
+            // revocation is a fact about a row rather than a row that disappears.
+            addColumnIfMissing(db, 'devices', 'public_key', 'TEXT');
+            addColumnIfMissing(db, 'devices', 'key_algorithm', "TEXT NOT NULL DEFAULT ''");
+            addColumnIfMissing(db, 'devices', 'status', "TEXT NOT NULL DEFAULT 'active'");
+            addColumnIfMissing(db, 'devices', 'revoked_at', 'TEXT');
+
+            // Who may admit a device or take one away. It is a property of a person in
+            // the household file, not a separate account: there is one kind of user
+            // here, and some of them administer.
+            addColumnIfMissing(db, 'users', 'admin', 'INTEGER NOT NULL DEFAULT 0');
+
+            // An enrolment invitation. Only the hash is stored: a copy of the database
+            // is not a stack of working invitations.
+            db.exec(`
+                CREATE TABLE IF NOT EXISTS enrollment_tokens (
+                  id TEXT PRIMARY KEY,
+                  token_hash TEXT NOT NULL UNIQUE,
+                  created_at TEXT NOT NULL,
+                  expires_at TEXT NOT NULL,
+                  used_at TEXT,
+                  used_by_device_id TEXT,
+                  revoked_at TEXT,
+                  created_by TEXT,
+                  intended_user_id TEXT REFERENCES users(id) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS idx_enrollment_tokens_live
+                  ON enrollment_tokens(expires_at, used_at, revoked_at);
+
+                -- The other ways a device can be recognised. A device key is the
+                -- canonical identity; everything here is additional evidence about the
+                -- same device, kept apart so no single mechanism becomes the identity.
+                CREATE TABLE IF NOT EXISTS authenticators (
+                  id TEXT PRIMARY KEY,
+                  device_id TEXT NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+                  type TEXT NOT NULL,
+                  external_subject TEXT NOT NULL DEFAULT '',
+                  metadata TEXT NOT NULL DEFAULT '{}',
+                  created_at TEXT NOT NULL,
+                  last_verified_at TEXT,
+                  revoked_at TEXT
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_authenticators_identity
+                  ON authenticators(device_id, type, external_subject);
+
+                CREATE TABLE IF NOT EXISTS auth_challenges (
+                  id TEXT PRIMARY KEY,
+                  device_id TEXT NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+                  nonce TEXT NOT NULL,
+                  created_at TEXT NOT NULL,
+                  expires_at TEXT NOT NULL,
+                  used_at TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_auth_challenges_device
+                  ON auth_challenges(device_id, used_at);
+            `);
+        },
+    },
+];
+
 class Store {
     constructor(dataDir, familyConfigPath) {
         fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 });
         this.db = new DatabaseSync(path.join(dataDir, 'crossbar.sqlite'));
         this.db.exec('PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;');
         this.db.exec(SCHEMA);
+        this.migrate();
         this.syncFamilyConfig(familyConfigPath);
+    }
+
+    /** Applies whatever this database has not seen. Safe to run on every start. */
+    migrate() {
+        const current = this.db.prepare('PRAGMA user_version').get().user_version || 0;
+        for (const migration of MIGRATIONS) {
+            if (migration.version <= current) continue;
+            this.transaction(() => {
+                migration.apply(this.db);
+                // The version is a literal from this file, never from a request.
+                this.db.exec(`PRAGMA user_version = ${migration.version}`);
+            });
+        }
     }
 
     close() {
@@ -148,13 +242,31 @@ class Store {
         if (!users.length) throw new Error('Family configuration requires at least one user');
 
         this.transaction(() => {
+            // A login is how a tailnet identity finds its person, and only one row may
+            // hold it. Moving one — correcting a mistyped login, or swapping two
+            // people's — would otherwise collide with whoever holds it now, and the
+            // server would refuse to start over a household file that is perfectly
+            // correct. So every login the file is about to claim is released first,
+            // under a value no login can be.
+            const release = this.db.prepare(`
+                UPDATE users SET tailscale_login = 'replaced:' || id
+                WHERE tailscale_login = ? COLLATE NOCASE AND id <> ?
+            `);
+            for (const user of users) {
+                assertId(user.id, 'user id');
+                const login = String(user.tailscaleLogin || '').trim().toLowerCase();
+                if (!login) throw new Error(`Missing tailscale login for ${user.id}`);
+                release.run(login, user.id);
+            }
+
             const upsert = this.db.prepare(`
-                INSERT INTO users (id, tailscale_login, display_name, relationship, avatar)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO users (id, tailscale_login, display_name, relationship, avatar, admin)
+                VALUES (?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET tailscale_login=excluded.tailscale_login,
                   display_name=CASE WHEN users.first_seen_at IS NULL THEN excluded.display_name ELSE users.display_name END,
                   relationship=excluded.relationship,
                   avatar=CASE WHEN users.first_seen_at IS NULL THEN excluded.avatar ELSE users.avatar END,
+                  admin=excluded.admin,
                   enabled=1
             `);
             for (const user of users) {
@@ -167,6 +279,7 @@ class Store {
                     cleanText(user.displayName, 80, 'display name'),
                     cleanOptional(user.relationship, 80),
                     cleanOptional(user.avatar, 500),
+                    user.admin ? 1 : 0,
                 );
             }
 
@@ -191,7 +304,7 @@ class Store {
 
     userByLogin(login) {
         return this.db.prepare(`
-            SELECT id, display_name AS displayName, relationship, avatar,
+            SELECT id, display_name AS displayName, relationship, avatar, admin,
               first_seen_at AS firstSeen, last_authenticated_at AS lastAuthenticated
             FROM users WHERE tailscale_login = ? COLLATE NOCASE AND enabled = 1
         `).get(login) || null;
@@ -199,10 +312,20 @@ class Store {
 
     userById(id) {
         return this.db.prepare(`
-            SELECT id, display_name AS displayName, relationship, avatar,
+            SELECT id, display_name AS displayName, relationship, avatar, admin,
               first_seen_at AS firstSeen, last_authenticated_at AS lastAuthenticated
             FROM users WHERE id = ? AND enabled = 1
         `).get(id) || null;
+    }
+
+    /** Everyone the household file knows, for an operator. */
+    listUsers() {
+        return this.db.prepare(`
+            SELECT u.id, u.display_name AS displayName, u.relationship, u.tailscale_login AS login,
+              u.admin, u.enabled, u.first_seen_at AS firstSeen, u.last_authenticated_at AS lastAuthenticated,
+              (SELECT COUNT(*) FROM devices d WHERE d.user_id = u.id AND d.status = 'active') AS activeDevices
+            FROM users u ORDER BY u.display_name
+        `).all().map((row) => ({ ...row, admin: Boolean(row.admin), enabled: Boolean(row.enabled) }));
     }
 
     /**
@@ -357,6 +480,195 @@ class Store {
               last_seen_at AS lastSeenAt
             FROM devices WHERE user_id = ? ORDER BY last_seen_at DESC
         `).all(userId);
+    }
+
+    // ── Device identity ─────────────────────────────────────────────────────────
+
+    /** A device as an identity: its key, and whether it may still use it. */
+    deviceIdentity(deviceId) {
+        return this.db.prepare(`
+            SELECT id, user_id AS userId, label, platform, public_key AS publicKey,
+              key_algorithm AS keyAlgorithm, status, created_at AS createdAt,
+              last_seen_at AS lastSeenAt, revoked_at AS revokedAt
+            FROM devices WHERE id = ?
+        `).get(deviceId) || null;
+    }
+
+    /**
+     * A device that has just proved it holds the private half of `publicKey`. The id
+     * is the server's, not the client's: a device may choose its own label, but not
+     * the name it is known by.
+     */
+    registerEnrolledDevice({ id, userId, label, platform, publicKey, algorithm, now }) {
+        this.db.prepare(`
+            INSERT INTO devices
+              (id, user_id, label, platform, public_key, key_algorithm, status, created_at, last_seen_at)
+            VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?)
+        `).run(id, userId, cleanOptional(label, 60), cleanOptional(platform, 40),
+            String(publicKey || ''), String(algorithm || ''), now, now);
+        return this.deviceIdentity(id);
+    }
+
+    renameDevice(deviceId, label, now) {
+        const result = this.db.prepare('UPDATE devices SET label = ?, last_seen_at = ? WHERE id = ?')
+            .run(cleanOptional(label, 60), now, deviceId);
+        return result.changes === 1;
+    }
+
+    /**
+     * A revoked device is not a revoked person. The key stops working and the push
+     * token is dropped so nothing is delivered to it, but the row stays: an iPhone
+     * that was replaced is a fact worth keeping, and an audit that cannot see it is
+     * not an audit.
+     */
+    revokeDevice(deviceId, now) {
+        const result = this.db.prepare(`
+            UPDATE devices SET status = 'revoked', revoked_at = ?, push_token = NULL, push_environment = NULL
+            WHERE id = ? AND status <> 'revoked'
+        `).run(now, deviceId);
+        return result.changes === 1;
+    }
+
+    /** Every device, for an operator. Not filtered by anything the caller claims. */
+    allDevices(userId = null) {
+        const where = userId ? 'WHERE d.user_id = ?' : '';
+        return this.db.prepare(`
+            SELECT d.id, d.user_id AS userId, u.display_name AS userName, d.label, d.platform,
+              d.status, d.key_algorithm AS keyAlgorithm, (d.public_key IS NOT NULL) AS hasKey,
+              (d.push_token IS NOT NULL) AS hasPushToken, d.created_at AS createdAt,
+              d.last_seen_at AS lastSeenAt, d.revoked_at AS revokedAt
+            FROM devices d JOIN users u ON u.id = d.user_id ${where}
+            ORDER BY u.display_name, d.last_seen_at DESC
+        `).all(...(userId ? [userId] : []));
+    }
+
+    // ── Enrolment invitations ───────────────────────────────────────────────────
+
+    /** Only the hash is stored: a copy of this database is not a stack of working invitations. */
+    createEnrollment({ id, tokenHash, now, expiresAt, createdBy = null, intendedUserId = null }) {
+        this.db.prepare(`
+            INSERT INTO enrollment_tokens
+              (id, token_hash, created_at, expires_at, created_by, intended_user_id)
+            VALUES (?, ?, ?, ?, ?, ?)
+        `).run(id, tokenHash, now, expiresAt, createdBy, intendedUserId);
+        return this.enrollmentById(id);
+    }
+
+    enrollmentById(id) {
+        return this.db.prepare(`
+            SELECT id, token_hash AS tokenHash, created_at AS createdAt, expires_at AS expiresAt,
+              used_at AS usedAt, used_by_device_id AS usedByDeviceId, revoked_at AS revokedAt,
+              created_by AS createdBy, intended_user_id AS intendedUserId
+            FROM enrollment_tokens WHERE id = ?
+        `).get(id) || null;
+    }
+
+    enrollmentByHash(tokenHash) {
+        return this.db.prepare(`
+            SELECT id, token_hash AS tokenHash, created_at AS createdAt, expires_at AS expiresAt,
+              used_at AS usedAt, used_by_device_id AS usedByDeviceId, revoked_at AS revokedAt,
+              created_by AS createdBy, intended_user_id AS intendedUserId
+            FROM enrollment_tokens WHERE token_hash = ?
+        `).get(tokenHash) || null;
+    }
+
+    /**
+     * Spends an invitation. One statement, so two devices redeeming the same code at
+     * the same moment cannot both succeed: the second finds nothing left to spend.
+     */
+    useEnrollment(id, deviceId, now) {
+        const spent = this.db.prepare(`
+            UPDATE enrollment_tokens SET used_at = ?, used_by_device_id = ?
+            WHERE id = ? AND used_at IS NULL AND revoked_at IS NULL
+        `).run(now, deviceId, id);
+        return spent.changes === 1;
+    }
+
+    revokeEnrollment(id, now) {
+        const result = this.db.prepare(
+            'UPDATE enrollment_tokens SET revoked_at = ? WHERE id = ? AND used_at IS NULL AND revoked_at IS NULL',
+        ).run(now, id);
+        return result.changes === 1;
+    }
+
+    enrollments(now, limit = 50) {
+        return this.db.prepare(`
+            SELECT id, created_at AS createdAt, expires_at AS expiresAt, used_at AS usedAt,
+              revoked_at AS revokedAt, created_by AS createdBy, intended_user_id AS intendedUserId,
+              used_by_device_id AS usedByDeviceId,
+              CASE WHEN revoked_at IS NOT NULL THEN 'revoked'
+                   WHEN used_at IS NOT NULL THEN 'used'
+                   WHEN expires_at <= ? THEN 'expired'
+                   ELSE 'open' END AS state
+            FROM enrollment_tokens ORDER BY created_at DESC LIMIT ?
+        `).all(now, Math.min(500, Math.max(1, Number(limit) || 50)));
+    }
+
+    // ── Additional authenticators ───────────────────────────────────────────────
+
+    /**
+     * Something else that vouches for the same device — the tailnet login it arrived
+     * with, today. Kept in its own table so no single mechanism becomes the identity,
+     * and so one can be revoked without touching the device key. A revoked
+     * authenticator stays revoked: it is evidence that was withdrawn on purpose.
+     */
+    rememberAuthenticator({ id, deviceId, type, externalSubject = '', metadata = {}, now }) {
+        this.db.prepare(`
+            INSERT INTO authenticators
+              (id, device_id, type, external_subject, metadata, created_at, last_verified_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(device_id, type, external_subject) DO UPDATE SET
+              last_verified_at = excluded.last_verified_at,
+              metadata = excluded.metadata
+        `).run(id, deviceId, type, String(externalSubject || '').slice(0, 200),
+            JSON.stringify(metadata || {}).slice(0, 2000), now, now);
+    }
+
+    authenticatorsForDevice(deviceId) {
+        return this.db.prepare(`
+            SELECT id, device_id AS deviceId, type, external_subject AS externalSubject,
+              metadata, created_at AS createdAt, last_verified_at AS lastVerifiedAt,
+              revoked_at AS revokedAt
+            FROM authenticators WHERE device_id = ? ORDER BY created_at
+        `).all(deviceId);
+    }
+
+    revokeAuthenticator(id, now) {
+        const result = this.db.prepare(
+            'UPDATE authenticators SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL',
+        ).run(now, id);
+        return result.changes === 1;
+    }
+
+    // ── Challenges ──────────────────────────────────────────────────────────────
+
+    createChallenge({ id, deviceId, nonce, now, expiresAt }) {
+        this.db.prepare(`
+            INSERT INTO auth_challenges (id, device_id, nonce, created_at, expires_at)
+            VALUES (?, ?, ?, ?, ?)
+        `).run(id, deviceId, nonce, now, expiresAt);
+    }
+
+    /**
+     * Takes a challenge out of circulation and hands it back. The take is what
+     * decides it: two signatures arriving together cannot both be answered by the
+     * same challenge, which is what makes a captured one useless to anybody else.
+     */
+    consumeChallenge(id, now) {
+        return this.transaction(() => {
+            const row = this.db.prepare('SELECT * FROM auth_challenges WHERE id = ?').get(id) || null;
+            if (!row) return null;
+            const taken = this.db.prepare('UPDATE auth_challenges SET used_at = ? WHERE id = ? AND used_at IS NULL')
+                .run(now, id);
+            return taken.changes === 1 ? row : null;
+        });
+    }
+
+    /** Challenges are cheap and worthless after minutes; only recent ones are kept. */
+    purgeChallenges(now) {
+        const cutoff = new Date(Date.parse(now) - 24 * 3600 * 1000).toISOString();
+        const removed = this.db.prepare('DELETE FROM auth_challenges WHERE expires_at < ?').run(cutoff);
+        return removed.changes;
     }
 
     // ── Calls ───────────────────────────────────────────────────────────────────

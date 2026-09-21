@@ -70,7 +70,76 @@ function loadConfig() {
         throw new Error('ALLOW_DEV_IDENTITY requires a loopback listener');
     }
 
+    // ── Network mode ────────────────────────────────────────────────────────────
+    //
+    // How this deployment is reached, which decides what about a request may be
+    // believed. `private` is the tailnet: a local proxy injects an identity header,
+    // and the loopback listener is what makes that header mean anything. `public` is
+    // the open internet behind a reverse proxy on this same host: nothing in the
+    // request is believed, and a device proves itself with a key it holds.
+    //
+    // The mode changes what is trusted, never which code runs: both modes are the
+    // same server, the same signalling and the same database.
+    const networkMode = text('CROSSBAR_NETWORK_MODE', 'private').toLowerCase();
+    if (networkMode !== 'private' && networkMode !== 'public') {
+        throw new Error('CROSSBAR_NETWORK_MODE must be private or public');
+    }
+
+    const publicHostname = text('CROSSBAR_PUBLIC_HOSTNAME', '').toLowerCase();
+    if (networkMode === 'public') {
+        if (!publicHostname) {
+            throw new Error('CROSSBAR_PUBLIC_HOSTNAME is required in public mode');
+        }
+        // The origin handed to clients inside a join URL has to be the address they
+        // reached this server on. Getting this wrong sends every invitation to a host
+        // that does not answer, and it fails at the worst moment — mid-call.
+        if (new URL(publicOrigin).hostname.toLowerCase() !== publicHostname) {
+            throw new Error('PUBLIC_ORIGIN must name CROSSBAR_PUBLIC_HOSTNAME in public mode');
+        }
+        if (bool('ALLOW_DEV_IDENTITY', false)) {
+            throw new Error('ALLOW_DEV_IDENTITY must be off in public mode: it accepts a claimed identity');
+        }
+    }
+
+    // The identity header a local proxy injects. Believed only in private mode: on the
+    // public internet the same header can simply be typed by whoever is calling, and
+    // the reverse proxy strips it for exactly that reason. The default follows the mode
+    // — off in public, on in private — and asking for it in public mode is refused
+    // rather than quietly ignored, because someone who set it meant something by it.
+    const trustTailscaleHeaders = bool('TRUST_TAILSCALE_HEADERS', networkMode === 'private');
+    if (networkMode === 'public' && trustTailscaleHeaders) {
+        throw new Error('TRUST_TAILSCALE_HEADERS must be off in public mode: the header is client-supplied there');
+    }
+
+    // ── Device identity ─────────────────────────────────────────────────────────
+    //
+    // Crossbar's own authentication: a per-device key, enrolled once, used to answer
+    // a challenge. It is the canonical application identity in both modes; the tailnet
+    // header is an additional trust signal where it exists, never the thing that
+    // decides who someone is.
+    //
+    // Off by default in private mode because the devices that exist today have no key
+    // yet, and switching it on stops them connecting. On by default in public mode
+    // because reachability there means nothing at all.
+    const requireDeviceAuth = bool('CROSSBAR_REQUIRE_DEVICE_AUTH', networkMode === 'public');
+    const sessionSecret = text('CROSSBAR_SESSION_SECRET', '');
+    if (requireDeviceAuth && !sessionSecret) {
+        throw new Error('CROSSBAR_REQUIRE_DEVICE_AUTH needs CROSSBAR_SESSION_SECRET to sign sessions with');
+    }
+
     const stunUrl = text('ICE_STUN_URL', 'stun:stun.l.google.com:19302');
+    const turnHost = text('CROSSBAR_TURN_HOST', '');
+    const turnPort = integer('CROSSBAR_TURN_PORT', 3478, 1, 65535);
+    const turnMinPort = integer('CROSSBAR_TURN_MIN_PORT', 49160, 1024, 65535);
+    const turnMaxPort = integer('CROSSBAR_TURN_MAX_PORT', 49200, 1024, 65535);
+    const turnSharedSecret = text('CROSSBAR_TURN_SHARED_SECRET', '');
+    if (turnHost && !turnSharedSecret) {
+        throw new Error('CROSSBAR_TURN_HOST needs CROSSBAR_TURN_SHARED_SECRET: clients get temporary credentials, never a static one');
+    }
+    if (turnMaxPort < turnMinPort) {
+        throw new Error('CROSSBAR_TURN_MAX_PORT must not be below CROSSBAR_TURN_MIN_PORT');
+    }
+
     const turnUrl = text('ICE_TURN_URL', '');
     const turnUsername = text('ICE_TURN_USERNAME', '');
     const turnCredential = text('ICE_TURN_CREDENTIAL', '');
@@ -85,8 +154,12 @@ function loadConfig() {
         familyConfigPath: path.resolve(text('FAMILY_CONFIG_PATH', './data/family.json')),
         webRoot: path.resolve(text('WEB_ROOT', './public')),
 
+        // Transport and trust
+        networkMode,
+        publicHostname,
+        trustTailscaleHeaders,
+
         // Identity
-        trustTailscaleHeaders: bool('TRUST_TAILSCALE_HEADERS', true),
         // A login that arrives from the tailnet is enrolled on first sight, which is
         // what the service this replaces did. Turn it off to require every member to
         // be written into the household file first.
@@ -96,6 +169,13 @@ function loadConfig() {
             .split(',')
             .map((value) => value.trim().toLowerCase())
             .filter(Boolean),
+
+        // Crossbar device identity
+        requireDeviceAuth,
+        sessionSecret,
+        sessionTtlSeconds: integer('CROSSBAR_SESSION_TTL_SECONDS', 43200, 300, 2592000),
+        challengeTtlSeconds: integer('CROSSBAR_CHALLENGE_TTL_SECONDS', 120, 30, 900),
+        enrollmentTtlSeconds: integer('CROSSBAR_ENROLLMENT_TTL_SECONDS', 900, 60, 86400),
 
         // Call behaviour
         callRingSeconds: integer('CALL_RING_SECONDS', 90, 30, 300),
@@ -123,6 +203,18 @@ function loadConfig() {
                 ? [{ urls: turnUrl, username: turnUsername, credential: turnCredential }]
                 : []),
         ]),
+        // STUN and TURN for a deployment that relays. `iceServers` above is a static
+        // list, which is all a tailnet household ever needs; when a TURN host is
+        // configured the per-device list from `ice.js` is used instead, because a
+        // credential that ships inside a client is a credential everybody has.
+        turn: Object.freeze({
+            host: turnHost,
+            port: turnPort,
+            minPort: turnMinPort,
+            maxPort: turnMaxPort,
+            sharedSecret: turnSharedSecret,
+            ttlSeconds: integer('CROSSBAR_TURN_TTL_SECONDS', 600, 60, 86400),
+        }),
 
         // Push (optional; absent keys mean the capability reports itself disabled)
         vapidPublicKey: text('VAPID_PUBLIC_KEY', ''),

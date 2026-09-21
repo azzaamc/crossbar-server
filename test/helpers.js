@@ -17,7 +17,7 @@ const DEV_USERS = ['abdullah@dev', 'dad@dev', 'mum@dev'];
 
 const FAMILY = {
     users: [
-        { id: 'abdullah', tailscaleLogin: 'abdullah@dev', displayName: 'Abdullah', relationship: 'Me', avatar: '' },
+        { id: 'abdullah', tailscaleLogin: 'abdullah@dev', displayName: 'Abdullah', relationship: 'Me', avatar: '', admin: true },
         { id: 'dad', tailscaleLogin: 'dad@dev', displayName: 'Dad', relationship: 'Father', avatar: '' },
         { id: 'mum', tailscaleLogin: 'mum@dev', displayName: 'Mum', relationship: 'Mother', avatar: '' },
     ],
@@ -61,6 +61,14 @@ function baseConfig(dataDir, familyConfigPath, overrides = {}) {
         statusPerSecond: 10,
         malformedLimit: 10,
         iceServers: [{ urls: 'stun:example.invalid:3478' }],
+        networkMode: 'private',
+        publicHostname: '',
+        requireDeviceAuth: false,
+        sessionSecret: '',
+        sessionTtlSeconds: 43200,
+        challengeTtlSeconds: 120,
+        enrollmentTtlSeconds: 900,
+        turn: { host: '', port: 3478, minPort: 49160, maxPort: 49200, sharedSecret: '', ttlSeconds: 600 },
         vapidPublicKey: '',
         vapidPrivateKey: '',
         vapidSubject: '',
