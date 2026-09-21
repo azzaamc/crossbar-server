@@ -47,13 +47,17 @@ function createEventBus({ store, log, heartbeatMs = HEARTBEAT_MS }) {
     /** Registers a stream and returns the function that removes it again. */
     function add(userId, response) {
         let set = streams.get(userId);
-        const wasOffline = !set || set.size === 0;
         if (!set) {
             set = new Map();
             streams.set(userId, set);
         }
         store.touchPresence(userId, new Date().toISOString());
-        if (wasOffline) presence(userId, new Date().toISOString());
+        // Always the truth, whether or not this is a change. A client replacing its stream —
+        // which a pull-to-refresh does — cancels one and opens another, and the server can
+        // see those in either order. A broadcast that only fires on a transition then leaves
+        // the last word as whatever arrived second, and a phone that heard "offline" about
+        // somebody who is online has no reason to ask again.
+        presence(userId, new Date().toISOString());
 
         const timer = setInterval(() => {
             store.touchPresence(userId, new Date().toISOString());
@@ -72,10 +76,12 @@ function createEventBus({ store, log, heartbeatMs = HEARTBEAT_MS }) {
             const current = streams.get(userId);
             if (!current) return;
             current.delete(response);
-            if (!current.size) {
-                streams.delete(userId);
-                presence(userId, new Date().toISOString());
-            }
+            if (!current.size) streams.delete(userId);
+            // Same reasoning as `add`: the state after the change is what gets sent, not
+            // only the moment it crosses zero. A stream that was replaced still counts while
+            // the new one is open, so a person who never went offline is not reported as
+            // having gone offline.
+            presence(userId, new Date().toISOString());
         };
     }
 
