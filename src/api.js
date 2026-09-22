@@ -943,6 +943,12 @@ function createRequestHandler({ config, store, bus, push, lifecycle, log, client
             return;
         }
 
+        // What has happened, as opposed to what is happening: the same records the route
+        // below reads, without the filter that makes it a list of calls to rejoin.
+        if (req.method === 'GET' && pathname === '/api/calls/history') {
+            return sendJson(res, 200, { calls: store.callHistory(user.id) });
+        }
+
         if (req.method === 'GET' && pathname === '/api/calls') {
             return sendJson(res, 200, { calls: store.callsForUser(user.id) });
         }

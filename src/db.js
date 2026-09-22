@@ -868,7 +868,31 @@ class Store {
         };
     }
 
-    /** Open calls for the person: what they must ring, and what they are already in. */
+    /**
+     * What has happened on this person's calls, newest first.
+     *
+     * `callsForUser` answers *what is happening now* — ringing and active calls, which is
+     * what a client needs in order to rejoin one. This answers the other question, and reads
+     * the same rows: a call is one row and each person's part in it is another, so "missed"
+     * is a fact about the row rather than something counted while it happened.
+     */
+    callHistory(userId, limit = 50) {
+        return this.db.prepare(`
+            SELECT c.id AS callId, c.kind, c.caller_user_id AS callerId,
+              caller.display_name AS callerName,
+              c.created_at AS startedAt, c.answered_at AS answeredAt, c.ended_at AS endedAt,
+              p.status AS myStatus, p.joined_at AS joinedAt, p.left_at AS leftAt,
+              (SELECT GROUP_CONCAT(u.display_name, ', ')
+                 FROM call_participants q JOIN users u ON u.id = q.user_id
+                WHERE q.call_id = c.id AND q.user_id <> c.caller_user_id) AS others
+            FROM calls c
+            JOIN call_participants p ON p.call_id = c.id AND p.user_id = ?
+            JOIN users caller ON caller.id = c.caller_user_id
+            WHERE c.ended_at IS NOT NULL
+            ORDER BY c.created_at DESC LIMIT ?
+        `).all(userId, Math.min(200, Math.max(1, Number(limit) || 50)));
+    }
+
     callsForUser(userId) {
         return this.db.prepare(`
             SELECT c.id, c.room_id AS roomId, c.caller_user_id AS callerId, caller.display_name AS callerName,
