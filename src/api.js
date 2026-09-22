@@ -48,6 +48,8 @@ const AUTH_STATUS = {
     CHALLENGE_EXPIRED: 410,
     SIGNATURE_INVALID: 401,
     USER_UNKNOWN: 404,
+    OPERATOR_DISABLED: 404,
+    PASSWORD_INVALID: 401,
     RATE_LIMITED: 429,
 };
 
@@ -64,6 +66,8 @@ const AUTH_MESSAGE = {
     CHALLENGE_EXPIRED: 'That challenge has expired.',
     SIGNATURE_INVALID: 'That signature does not match this device.',
     USER_UNKNOWN: 'That person is not in this household.',
+    OPERATOR_DISABLED: 'This server has no console password set.',
+    PASSWORD_INVALID: 'That password is not the one for this server.',
     RATE_LIMITED: 'Too many attempts. Try again shortly.',
 };
 
@@ -94,9 +98,30 @@ function createRequestHandler({ config, store, bus, push, lifecycle, log, client
         return headers;
     }
 
-    function sendJson(res, status, data) {
-        res.writeHead(status, { ...securityHeaders('application/json; charset=utf-8'), 'cache-control': 'no-store' });
+    function sendJson(res, status, data, extra = {}) {
+        res.writeHead(status, {
+            ...securityHeaders('application/json; charset=utf-8'),
+            'cache-control': 'no-store',
+            ...extra,
+        });
         res.end(JSON.stringify(data));
+    }
+
+    /**
+     * The operator's session, as a cookie the console's own script cannot read.
+     *
+     * `SameSite=Strict`, because nothing but this site should be able to make a browser
+     * send it. `Secure` only where the origin is https: a deployment running on plain
+     * loopback would otherwise never receive the cookie it had just been given.
+     */
+    function operatorCookie(token, { clear = false } = {}) {
+        const parts = [
+            `${auth.OPERATOR_COOKIE}=${clear ? '' : token}`,
+            'Path=/', 'HttpOnly', 'SameSite=Strict',
+        ];
+        if (config.publicOrigin.startsWith('https:')) parts.push('Secure');
+        if (clear) parts.push('Max-Age=0');
+        return parts.join('; ');
     }
 
     function sendError(res, status, code, message) {
@@ -380,8 +405,50 @@ function createRequestHandler({ config, store, bus, push, lifecycle, log, client
             });
         }
 
-        const user = requireUser(req, res);
-        if (!user) return;
+        // ── The operator's way in ─────────────────────────────────────────────────
+        //
+        // Above the device check on purpose: these two are how a browser with no key and no
+        // session gets one, and a route that demanded a session first could never be used by
+        // anyone who needs it. The only route that takes a password, and it is not an
+        // account — no username, nothing to enumerate, and the same answer whether the
+        // password is wrong or none has been set. Rate limited by address, because a shared
+        // secret with no limit is a shared secret somebody eventually finds.
+        if (req.method === 'POST' && pathname === '/api/admin/session') {
+            if (!lifecycle.limiter.take(`operator:${clientAddress(req)}`, 5, 60000)) {
+                return authFailure(res, 'RATE_LIMITED');
+            }
+            const body = await readJsonOrRefuse(req, res);
+            if (!body) return;
+            const result = auth.openOperatorSession({
+                config,
+                now: new Date().toISOString(),
+                password: String(body.password || ''),
+            });
+            if (!result.ok) {
+                log.warn('operator_login_refused', { from: clientAddress(req) });
+                return authFailure(res, result.reason);
+            }
+            log.info('operator_login', { from: clientAddress(req) });
+            return sendJson(res, 200, { ok: true, expiresAt: result.session.expiresAt },
+                { 'set-cookie': operatorCookie(result.session.token) });
+        }
+
+        // Closing a session only ever takes something away, so it needs no privilege, and
+        // it has to work from a browser whose session has already stopped being accepted.
+        if (req.method === 'POST' && pathname === '/api/admin/signout') {
+            return sendJson(res, 200, { ok: true }, { 'set-cookie': operatorCookie('', { clear: true }) });
+        }
+
+        // The operator's session answers for the administrative routes and nothing else, so
+        // it is resolved here: a browser holding it has no device, and `requireUser` would
+        // refuse it on the way in — which is the friction this exists to remove.
+        const isAdminRoute = pathname.startsWith('/api/admin/');
+        const operator = isAdminRoute
+            ? auth.operatorFromRequest(req, { config, now: new Date().toISOString() })
+            : null;
+
+        const user = operator ? null : requireUser(req, res);
+        if (!operator && !user) return;
 
         if (deviceId) store.touchDevice(deviceId, new Date().toISOString());
 
@@ -439,9 +506,11 @@ function createRequestHandler({ config, store, bus, push, lifecycle, log, client
         // administrator. There is no second kind of account and no admin UI: the CLI
         // drives these same routes, and the same identity rules apply to both.
         if (pathname.startsWith('/api/admin/')) {
-            if (!user.admin) {
+            if (!operator && !user.admin) {
                 return sendError(res, 403, 'NOT_ADMIN', 'Only an administrator may manage devices.');
             }
+            /** Who did it, for the record and for the invitations: a person, or the console. */
+            const actor = operator ? 'operator' : user.id;
 
             /** A device as an operator sees it. The public key is not part of that. */
             function adminDevice(device) {
@@ -503,14 +572,14 @@ function createRequestHandler({ config, store, bus, push, lifecycle, log, client
                     config,
                     now: new Date().toISOString(),
                     userId: String(body.userId || ''),
-                    createdBy: user.id,
+                    createdBy: actor,
                     ttlSeconds: Number(body.ttlSeconds) || null,
                 });
                 if (!result.ok) return authFailure(res, result.reason);
                 log.info('enrollment_created', {
                     enrollmentId: result.enrollment.id,
                     intendedUserId: result.enrollment.intendedUserId,
-                    createdBy: user.id,
+                    createdBy: actor,
                 });
                 // The plaintext token is in this response and nowhere else; only its
                 // hash exists server-side, so it cannot be read back later.
@@ -531,7 +600,7 @@ function createRequestHandler({ config, store, bus, push, lifecycle, log, client
                 const now = new Date().toISOString();
                 if (deviceMatch[2] === 'revoke') {
                     store.revokeDevice(target.id, now);
-                    log.info('device_revoked', { deviceId: target.id, userId: target.userId, by: user.id });
+                    log.info('device_revoked', { deviceId: target.id, userId: target.userId, by: actor });
                     return sendJson(res, 200, { device: adminDevice(store.deviceIdentity(target.id)) });
                 }
                 const body = await readJsonOrRefuse(req, res);
@@ -544,7 +613,7 @@ function createRequestHandler({ config, store, bus, push, lifecycle, log, client
             if (req.method === 'POST' && enrollmentMatch) {
                 const revoked = store.revokeEnrollment(enrollmentMatch[1], new Date().toISOString());
                 if (!revoked) return sendError(res, 404, 'ENROLLMENT_INVALID', 'That enrolment code is not open.');
-                log.info('enrollment_revoked', { enrollmentId: enrollmentMatch[1], by: user.id });
+                log.info('enrollment_revoked', { enrollmentId: enrollmentMatch[1], by: actor });
                 return sendJson(res, 200, { revoked: true });
             }
 

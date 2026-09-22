@@ -185,8 +185,12 @@ function loadConfig() {
 
         // Crossbar device identity
         requireDeviceAuth,
+        // The operator's way in to the console. A hash, never a password: this file is
+        // read by anything that can read the service's configuration. Set it with
+        // `node src/admin.js password`, which is the only thing that writes it.
+        adminPasswordHash: text('CROSSBAR_ADMIN_PASSWORD_HASH', ''),
         sessionSecret,
-        sessionTtlSeconds: integer('CROSSBAR_SESSION_TTL_SECONDS', 43200, 300, 2592000),
+        sessionTtlSeconds: integer('CROSSBAR_SESSION_TTL_SECONDS', 43200, 60, 2592000),
         challengeTtlSeconds: integer('CROSSBAR_CHALLENGE_TTL_SECONDS', 120, 30, 900),
         enrollmentTtlSeconds: integer('CROSSBAR_ENROLLMENT_TTL_SECONDS', 900, 60, 86400),
 

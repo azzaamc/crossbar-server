@@ -27,7 +27,12 @@ async function call(path, options = {}) {
         }
     }
 
-    if (!response.ok) throw new Error(data?.error?.message || `The server refused that (HTTP ${response.status}).`);
+    if (!response.ok) {
+        const failure = new Error(data?.error?.message || `The server refused that (HTTP ${response.status}).`);
+        failure.status = response.status;
+        failure.code = data?.error?.code;
+        throw failure;
+    }
     return data;
 }
 
@@ -302,8 +307,79 @@ function showEnrolment(notice) {
     );
 }
 
+/**
+ * The way in for whoever runs this household.
+ *
+ * The console is an operator surface, not a client, so it takes a password — kept on the
+ * server only as a hash, and answered with a session cookie this page cannot read. The
+ * device-key path is still underneath: a browser that has enrolled one is admitted without
+ * being asked anything, so this appears only when there is neither.
+ */
+function showLogin(message, withoutPassword) {
+    if (withoutPassword) {
+        // No password has been set on this server, so the only way in is a device key.
+        showEnrolment(message);
+        return;
+    }
+
+    const password = el('input', {
+        type: 'password',
+        placeholder: 'Console password',
+        autocomplete: 'current-password',
+    });
+    const notice = el('p', { class: message ? 'failed' : 'muted', text: message || '' });
+    const button = el('button', { type: 'button', class: 'primary', text: 'Sign in' });
+
+    const signIn = async () => {
+        button.disabled = true;
+        notice.className = 'muted';
+        notice.textContent = 'Checking…';
+        try {
+            const response = await fetch('/api/admin/session', {
+                method: 'POST',
+                headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ password: password.value }),
+            });
+            const data = await response.json().catch(() => ({}));
+            if (!response.ok) {
+                notice.className = 'failed';
+                notice.textContent = data?.error?.message || `The server refused that (HTTP ${response.status}).`;
+                button.disabled = false;
+                return;
+            }
+            await refresh();
+        } catch (error) {
+            notice.className = 'failed';
+            notice.textContent = error.message;
+            button.disabled = false;
+        }
+    };
+
+    button.addEventListener('click', signIn);
+    password.addEventListener('keydown', (event) => {
+        if (event.key === 'Enter') signIn();
+    });
+
+    main.replaceChildren(
+        el('h2', { text: 'This console' }),
+        el('p', {
+            text: 'Signing in here administers the household: who is in it, which devices are '
+                + 'enrolled, and how the server itself is configured. The password is checked '
+                + 'against a hash on the server and never travels anywhere else.',
+        }),
+        el('div', { class: 'grant' }, [el('div', { class: 'row' }, [password, button]), notice]),
+    );
+    password.focus();
+}
+
 /** What this browser is, and the way to stop being it. */
 function browserFoot() {
+    const signOut = el('button', { type: 'button', text: 'Sign out' });
+    signOut.addEventListener('click', async () => {
+        await fetch('/api/admin/signout', { method: 'POST' });
+        await refresh();
+    });
+
     const forget = el('button', { type: 'button', class: 'danger', text: 'Forget this browser' });
     forget.addEventListener('click', async () => {
         if (!confirm('Forget the key this browser holds? Enrolling it again needs a new code.')) return;
@@ -318,6 +394,7 @@ function browserFoot() {
                 ? 'This browser signs in with a key of its own, kept unreadable on this device.'
                 : 'This browser cannot keep a key: it needs a secure connection to this server.',
         }),
+        signOut,
         forget,
     ]);
 }
@@ -332,21 +409,6 @@ function show(text, failed = false) {
 
 async function refresh() {
     try {
-        // A public deployment trusts nothing about a request, so this browser has to be a
-        // device before the server will answer anything at all. A private one has the
-        // tailnet behind it and arrives already known.
-        if (!CrossbarDevice.token()) {
-            const identity = await call('/api/session');
-            if (!identity.authenticated) {
-                const known = CrossbarDevice.supported ? await CrossbarDevice.identity() : null;
-                if (known?.deviceId) await CrossbarDevice.session();
-                if (!CrossbarDevice.token()) {
-                    showEnrolment();
-                    return;
-                }
-            }
-        }
-
         const [status, people, devices, enrollments] = await Promise.all([
             call('/api/admin/status'),
             call('/api/admin/users'),
@@ -361,6 +423,13 @@ async function refresh() {
             browserFoot(),
         );
     } catch (error) {
+        // Refused for who this browser is, rather than for what it asked: the answer is the
+        // operator's password — unless the server has none set, in which case it is a device
+        // key, which is what the enrolment panel is for.
+        if (error.status === 401 || error.status === 403 || error.code === 'OPERATOR_DISABLED') {
+            showLogin(error.message || '', error.code === 'OPERATOR_DISABLED');
+            return;
+        }
         show(error.message, true);
     }
 }

@@ -17,6 +17,9 @@ const crypto = require('node:crypto');
 /** Prefix on every session token, so a token from another scheme cannot be parsed as one of these. */
 const TOKEN_VERSION = 'v1';
 
+/** The cookie the operator's console session lives in. HttpOnly: no script can read it. */
+const OPERATOR_COOKIE = 'crossbar_admin';
+
 /** The only signing algorithm accepted. Curve and hash are fixed with it — see `deviceKeyFrom`. */
 const ALGORITHM = 'ES256';
 const CURVE = 'prime256v1';
@@ -126,7 +129,8 @@ function issueSession({ deviceId, userId, secret, ttlSeconds, now }) {
     return { token: `${body}.${signature}`, expiresAt: new Date(expiresAt * 1000).toISOString() };
 }
 
-function verifySession(token, secret, now) {
+/** The claims a signed token carries, once its signature and its expiry hold up. */
+function verifyToken(token, secret, now) {
     const parts = String(token || '').split('.');
     if (parts.length !== 3 || parts[0] !== TOKEN_VERSION) return null;
     const body = `${parts[0]}.${parts[1]}`;
@@ -138,18 +142,25 @@ function verifySession(token, secret, now) {
     } catch {
         return null;
     }
+    if (!claims || typeof claims.exp !== 'number' || claims.exp * 1000 <= Date.parse(now)) return null;
+    return claims;
+}
+
+/** A device session's claims, or null: the shape a device session has and no other does. */
+function verifySession(token, secret, now) {
+    const claims = verifyToken(token, secret, now);
     if (!claims || typeof claims.d !== 'string' || typeof claims.u !== 'string') return null;
-    if (typeof claims.exp !== 'number' || claims.exp * 1000 <= Date.parse(now)) return null;
     return claims;
 }
 
 /**
  * The session a request carries, if any.
  *
- * Three places, because three kinds of client exist: a header for anything that can
- * set one, a second header name for clients that want to keep `Authorization` for
- * something else, and the query string because a browser cannot set headers on a
- * WebSocket upgrade.
+ * Four places, because four kinds of client exist: a header for anything that can set
+ * one, a second header name for clients that want to keep `Authorization` for something
+ * else, the query string because a browser cannot set headers on a WebSocket upgrade,
+ * and the operator's cookie — which the page's own script is not allowed to read, so it
+ * cannot leak it either.
  */
 function tokenFromRequest(req) {
     const authorization = req.headers?.authorization;
@@ -158,12 +169,25 @@ function tokenFromRequest(req) {
     }
     const named = req.headers?.['x-crossbar-session'];
     if (typeof named === 'string' && named.trim()) return named.trim();
+    const cookie = cookieFromRequest(req, OPERATOR_COOKIE);
+    if (cookie) return cookie;
     try {
         const url = new URL(req.url || '/', 'http://localhost');
         const query = url.searchParams.get('token');
         if (query) return query.trim();
     } catch {
         // A URL that cannot be parsed carries no token.
+    }
+    return null;
+}
+
+/** One cookie, by name, out of whatever the request sent. */
+function cookieFromRequest(req, name) {
+    const header = req.headers?.cookie;
+    if (typeof header !== 'string') return null;
+    for (const part of header.split(';')) {
+        const [key, ...rest] = part.trim().split('=');
+        if (key === name) return rest.join('=').trim() || null;
     }
     return null;
 }
@@ -184,6 +208,89 @@ function sessionFromRequest(req, { store, config, now }) {
     const user = store.userById(claims.u);
     if (!user) return null;
     return { device, user, claims };
+}
+
+// ── The operator ────────────────────────────────────────────────────────────────
+
+/**
+ * A password hash, in one line, with the parameters that made it.
+ *
+ * scrypt, because it is the one Node ships that is meant for passwords: memory-hard, so
+ * guessing is expensive and checking is cheap. The cost travels with the hash, so raising
+ * it later does not invalidate what is already set.
+ */
+const SCRYPT = Object.freeze({ N: 16384, r: 8, p: 1, keyLength: 32 });
+
+function hashPassword(password) {
+    const salt = crypto.randomBytes(16);
+    const key = crypto.scryptSync(String(password), salt, SCRYPT.keyLength, SCRYPT);
+    return ['scrypt', SCRYPT.N, SCRYPT.r, SCRYPT.p,
+        salt.toString('base64'), key.toString('base64')].join(':');
+}
+
+/** Whether this password is the one that hash was made from. */
+function verifyPassword(password, stored) {
+    const parts = String(stored || '').split(':');
+    if (parts.length !== 6 || parts[0] !== 'scrypt') return false;
+    const [, N, r, p, salt, expected] = parts;
+    let key;
+    try {
+        key = crypto.scryptSync(String(password), Buffer.from(salt, 'base64'),
+            Buffer.from(expected, 'base64').length,
+            { N: Number(N), r: Number(r), p: Number(p) });
+    } catch {
+        return false;
+    }
+    return constantTimeEquals(key.toString('base64'), expected);
+}
+
+/**
+ * The operator's way in to the console.
+ *
+ * The console is an operator surface, not a client, and asking whoever runs this household
+ * to enrol a device key before they could open it made the console the hardest page in the
+ * product to reach. So it has a password of its own — one, shared by whoever administers
+ * the household, stored only as a hash.
+ *
+ * Deliberately not an account: no username, no recovery, nothing to enumerate, and the same
+ * answer whether the password is wrong or none has been set. What it produces is a session
+ * like any other, signed with the same secret.
+ */
+function openOperatorSession({ config, now, password }) {
+    if (!config.sessionSecret || !config.adminPasswordHash) return { ok: false, reason: 'OPERATOR_DISABLED' };
+    if (!verifyPassword(password, config.adminPasswordHash)) return { ok: false, reason: 'PASSWORD_INVALID' };
+    return {
+        ok: true,
+        session: issueOperatorSession({
+            secret: config.sessionSecret,
+            ttlSeconds: config.sessionTtlSeconds,
+            now,
+        }),
+    };
+}
+
+function issueOperatorSession({ secret, ttlSeconds, now }) {
+    const issuedAt = Math.floor(Date.parse(now) / 1000);
+    const expiresAt = issuedAt + ttlSeconds;
+    const payload = Buffer.from(JSON.stringify({ a: true, iat: issuedAt, exp: expiresAt }), 'utf8')
+        .toString('base64url');
+    const body = `${TOKEN_VERSION}.${payload}`;
+    const signature = crypto.createHmac('sha256', secret).update(body).digest('base64url');
+    return { token: `${body}.${signature}`, expiresAt: new Date(expiresAt * 1000).toISOString() };
+}
+
+/** An operator session's claims, or null: `a`, which no device session carries. */
+function verifyOperatorToken(token, secret, now) {
+    const claims = verifyToken(token, secret, now);
+    if (!claims || claims.a !== true) return null;
+    return claims;
+}
+
+/** The operator a request proves itself to be, or null. */
+function operatorFromRequest(req, { config, now }) {
+    if (!config.sessionSecret || !config.adminPasswordHash) return null;
+    const claims = verifyOperatorToken(tokenFromRequest(req), config.sessionSecret, now);
+    return claims ? { source: 'password', claims } : null;
 }
 
 // ── Enrolment ───────────────────────────────────────────────────────────────────
@@ -364,6 +471,11 @@ module.exports = {
     completeSession,
     sessionFromRequest,
     tokenFromRequest,
+    openOperatorSession,
+    operatorFromRequest,
+    hashPassword,
+    verifyPassword,
+    OPERATOR_COOKIE,
     issueSession,
     verifySession,
     verifyDeviceSignature,

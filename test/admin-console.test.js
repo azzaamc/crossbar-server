@@ -9,6 +9,13 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 
 const { startTestServer, api } = require('./helpers');
+const auth = require('../src/auth');
+
+const PASSWORD = 'a-console-password-for-testing';
+const WITH_PASSWORD = {
+    sessionSecret: 'console-test-secret',
+    adminPasswordHash: auth.hashPassword(PASSWORD),
+};
 
 async function get(base, route) {
     const response = await fetch(`${base}${route}`);
@@ -18,6 +25,20 @@ async function get(base, route) {
         body: await response.text(),
     };
 }
+
+/** Signs in with a password, and answers with whatever cookie came back. */
+async function signIn(base, password) {
+    const response = await fetch(`${base}/api/admin/session`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ password }),
+    });
+    const body = await response.json().catch(() => ({}));
+    return { status: response.status, body, cookie: response.headers.get('set-cookie') || '' };
+}
+
+/** The cookie's first name=value pair, which is what a browser would send back. */
+const cookiePair = (header) => header.split(';')[0];
 
 test('the console is served from the server, and names its own parts', async (t) => {
     const { server, base } = await startTestServer();
@@ -58,4 +79,58 @@ test('the page is public and every fact on it is not', async (t) => {
     assert.equal((await api(base, null, '/api/admin/status')).status, 401);
     assert.equal((await api(base, 'dad@dev', '/api/admin/status')).status, 403);
     assert.equal((await api(base, 'abdullah@dev', '/api/admin/status')).status, 200);
+});
+
+test('a password opens the console, and only the console', async (t) => {
+    const { server, base } = await startTestServer(WITH_PASSWORD);
+    t.after(() => server.close());
+
+    const refused = await signIn(base, 'not-it');
+    assert.equal(refused.status, 401);
+    assert.equal(refused.body.error.code, 'PASSWORD_INVALID');
+    assert.equal(refused.cookie, '', 'a refusal sets no session');
+
+    const opened = await signIn(base, PASSWORD);
+    assert.equal(opened.status, 200);
+    // The cookie is the session, and it is one no script can read.
+    assert.match(opened.cookie, /^crossbar_admin=v1\./);
+    assert.match(opened.cookie, /HttpOnly/);
+    assert.match(opened.cookie, /SameSite=Strict/);
+
+    const cookie = cookiePair(opened.cookie);
+    const status = await fetch(`${base}/api/admin/status`, { headers: { cookie } });
+    assert.equal(status.status, 200);
+
+    // And it answers for the console's routes and nothing else: a browser holding it is not
+    // a household member, and must not be able to act as one.
+    const bootstrap = await fetch(`${base}/api/bootstrap`, { headers: { cookie } });
+    assert.equal(bootstrap.status, 401);
+
+    // Closing it takes the session away again.
+    const closed = await fetch(`${base}/api/admin/signout`, { method: 'POST', headers: { cookie } });
+    assert.equal(closed.status, 200);
+    assert.match(closed.headers.get('set-cookie') || '', /Max-Age=0/);
+});
+
+test('a server with no password set says so, and a password is not guessed at', async (t) => {
+    const { server, base } = await startTestServer({ sessionSecret: 'console-test-secret' });
+    t.after(() => server.close());
+
+    const unanswered = await signIn(base, PASSWORD);
+    assert.equal(unanswered.status, 404);
+    assert.equal(unanswered.body.error.code, 'OPERATOR_DISABLED');
+
+    // Nothing to answer, and nothing to guess at either.
+    assert.equal((await api(base, null, '/api/admin/status')).status, 401);
+});
+
+test('guessing is rate limited', async (t) => {
+    const { server, base } = await startTestServer(WITH_PASSWORD);
+    t.after(() => server.close());
+
+    const answers = [];
+    for (let attempt = 0; attempt < 7; attempt += 1) answers.push((await signIn(base, 'wrong')).status);
+    assert.equal(answers.at(-1), 429, `attempts: ${answers.join(', ')}`);
+    // And the right password is behind the same limit, not beside it.
+    assert.equal((await signIn(base, PASSWORD)).status, 429);
 });

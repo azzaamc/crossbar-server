@@ -30,6 +30,7 @@ const USAGE = `Crossbar administration
   status                                 Configuration and counts
   mode                                   Both configurations, and which is in force
   mode private|public                    Switch this deployment to that one
+  password                               Set the console's password, prompted
   doctor                                 Reachability checks
 `;
 
@@ -118,6 +119,55 @@ function loadFresh(cwd, mode) {
     return { ok: result.status === 0, message: failure.replace(/^\w*Error: /, '') };
 }
 
+/** A line typed without appearing on the screen, which is what a password deserves. */
+function readPassword(prompt) {
+    return new Promise((resolve) => {
+        process.stdout.write(prompt);
+        const { stdin } = process;
+        const wasRaw = Boolean(stdin.isRaw);
+        if (stdin.isTTY) stdin.setRawMode(true);
+        stdin.resume();
+        let typed = '';
+
+        const finish = (rest) => {
+            stdin.removeListener('data', onData);
+            if (stdin.isTTY) stdin.setRawMode(wasRaw);
+            process.stdout.write('\n');
+            // Anything typed after the newline belongs to whoever asks next — which is this
+            // function again, for the confirmation — so it goes back rather than being lost.
+            // Paused first: a stream that is still flowing emits what is pushed into it to a
+            // listener that has just been removed, which is to say it drops it.
+            stdin.pause();
+            if (rest) stdin.unshift(Buffer.from(rest, 'utf8'));
+            resolve(typed);
+        };
+
+        const onData = (chunk) => {
+            const text = String(chunk);
+            for (let index = 0; index < text.length; index += 1) {
+                const character = text[index];
+                if (character === '\r' || character === '\n') return finish(text.slice(index + 1));
+                // Ctrl-C is a way out, and it should leave the terminal as it found it.
+                if (character === '\u0003') { process.stdout.write('\n'); process.exit(130); }
+                if (character === '\u007f' || character === '\b') { typed = typed.slice(0, -1); continue; }
+                if (character >= ' ') typed += character;
+            }
+            return undefined;
+        };
+
+        stdin.on('data', onData);
+    });
+}
+
+/** One key set to one value, in place, with every other line left exactly as it was. */
+function setEnvLine(content, key, value) {
+    const lines = content.split('\n');
+    const index = lines.findIndex((line) => line.trim().startsWith(`${key}=`));
+    const line = `${key}=${value}`;
+    if (index === -1) return [...lines, line].join('\n');
+    return [...lines.slice(0, index), line, ...lines.slice(index + 1)].join('\n');
+}
+
 async function main(argv) {
     const { command, options, positional } = parseArgs(argv);
     if (!command || command === 'help' || command === '--help') {
@@ -199,6 +249,29 @@ async function main(argv) {
                     ? `Revoked ${deviceId} (${device.label || 'unlabelled'}). They keep their other devices.`
                     : `${deviceId} was already revoked.`);
                 return revoked ? 0 : 1;
+            }
+
+            case 'password': {
+                const file = path.resolve(process.cwd(), '.env');
+                if (!fs.existsSync(file)) {
+                    console.error('No .env here. Copy .env.example to .env first.');
+                    return 1;
+                }
+                const password = await readPassword('New console password: ');
+                if (password.length < 12) {
+                    console.error('Use at least 12 characters: this one password is the whole of the console’s defence.');
+                    return 1;
+                }
+                if (password !== await readPassword('Again: ')) {
+                    console.error('They did not match.');
+                    return 1;
+                }
+                fs.writeFileSync(file, setEnvLine(fs.readFileSync(file, 'utf8'),
+                    'CROSSBAR_ADMIN_PASSWORD_HASH', auth.hashPassword(password)));
+                console.log('Set, as a hash — the password itself is nowhere on this machine.');
+                console.log('It takes effect on the next start:');
+                console.log('  systemctl restart crossbar');
+                return 0;
             }
 
             case 'mode': {
