@@ -20,10 +20,17 @@ const loginOf = (user) => clean(user.tailscaleLogin, 200).toLowerCase();
 /**
  * What a household file has to be, whoever wrote it.
  *
+ * `requireLogins` is the one rule that depends on how a deployment is reached rather than
+ * on what a household is: where a tailnet proxy names the caller, a login is how somebody
+ * is found and everybody needs one. Where a device proves itself with a key, a login is a
+ * record of who somebody is elsewhere, and a household whose people have no tailnet has
+ * none to write down. It defaults to the strict reading so that a caller who has not
+ * thought about it gets the rule that cannot leave somebody unreachable.
+ *
  * Throws rather than returning, because every caller is about to write this file and a file
  * that cannot be loaded is a server that cannot start.
  */
-function validate(household) {
+function validate(household, { requireLogins = true } = {}) {
     const users = Array.isArray(household?.users) ? household.users : [];
     if (!users.length) throw new Error('A household needs at least one person.');
 
@@ -37,9 +44,14 @@ function validate(household) {
 
         if (!clean(user.displayName)) throw new Error(`${id} has no name.`);
         const login = loginOf(user);
-        if (!login) throw new Error(`${id} has no login, and a person is found by theirs.`);
-        if (logins.has(login)) throw new Error(`Two people claim the login ${login}.`);
-        logins.add(login);
+        if (!login && requireLogins) {
+            throw new Error(`${id} has no login, and a person is found by theirs here.`);
+        }
+        // A login that exists is claimed by one person only, whichever reading applies.
+        if (login) {
+            if (logins.has(login)) throw new Error(`Two people claim the login ${login}.`);
+            logins.add(login);
+        }
     }
 
     // A household nobody can administer is a state not worth being able to reach.
@@ -49,9 +61,9 @@ function validate(household) {
     return household;
 }
 
-function read(filePath) {
+function read(filePath, options) {
     if (!fs.existsSync(filePath)) throw new Error(`No household file at ${filePath}.`);
-    return validate(JSON.parse(fs.readFileSync(filePath, 'utf8')));
+    return validate(JSON.parse(fs.readFileSync(filePath, 'utf8')), options);
 }
 
 /**
@@ -59,8 +71,8 @@ function read(filePath) {
  * first, then moved into place, with the previous version kept beside it. A half-written
  * household is a server that will not start.
  */
-function write(filePath, household) {
-    validate(household);
+function write(filePath, household, options) {
+    validate(household, options);
     const body = `${JSON.stringify(household, null, 2)}\n`;
     const staging = `${filePath}.writing`;
     fs.writeFileSync(staging, body, { mode: 0o600 });
@@ -75,11 +87,14 @@ function withPerson(household, person) {
     if (household.users.some((user) => user.id.toLowerCase() === id)) {
         throw new Error(`There is already someone with the id ${id}.`);
     }
+    const login = loginOf(person);
     return {
         ...household,
         users: [...household.users, {
             id,
-            tailscaleLogin: loginOf(person),
+            // Left out rather than written empty: somebody with no tailnet has no login,
+            // and an empty string in the file reads as one that was meant to be filled in.
+            ...(login ? { tailscaleLogin: login } : {}),
             displayName: clean(person.displayName),
             avatar: clean(person.avatar, 500),
             ...(person.admin ? { admin: true } : {}),
@@ -99,7 +114,13 @@ function withChanges(household, id, changes) {
             if (user.id.toLowerCase() !== wanted) return user;
             const next = { ...user };
             if (changes.displayName !== undefined) next.displayName = clean(changes.displayName);
-            if (changes.tailscaleLogin !== undefined) next.tailscaleLogin = loginOf(changes);
+            if (changes.tailscaleLogin !== undefined) {
+                const login = loginOf(changes);
+                // Clearing one is a real edit: somebody who leaves the tailnet keeps their
+                // identity, their devices and their history, and stops being found by it.
+                if (login) next.tailscaleLogin = login;
+                else delete next.tailscaleLogin;
+            }
             if (changes.avatar !== undefined) next.avatar = clean(changes.avatar, 500);
             if (changes.admin !== undefined) next.admin = Boolean(changes.admin);
             if (changes.enabled !== undefined) next.enabled = Boolean(changes.enabled);

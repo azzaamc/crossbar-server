@@ -67,3 +67,24 @@ test('the same login twice in one file is refused rather than guessed at', (t) =
         /UNIQUE/,
     );
 });
+
+test('a household whose people have no logins is accepted where logins are not identity', (t) => {
+    const dir = scratch(t);
+    const file = familyFile(dir, 'notailnet.json', [
+        { id: 'sara', displayName: 'Sara', admin: true },
+        { id: 'omar', displayName: 'Omar' },
+    ]);
+
+    // The strict reading is the default, and it is what a server that finds people by
+    // their login has to insist on.
+    assert.throws(() => new Store(dir, file), /Missing tailscale login/);
+
+    const store = new Store(dir, file, { requireLogins: false });
+    t.after(() => store.close());
+
+    assert.equal(store.listUsers().length, 2);
+    assert.equal(store.userByLogin('sara'), null, 'nobody is found by a login they do not have');
+    // Absent, not empty: SQLite treats NULLs as distinct in a unique index, which is the
+    // whole reason two people can go without one.
+    assert.deepEqual(store.listUsers().map((user) => user.login), [null, null]);
+});

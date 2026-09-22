@@ -488,6 +488,54 @@ function createRequestHandler({ config, store, bus, push, lifecycle, log, client
             });
         }
 
+        // ── Adding another device ───────────────────────────────────────────────
+        //
+        // Somebody already enrolled on one device enrolling their next one, with nobody in
+        // between. The invitation is minted for the person this device already is and for
+        // nobody else, so a device cannot hand out identity: the most it can do is add
+        // another way in to its own.
+        //
+        // Short-lived and limited per person rather than per device, so reaching the limit
+        // is not something a third phone gets round. A code made here is made in a hurry,
+        // shown on a screen and often read out loud; one that outlived the sitting could be
+        // photographed later off a screen somebody had put down.
+        if (req.method === 'POST' && pathname === '/api/devices/enrollment') {
+            // The device the session belongs to, not one the request names: what an
+            // invitation is minted against must be something this server proved.
+            const { device } = currentUser(req);
+            if (!device) {
+                return sendError(res, 409, 'DEVICE_REQUIRED',
+                    'This device is recognised by the network it is on rather than by a key, '
+                    + 'so it has no enrolment to pass on. Another device on the same network '
+                    + 'is recognised the same way it is.');
+            }
+            if (!lifecycle.limiter.take(`device-enrollment:${user.id}`, 5, 60000)) {
+                return sendError(res, 429, 'RATE_LIMITED', 'Please wait before trying again.');
+            }
+            const result = auth.createInvitation({
+                store,
+                config,
+                now: new Date().toISOString(),
+                userId: user.id,
+                createdBy: device.id,
+                ttlSeconds: Math.min(config.enrollmentTtlSeconds, 900),
+            });
+            if (!result.ok) return authFailure(res, result.reason);
+            log.info('device_enrollment_created', {
+                enrollmentId: result.enrollment.id,
+                intendedUserId: result.enrollment.intendedUserId,
+                deviceId: device.id,
+            });
+            return sendJson(res, 201, {
+                enrollment: {
+                    id: result.enrollment.id,
+                    expiresAt: result.enrollment.expiresAt,
+                    intendedUserId: result.enrollment.intendedUserId,
+                },
+                payload: result.payload,
+            });
+        }
+
         // ── Where to send media ─────────────────────────────────────────────────
         //
         // Credentials that expire, handed to a device that has proved itself. A client
@@ -540,11 +588,16 @@ function createRequestHandler({ config, store, bus, push, lifecycle, log, client
             // than writing rows that the next start would overwrite. What a household may
             // be is checked before anything is written, and the file is replaced in one
             // move with the version before it kept beside.
-            const currentHousehold = () => householdFile.read(config.familyConfigPath);
+            // Whether a login is how somebody is found here, which is also whether the
+            // household file may leave one out. It is the same switch that decides whether
+            // a proxy header is believed, because that header *is* the login.
+            const requireLogins = config.trustTailscaleHeaders;
+
+            const currentHousehold = () => householdFile.read(config.familyConfigPath, { requireLogins });
 
             /** Writes the household file, then makes the database agree with it. */
             function saveHousehold(next) {
-                householdFile.write(config.familyConfigPath, next);
+                householdFile.write(config.familyConfigPath, next, { requireLogins });
                 store.syncFamilyConfig(config.familyConfigPath);
             }
 
@@ -555,10 +608,14 @@ function createRequestHandler({ config, store, bus, push, lifecycle, log, client
             if (req.method === 'GET' && pathname === '/api/admin/people') {
                 const known = new Map(store.listUsers().map((user) => [user.id, user]));
                 return sendJson(res, 200, {
+                    // Whether a login is how somebody is found here, so the console can ask
+                    // for one where it is identity and leave the field optional where it is
+                    // only a record of who somebody is elsewhere.
+                    requireLogins,
                     people: currentHousehold().users.map((user) => ({
                         id: user.id,
                         displayName: user.displayName,
-                        login: user.tailscaleLogin,
+                        login: user.tailscaleLogin || '',
                         avatar: user.avatar || '',
                         admin: Boolean(user.admin),
                         suspended: user.enabled === false,
@@ -779,7 +836,7 @@ function createRequestHandler({ config, store, bus, push, lifecycle, log, client
                     // The household's people, not the rows: somebody taken out of the file
                     // keeps their row for the history's sake, and counting rows here would
                     // make this card disagree with the People table beneath it.
-                    users: householdFile.read(config.familyConfigPath).users.length,
+                    users: householdFile.read(config.familyConfigPath, { requireLogins }).users.length,
                     devices: store.allDevices().length,
                     openEnrollments: store.enrollments(now).filter((item) => item.state === 'open').length,
                 });

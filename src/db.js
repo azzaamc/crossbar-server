@@ -20,7 +20,7 @@ const machine = require('./calls');
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS users (
   id TEXT PRIMARY KEY,
-  tailscale_login TEXT NOT NULL UNIQUE COLLATE NOCASE,
+  tailscale_login TEXT UNIQUE COLLATE NOCASE,
   display_name TEXT NOT NULL,
   avatar TEXT NOT NULL DEFAULT '',
   enabled INTEGER NOT NULL DEFAULT 1,
@@ -222,10 +222,50 @@ const MIGRATIONS = [
             dropColumnIfPresent(db, 'users', 'relationship');
         },
     },
+    {
+        version: 4,
+        // A person no longer has to have a tailnet login, so the column holding one may
+        // now be empty — and a column constraint cannot be relaxed where it stands, which
+        // makes this the first migration that has to rebuild a table rather than alter it.
+        // Nine other tables point at `users`, and SQLite will not drop a table they
+        // reference while foreign keys are enforced, so this asks to run without them.
+        withoutForeignKeys: true,
+        apply(db) {
+            db.exec(`
+                CREATE TABLE users_rebuilt (
+                  id TEXT PRIMARY KEY,
+                  tailscale_login TEXT UNIQUE COLLATE NOCASE,
+                  display_name TEXT NOT NULL,
+                  avatar TEXT NOT NULL DEFAULT '',
+                  enabled INTEGER NOT NULL DEFAULT 1,
+                  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                  first_seen_at TEXT,
+                  last_authenticated_at TEXT,
+                  identity_source TEXT NOT NULL DEFAULT 'configured',
+                  admin INTEGER NOT NULL DEFAULT 0
+                );
+
+                INSERT INTO users_rebuilt
+                  (id, tailscale_login, display_name, avatar, enabled, created_at,
+                   first_seen_at, last_authenticated_at, identity_source, admin)
+                SELECT id, tailscale_login, display_name, avatar, enabled, created_at,
+                       first_seen_at, last_authenticated_at, identity_source, admin
+                  FROM users;
+
+                DROP TABLE users;
+                ALTER TABLE users_rebuilt RENAME TO users;
+            `);
+        },
+    },
 ];
 
 class Store {
-    constructor(dataDir, familyConfigPath) {
+    constructor(dataDir, familyConfigPath, { requireLogins = true } = {}) {
+        // Whether a login is how somebody is found here. True where a tailnet proxy names
+        // the caller, false where a device proves itself with a key: on such a deployment
+        // a login is a record of who somebody is elsewhere, and a household whose people
+        // have no tailnet at all has none to write down.
+        this.requireLogins = requireLogins;
         fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 });
         this.db = new DatabaseSync(path.join(dataDir, 'crossbar.sqlite'));
         this.db.exec('PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;');
@@ -239,11 +279,28 @@ class Store {
         const current = this.db.prepare('PRAGMA user_version').get().user_version || 0;
         for (const migration of MIGRATIONS) {
             if (migration.version <= current) continue;
-            this.transaction(() => {
-                migration.apply(this.db);
-                // The version is a literal from this file, never from a request.
-                this.db.exec(`PRAGMA user_version = ${migration.version}`);
-            });
+            // A migration that rebuilds a table has to drop one other tables point at, and
+            // that is refused while foreign keys are enforced. SQLite will not change the
+            // pragma inside a transaction, so it is turned off around it — and the result
+            // is checked before the transaction may commit, so a rebuild that broke a
+            // reference rolls back instead of landing.
+            if (migration.withoutForeignKeys) this.db.exec('PRAGMA foreign_keys=OFF');
+            try {
+                this.transaction(() => {
+                    migration.apply(this.db);
+                    if (migration.withoutForeignKeys) {
+                        const broken = this.db.prepare('PRAGMA foreign_key_check').all();
+                        if (broken.length) {
+                            throw new Error(`Migration ${migration.version} left `
+                                + `${broken.length} broken reference(s).`);
+                        }
+                    }
+                    // The version is a literal from this file, never from a request.
+                    this.db.exec(`PRAGMA user_version = ${migration.version}`);
+                });
+            } finally {
+                if (migration.withoutForeignKeys) this.db.exec('PRAGMA foreign_keys=ON');
+            }
         }
     }
 
@@ -291,8 +348,12 @@ class Store {
             for (const user of users) {
                 assertId(user.id, 'user id');
                 const login = String(user.tailscaleLogin || '').trim().toLowerCase();
-                if (!login) throw new Error(`Missing tailscale login for ${user.id}`);
-                release.run(login, user.id);
+                if (!login && this.requireLogins) {
+                    throw new Error(`Missing tailscale login for ${user.id}`);
+                }
+                // Only a login that exists is released: the statement matches on equality,
+                // and an absent one has nothing to collide with.
+                if (login) release.run(login, user.id);
             }
 
             const upsert = this.db.prepare(`
@@ -307,10 +368,14 @@ class Store {
             for (const user of users) {
                 assertId(user.id, 'user id');
                 const login = String(user.tailscaleLogin || '').trim().toLowerCase();
-                if (!login) throw new Error(`Missing tailscale login for ${user.id}`);
+                if (!login && this.requireLogins) {
+                    throw new Error(`Missing tailscale login for ${user.id}`);
+                }
                 upsert.run(
                     user.id,
-                    login,
+                    // Absent, not empty: SQLite treats NULLs as distinct in a unique index,
+                    // which is what lets a household have more than one person without one.
+                    login || null,
                     cleanText(user.displayName, 80, 'display name'),
                     cleanOptional(user.avatar, 500),
                     user.admin ? 1 : 0,

@@ -23,7 +23,9 @@ const EXPIRY_SWEEP_MS = 10000;
 function createCrossbarServer({ config = loadConfig(), log } = {}) {
     const logger = log || createLogger({ level: config.nodeEnv === 'production' ? 'info' : 'debug' });
 
-    const store = new Store(config.dataDir, config.familyConfigPath);
+    const store = new Store(config.dataDir, config.familyConfigPath, {
+        requireLogins: config.trustTailscaleHeaders,
+    });
     const bus = createEventBus({ store, log: logger });
     const push = createPushNotifier({ config, log: logger });
     const lifecycle = createLifecycle({ config, store, bus, push, log: logger });

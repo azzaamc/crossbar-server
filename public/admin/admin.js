@@ -142,13 +142,13 @@ const slug = (text) => String(text || '').toLowerCase().trim()
     .replace(/^-+|-+$/g, '')
     .slice(0, 32);
 
-function peopleView(people, refresh) {
+function peopleView(people, refresh, requireLogins) {
     const rows = people.map((person) => el('tr', { class: person.suspended ? 'inactive' : '' }, [
         el('td', { text: person.displayName }),
         el('td', { text: person.admin ? 'administrator' : '—' }),
         el('td', { text: person.suspended ? 'suspended' : 'in the household' }),
         el('td', { class: 'numeric', text: person.devices }),
-        el('td', { text: person.login }),
+        el('td', { text: person.login || '—' }),
         el('td', { text: when(person.lastAuthenticated) }),
         el('td', {}, [el('div', { class: 'actions' }, [
             el('button', {
@@ -178,8 +178,17 @@ function peopleView(people, refresh) {
     ]));
 
     const name = el('input', { placeholder: 'Name', autocomplete: 'off' });
-    const id = el('input', { placeholder: 'id', autocomplete: 'off', size: '12' });
-    const login = el('input', { placeholder: 'Tailscale login', autocomplete: 'off', size: '22' });
+    const id = el('input', {
+        placeholder: 'short name',
+        autocomplete: 'off',
+        size: '12',
+        title: 'How this person is named in the server’s own records, and in any link to them.',
+    });
+    const login = el('input', {
+        placeholder: requireLogins ? 'Tailscale login' : 'Tailscale login (optional)',
+        autocomplete: 'off',
+        size: '22',
+    });
     let idTouched = false;
     name.addEventListener('input', () => {
         if (!idTouched) id.value = slug(name.value);
@@ -212,9 +221,17 @@ function peopleView(people, refresh) {
 
     const addCard = el('div', { class: 'grant' }, [
         el('p', {
-            text: 'A person needs a name and a login. The login is how the tailnet finds '
-                + 'them; on a server reached with device keys it is only a record, but a '
-                + 'household without one cannot be reached over a tailnet at all.',
+            text: 'The name is what everybody sees. The short name beside it is the id: how '
+                + 'this person is named in the server’s own records. It fills in from the name '
+                + 'as you type, and only needs changing if you would rather it read otherwise.',
+        }),
+        el('p', {
+            text: requireLogins
+                ? 'This server tells people apart by their tailnet login, so it is needed '
+                    + 'here — the address they sign in with, like name@example.com.'
+                : 'This server is reached with device keys, so a tailnet login is optional. '
+                    + 'It is kept as a note of who somebody is elsewhere and used for nothing '
+                    + 'else: leave it empty for anyone who has no tailnet.',
         }),
         el('div', { class: 'row' }, [name, id, login, add]),
         notice,
@@ -719,7 +736,7 @@ async function refresh() {
         main.replaceChildren(
             serverView(status),
             inviteView(people.people, refresh),
-            peopleView(people.people, refresh),
+            peopleView(people.people, refresh, people.requireLogins),
             devicesView(devices.devices, refresh),
             enrollmentsView(enrollments.enrollments, refresh),
             usageView(usage, people.people),

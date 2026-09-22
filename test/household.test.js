@@ -75,3 +75,50 @@ test('writing replaces the file in one move, and keeps the version before it', (
     assert.equal(JSON.parse(fs.readFileSync(household.backupPath(file), 'utf8')).users.length, 3);
     assert.equal(fs.existsSync(`${file}.writing`), false, 'nothing is left half-written');
 });
+
+test('a login is required where it is how people are found, and optional where it is not', () => {
+    const added = household.withPerson(three(), { id: 'sara', displayName: 'Sara' });
+
+    // Where a tailnet proxy names the caller, a person with no login is a person nobody
+    // can ever reach, so the file refuses it.
+    assert.throws(() => household.validate(added), /no login/);
+
+    // Where a device proves itself with a key, a login is a record of who somebody is
+    // elsewhere — and a household whose people have no tailnet has none to write down.
+    const relaxed = household.validate(added, { requireLogins: false });
+    assert.equal(relaxed.users.length, 4);
+    assert.equal(relaxed.users.find((user) => user.id === 'sara').tailscaleLogin, undefined,
+        'a login that was never given is absent, not empty');
+});
+
+test('a household where nobody has a login at all is a household with no tailnet in it', () => {
+    const noTailnet = {
+        users: [
+            { id: 'sara', displayName: 'Sara', admin: true },
+            { id: 'omar', displayName: 'Omar' },
+        ],
+    };
+    assert.equal(household.validate(noTailnet, { requireLogins: false }).users.length, 2);
+    assert.throws(() => household.validate(noTailnet), /no login/);
+});
+
+test('a login that is there is still held by one person only', () => {
+    assert.throws(
+        () => household.validate(
+            household.withPerson(three(), { id: 'sara', displayName: 'Sara', tailscaleLogin: 'FAISALC@gmail.com' }),
+            { requireLogins: false },
+        ),
+        /claim the login/);
+});
+
+test('a login can be cleared, which is what leaving a tailnet looks like', () => {
+    const cleared = household.withChanges(three(), 'dad', { tailscaleLogin: '' });
+
+    // Somebody who leaves the tailnet keeps their identity and their history, and stops
+    // being found by a login.
+    const relaxed = household.validate(cleared, { requireLogins: false });
+    assert.equal(relaxed.users.find((user) => user.id === 'dad').tailscaleLogin, undefined);
+
+    // And where a login is how people are found, taking somebody's away is refused.
+    assert.throws(() => household.validate(cleared), /no login/);
+});

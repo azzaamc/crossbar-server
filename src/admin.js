@@ -146,7 +146,9 @@ async function main(argv) {
     }
 
     const config = loadConfig();
-    const store = new Store(config.dataDir, config.familyConfigPath);
+    const store = new Store(config.dataDir, config.familyConfigPath, {
+        requireLogins: config.trustTailscaleHeaders,
+    });
     const now = new Date().toISOString();
 
     try {

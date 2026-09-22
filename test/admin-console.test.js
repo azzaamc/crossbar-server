@@ -217,3 +217,66 @@ test('the household can be changed from the console, and suspending is not remov
     assert.equal((await status.json()).users, 3);
     assert.equal(server.store.listUsers().length, 4, 'the row is still there, disabled');
 });
+
+/** Adds somebody through the console, as the operator's browser does. */
+async function addPerson(base, cookie, person) {
+    const response = await fetch(`${base}/api/admin/people`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', cookie: cookiePair(cookie) },
+        body: JSON.stringify(person),
+    });
+    return { status: response.status, data: await response.json().catch(() => ({})) };
+}
+
+test('a person without a login is refused where a login is how people are found', async (t) => {
+    const { server, base } = await startTestServer(WITH_PASSWORD);
+    t.after(() => server.close());
+    const { cookie } = await signIn(base, PASSWORD);
+
+    const refused = await addPerson(base, cookie, { id: 'sara', displayName: 'Sara' });
+    assert.equal(refused.status, 400);
+    assert.equal(refused.data.error.code, 'HOUSEHOLD_INVALID');
+    assert.match(refused.data.error.message, /no login/);
+
+    // And the console is told which reading applies, so it knows to ask for one.
+    const listed = await fetch(`${base}/api/admin/people`, { headers: { cookie: cookiePair(cookie) } });
+    assert.equal((await listed.json()).requireLogins, true);
+});
+
+test('a person without a login is taken where a login is only a record', async (t) => {
+    // Device keys are how this deployment knows anybody: a tailnet login is a note beside
+    // somebody's name rather than the way they are found, so it cannot be required.
+    const { server, base } = await startTestServer({ ...WITH_PASSWORD, trustTailscaleHeaders: false });
+    t.after(() => server.close());
+    const { cookie } = await signIn(base, PASSWORD);
+
+    const added = await addPerson(base, cookie, { id: 'sara', displayName: 'Sara' });
+    assert.equal(added.status, 201, JSON.stringify(added.data));
+    assert.equal(added.data.users.find((user) => user.id === 'sara').login, null,
+        'no login is absent, not empty');
+
+    const listed = await fetch(`${base}/api/admin/people`, { headers: { cookie: cookiePair(cookie) } });
+    const page = await listed.json();
+    assert.equal(page.requireLogins, false);
+    assert.equal(page.people.find((person) => person.id === 'sara').login, '', 'and reads as nothing to show');
+
+    // Two of them, which is the case a single empty string could never have expressed.
+    assert.equal((await addPerson(base, cookie, { id: 'omar', displayName: 'Omar' })).status, 201);
+    assert.equal(server.store.listUsers().filter((user) => user.login === null).length, 2);
+    assert.equal(server.store.userByLogin('sara'), null, 'nobody is found by a login they do not have');
+});
+
+test('a login can be taken off somebody who leaves the tailnet', async (t) => {
+    const { server, base } = await startTestServer({ ...WITH_PASSWORD, trustTailscaleHeaders: false });
+    t.after(() => server.close());
+    const { cookie } = await signIn(base, PASSWORD);
+
+    const cleared = await fetch(`${base}/api/admin/people/dad`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', cookie: cookiePair(cookie) },
+        body: JSON.stringify({ tailscaleLogin: '' }),
+    });
+    assert.equal(cleared.status, 200, JSON.stringify(await cleared.json().catch(() => ({}))));
+    assert.equal(server.store.userByLogin('dad@dev'), null);
+    assert.ok(server.store.userById('dad'), 'they keep their identity and their history');
+});

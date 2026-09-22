@@ -520,3 +520,97 @@ test('health answers without a session and says nothing worth having', async (t)
     assert.equal(health.status, 200);
     assert.deepEqual(health.data, { status: 'ok', mode: 'private' });
 });
+
+// ── Adding another device ───────────────────────────────────────────────────────
+
+test('a device invites the next device of its own person, with nobody in between', async (t) => {
+    const { server, base } = await startTestServer(AVAILABLE);
+    t.after(() => server.close());
+
+    const first = await enrolledDevice(base, 'dad');
+
+    const made = await api(base, null, '/api/devices/enrollment', {
+        method: 'POST',
+        headers: bearer(first.session.token),
+    });
+    assert.equal(made.status, 201, JSON.stringify(made.data));
+    assert.equal(made.data.enrollment.intendedUserId, 'dad', 'the invitation is for the person the device is');
+    // The code carries the address and the mode, as every other invitation does, so the
+    // second device configures itself from it and is asked nothing.
+    assert.equal(made.data.payload.server, server.config.publicOrigin);
+    assert.equal(made.data.payload.mode, 'private');
+    assert.ok(made.data.payload.enrollment_token);
+
+    // And it is an invitation like any other: the second device spends it and turns out to
+    // be the same person, on a different device.
+    const second = await enrol(base, made.data.payload.enrollment_token, newDeviceKey());
+    assert.equal(second.status, 200, JSON.stringify(second.data));
+    assert.equal(second.data.user.id, 'dad');
+    assert.notEqual(second.data.device.id, first.device.id);
+});
+
+/// The rule that makes this safe to offer at all: the most a device can do is add another
+/// way into its own identity.
+test('the invitation a device mints is for its own person, whoever it asks for', async (t) => {
+    const { server, base } = await startTestServer(AVAILABLE);
+    t.after(() => server.close());
+
+    const { session } = await enrolledDevice(base, 'dad');
+
+    const made = await api(base, null, '/api/devices/enrollment', {
+        method: 'POST',
+        headers: bearer(session.token),
+        body: { userId: 'mum', intendedUserId: 'mum' },
+    });
+    assert.equal(made.status, 201);
+    assert.equal(made.data.enrollment.intendedUserId, 'dad', 'a body naming somebody else changes nothing');
+});
+
+test('a caller that is not a device cannot mint an invitation', async (t) => {
+    const { server, base } = await startTestServer(AVAILABLE);
+    t.after(() => server.close());
+
+    // Nothing at all.
+    const anonymous = await api(base, null, '/api/devices/enrollment', { method: 'POST' });
+    assert.equal(anonymous.status, 401);
+
+    // A network identity: recognised, but it holds no enrolment to pass on — another device
+    // on the same network is recognised the same way it is, so there is nothing to hand over.
+    const asNetwork = await api(base, 'dad@dev', '/api/devices/enrollment', { method: 'POST' });
+    assert.equal(asNetwork.status, 409);
+    assert.equal(asNetwork.data.error.code, 'DEVICE_REQUIRED');
+});
+
+test('a device cannot mint invitations without limit', async (t) => {
+    const { server, base } = await startTestServer(AVAILABLE);
+    t.after(() => server.close());
+
+    const { session } = await enrolledDevice(base, 'dad');
+    const statuses = [];
+    for (let attempt = 0; attempt < 7; attempt += 1) {
+        const made = await api(base, null, '/api/devices/enrollment', {
+            method: 'POST',
+            headers: bearer(session.token),
+        });
+        statuses.push(made.status);
+    }
+    assert.equal(statuses.at(-1), 429, `attempts: ${statuses.join(', ')}`);
+});
+
+test('an invitation a device makes for itself is short-lived whatever the server allows', async (t) => {
+    // An operator may hand out day-long invitations from the console. One made on a phone
+    // in a hurry is a different thing: it is shown on a screen and often read out loud, so
+    // it does not inherit that.
+    const { server, base } = await startTestServer({ ...AVAILABLE, enrollmentTtlSeconds: 86400 });
+    t.after(() => server.close());
+
+    const { session } = await enrolledDevice(base, 'dad');
+    const made = await api(base, null, '/api/devices/enrollment', {
+        method: 'POST',
+        headers: bearer(session.token),
+    });
+
+    const life = Date.parse(made.data.enrollment.expiresAt) - Date.now();
+    assert.ok(life > 0, 'it is not born expired');
+    assert.ok(life <= 15 * 60 * 1000 + 5000, `expected about a quarter of an hour, got ${Math.round(life / 1000)}s`);
+});
