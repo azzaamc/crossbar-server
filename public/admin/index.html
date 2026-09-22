@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Crossbar — household administration</title>
+    <link rel="stylesheet" href="/admin/admin.css">
+</head>
+<body>
+    <!--
+        The operator console. It is served by the Crossbar server itself, on the same
+        origin as the API it calls, so there is no second listener to secure and the
+        identity rules are the ones the API already applies: an administrator of this
+        household, proved the same way every other request is.
+
+        No inline script or style, because the server sends a content-security-policy
+        with `script-src 'self'`; nothing is built here that a policy would have to
+        make an exception for.
+    -->
+    <header>
+        <div>
+            <h1>Crossbar</h1>
+            <p class="sub">Household administration</p>
+        </div>
+        <button id="refresh" type="button">Refresh</button>
+    </header>
+
+    <main id="main">
+        <p class="muted">Reading the server…</p>
+    </main>
+
+    <script src="/admin/admin.js"></script>
+</body>
+</html>

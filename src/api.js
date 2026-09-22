@@ -250,10 +250,16 @@ function createRequestHandler({ config, store, bus, push, lifecycle, log, client
 
         const isCallClient = url.pathname === '/call' || url.pathname.startsWith('/call/')
             || url.pathname === '/newcall';
-        const root = isCallClient ? clientRoot : config.webRoot;
+        // The operator console is this server's own too: served from here so it is the
+        // same origin as the API it calls, and so it exists even where no household PWA
+        // is deployed beside it.
+        const isConsole = url.pathname === '/admin' || url.pathname.startsWith('/admin/');
+        const root = isConsole ? path.join(clientRoot, 'admin')
+            : (isCallClient ? clientRoot : config.webRoot);
 
         if (url.pathname === '/call') relative = 'call/index.html';
         if (url.pathname === '/newcall') relative = 'newcall.html';
+        if (isConsole) relative = url.pathname === '/admin' ? 'index.html' : relative.slice('admin/'.length) || 'index.html';
 
         const filePath = resolveWithin(root, relative);
         if (!filePath) return sendError(res, 403, 'FORBIDDEN', 'Forbidden.');
