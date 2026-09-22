@@ -10,7 +10,10 @@
 //
 // Usage: node src/admin.js <command> [options]
 
-const { loadConfig } = require('./config');
+const fs = require('node:fs');
+const path = require('node:path');
+const { spawnSync } = require('node:child_process');
+const { loadConfig, applyMode, modeBlock, MODES } = require('./config');
 const { Store } = require('./db');
 const auth = require('./auth');
 const { diagnose } = require('./diagnostics');
@@ -25,6 +28,8 @@ const USAGE = `Crossbar administration
   rename-device <deviceId> <label>       Give a device a name a person recognises
   revoke-device <deviceId>               Take a device's key out of use
   status                                 Configuration and counts
+  mode                                   Both configurations, and which is in force
+  mode private|public                    Switch this deployment to that one
   doctor                                 Reachability checks
 `;
 
@@ -91,6 +96,26 @@ function printEnrollments(store) {
             + pad(row.expiresAt, 26) + (row.createdBy || 'cli'),
         );
     }
+}
+
+/**
+ * What the selected configuration makes of itself, read by a child process with nothing
+ * but the file in its environment — which is the question a restart asks. Inheriting this
+ * process's environment would answer a different one: this process read `.env` when it
+ * started, and `loadDotEnv` never overwrites a variable that is already set, so anything
+ * held here would hide what the file now says.
+ */
+function loadFresh(cwd, mode) {
+    const result = spawnSync(process.execPath, [
+        '-e', `require(${JSON.stringify(path.join(__dirname, 'config.js'))}).loadConfig()`,
+    ], {
+        cwd,
+        env: { PATH: process.env.PATH, CROSSBAR_NETWORK_MODE: mode },
+        encoding: 'utf8',
+    });
+    const stderr = (result.stderr || '').split('\n').map((line) => line.trim()).filter(Boolean);
+    const failure = stderr.find((line) => /Error: /.test(line)) || stderr[stderr.length - 1] || '';
+    return { ok: result.status === 0, message: failure.replace(/^\w*Error: /, '') };
 }
 
 async function main(argv) {
@@ -174,6 +199,60 @@ async function main(argv) {
                     ? `Revoked ${deviceId} (${device.label || 'unlabelled'}). They keep their other devices.`
                     : `${deviceId} was already revoked.`);
                 return revoked ? 0 : 1;
+            }
+
+            case 'mode': {
+                const file = path.resolve(process.cwd(), '.env');
+                if (!fs.existsSync(file)) {
+                    console.error('No .env here. Copy .env.example to .env first.');
+                    return 1;
+                }
+                const content = fs.readFileSync(file, 'utf8');
+                const [wanted] = positional;
+
+                if (!wanted) {
+                    console.log(`${pad('', 3)}${pad('MODE', 11)}${pad('HOSTNAME', 38)}ORIGIN`);
+                    for (const mode of MODES) {
+                        const block = modeBlock(content, mode);
+                        const active = config.networkMode === mode;
+                        console.log(
+                            pad(active ? '->' : '', 3) + pad(mode, 11) + pad(block.HOSTNAME || '-', 38)
+                            + (block.ORIGIN || '(unset: invitations would carry the default origin)'),
+                        );
+                    }
+                    const check = loadFresh(process.cwd(), config.networkMode);
+                    console.log(check.ok
+                        ? `\n${config.networkMode} is in force, and loads cleanly.`
+                        : `\n${config.networkMode} is in force but does not load: ${check.message}`);
+                    return check.ok ? 0 : 1;
+                }
+
+                if (!MODES.includes(wanted)) {
+                    console.error(`mode takes one of ${MODES.join(', ')}.`);
+                    return 1;
+                }
+                if (wanted === config.networkMode) {
+                    console.log(`Already in ${wanted}; nothing to change.`);
+                    return 0;
+                }
+
+                // Written before it is checked, because the only honest test is what the
+                // file says to a process starting from it — and put back if it does not
+                // hold up. A switch that leaves a deployment unable to start is worse
+                // than no switch at all.
+                fs.writeFileSync(file, applyMode(content, wanted));
+                const check = loadFresh(process.cwd(), wanted);
+                if (!check.ok) {
+                    fs.writeFileSync(file, content);
+                    console.error(`Cannot switch to ${wanted}: ${check.message}`);
+                    console.error(`Fill in its block in .env — NETWORK_MODE_${wanted.toUpperCase()}_HOSTNAME`
+                        + ` and NETWORK_MODE_${wanted.toUpperCase()}_ORIGIN — and try again.`);
+                    return 1;
+                }
+                console.log(`In ${wanted} from the next start:`);
+                console.log('  systemctl restart crossbar');
+                console.log('  (the reverse proxy too, when the two modes bind different addresses)');
+                return 0;
             }
 
             case 'status': {

@@ -14,8 +14,30 @@ is never exposed. That is what lets the server treat "the connection came from l
 unaffected by anything in this directory, and both modes run the same server.
 
 In public mode the application's identity is a per-device key rather than the network. The
-settings that matter are `CROSSBAR_NETWORK_MODE=public`, `CROSSBAR_PUBLIC_HOSTNAME` (which
-`PUBLIC_ORIGIN` must also name) and `CROSSBAR_SESSION_SECRET`; see `../.env.example`.
+settings that matter are the public block in `.env` — `NETWORK_MODE_PUBLIC_HOSTNAME`, which
+`NETWORK_MODE_PUBLIC_ORIGIN` must also name, and `NETWORK_MODE_PUBLIC_BIND_ADDRESS` for
+Caddy — plus `CROSSBAR_SESSION_SECRET`; see `../.env.example`.
+
+## Switching modes
+
+A deployment holds both configurations, one block per mode, and moves between them with one
+command:
+
+```
+node src/admin.js mode            # both, and which one is in force
+node src/admin.js mode public     # switch to it
+sudo systemctl restart crossbar   # and the reverse proxy, when the modes bind different addresses
+```
+
+It rewrites the generated section of `.env` and nothing else, so the secrets, paths, limits
+and relay settings in between are never touched by switching. It writes the file first and
+then loads it in a fresh process, because the only honest test of a configuration is what it
+says to a process starting from it; if it does not hold up, it puts the file back and names
+the key that is missing. Switching to a mode whose block is empty is refused rather than
+half-applied.
+
+The mode's own block decides where that mode is reached — the origin an invitation carries,
+and the address the proxy binds — so both configurations stay complete on the one box.
 
 ## Files
 
@@ -46,15 +68,18 @@ EnvironmentFile=/home/admin/crossbar/.env
 Then `sudo systemctl restart caddy`. Nothing else from `.env` is used by Caddy, and `PORT`
 only matters if the server does not listen on 3003.
 
-`CROSSBAR_BIND_ADDRESS` is the other value Caddy reads: the address it listens on. Set it to
-the address the router forwards to — never the wildcard. A host that already serves the same
-ports over a tailnet holds `:443` on its own address, and a wildcard bind beside a specific
-one is either refused outright or resolved by the kernel's discretion, which is not a thing
-to leave a public listener to. It has to be stable, so reserve it on the router.
+`NETWORK_MODE_PUBLIC_BIND_ADDRESS` in the public block is the other value Caddy reads — the
+switch copies it to `CROSSBAR_BIND_ADDRESS`, which is the name the Caddyfile expands. It is
+the address Caddy listens on: set it to the address the router forwards to — never the
+wildcard. A host that already serves the same ports over a tailnet holds `:443` on its own
+address, and a wildcard bind beside a specific one is either refused outright or resolved by
+the kernel's discretion, which is not a thing to leave a public listener to. It has to be
+stable, so reserve it on the router.
 
 ## DNS
 
-One record matters: `CROSSBAR_PUBLIC_HOSTNAME` must resolve to the home connection.
+One record matters: the public block's `NETWORK_MODE_PUBLIC_HOSTNAME` must resolve to the
+home connection.
 
 - `A` — the connection's IPv4 address.
 - `AAAA` — its IPv6 address, if the ISP provides one. Worth having: native IPv6 has no NAT,

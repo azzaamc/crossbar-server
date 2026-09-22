@@ -64,7 +64,6 @@ function loadConfig() {
     // can reach the same port.
     if (!LOOPBACK.has(host)) throw new Error('HOST must remain loopback-only');
 
-    const publicOrigin = httpsOrigin(text('PUBLIC_ORIGIN', `http://${host}:${integer('PORT', 3010, 1, 65535)}`), 'PUBLIC_ORIGIN');
     const allowDevIdentity = bool('ALLOW_DEV_IDENTITY', false);
     if (allowDevIdentity && !LOOPBACK.has(host)) {
         throw new Error('ALLOW_DEV_IDENTITY requires a loopback listener');
@@ -79,16 +78,30 @@ function loadConfig() {
     // request is believed, and a device proves itself with a key it holds.
     //
     // The mode changes what is trusted, never which code runs: both modes are the
-    // same server, the same signalling and the same database.
+    // same server, the same signalling and the same database. It is one line in
+    // `.env`, and both configurations are kept there at once, so switching is one
+    // command and neither configuration is a different build.
     const networkMode = text('CROSSBAR_NETWORK_MODE', 'private').toLowerCase();
     if (networkMode !== 'private' && networkMode !== 'public') {
         throw new Error('CROSSBAR_NETWORK_MODE must be private or public');
     }
 
-    const publicHostname = text('CROSSBAR_PUBLIC_HOSTNAME', '').toLowerCase();
+    // Where this deployment is, per mode. Both configurations live in `.env` at once
+    // — `node src/admin.js mode` moves between them — so the address a mode needs is
+    // named for that mode, and the plain names stay as overrides for a run that is
+    // not a deployment (a laptop, a test).
+    const modeKey = (name) => `NETWORK_MODE_${networkMode.toUpperCase()}_${name}`;
+    const modeValue = (name, fallback = '') => text(modeKey(name), text(name, fallback));
+
+    const publicOrigin = httpsOrigin(
+        modeValue('ORIGIN', `http://${host}:${integer('PORT', 3010, 1, 65535)}`),
+        `PUBLIC_ORIGIN or ${modeKey('ORIGIN')}`,
+    );
+
+    const publicHostname = modeValue('HOSTNAME').toLowerCase();
     if (networkMode === 'public') {
         if (!publicHostname) {
-            throw new Error('CROSSBAR_PUBLIC_HOSTNAME is required in public mode');
+            throw new Error(`${modeKey('HOSTNAME')} (or CROSSBAR_PUBLIC_HOSTNAME) is required in public mode: it is the host invitations send people to`);
         }
         // The origin handed to clients inside a join URL has to be the address they
         // reached this server on. Getting this wrong sends every invitation to a host
@@ -225,4 +238,72 @@ function loadConfig() {
     });
 }
 
-module.exports = { loadConfig, loadDotEnv, bool, integer, text };
+// ── Choosing between the two configurations ─────────────────────────────────
+//
+// `.env` holds both: a block per mode naming where that mode is reached, and a
+// section generated from the one selected. Switching rewrites the generated section
+// and nothing else, so the secrets, paths, limits and relay settings in between are
+// never touched by it. Both blocks are ordinary `.env` lines, and `modeValue` above
+// reads whichever one is selected.
+
+const MODE_BEGIN = '# >>> the configuration in force, written by `node src/admin.js mode` >>>';
+const MODE_END = '# <<< end of the configuration in force <<<';
+
+const MODES = Object.freeze(['private', 'public']);
+const MODE_NAMES = Object.freeze(['HOSTNAME', 'ORIGIN', 'BIND_ADDRESS']);
+
+/** The names the generated section owns, in the order it writes them. */
+const GENERATED_KEYS = Object.freeze([
+    'CROSSBAR_NETWORK_MODE', 'CROSSBAR_PUBLIC_HOSTNAME', 'PUBLIC_ORIGIN',
+    'CROSSBAR_BIND_ADDRESS', 'TRUST_TAILSCALE_HEADERS', 'CROSSBAR_REQUIRE_DEVICE_AUTH',
+]);
+
+/** A mode's own block, as `{ HOSTNAME, ORIGIN, BIND_ADDRESS }` — empty strings unset. */
+function modeBlock(content, mode) {
+    const values = {};
+    for (const name of MODE_NAMES) {
+        const key = `NETWORK_MODE_${mode.toUpperCase()}_${name}=`;
+        const line = content.split('\n').find((item) => item.trim().startsWith(key));
+        values[name] = line ? line.trim().slice(key.length).trim() : '';
+    }
+    return values;
+}
+
+/**
+ * The `.env` a switch produces: the selected mode's own values written under the names
+ * everything downstream reads — the server, Caddy, the units — and the overrides that
+ * would contradict the mode emptied, so the mode's own defaults decide. Everything
+ * outside the generated section, comments included, is left exactly as it was.
+ *
+ * Pure, so the same content and mode always give the same answer, and it can be tested
+ * without a file.
+ */
+function applyMode(content, mode) {
+    if (!MODES.includes(mode)) throw new Error(`mode must be one of ${MODES.join(', ')}`);
+    const values = modeBlock(content, mode);
+    const generated = [
+        MODE_BEGIN,
+        `CROSSBAR_NETWORK_MODE=${mode}`,
+        `CROSSBAR_PUBLIC_HOSTNAME=${values.HOSTNAME}`,
+        `PUBLIC_ORIGIN=${values.ORIGIN}`,
+        `CROSSBAR_BIND_ADDRESS=${values.BIND_ADDRESS}`,
+        '# Left empty on purpose: the mode decides both. The identity header is believed',
+        '# only in private mode, and device keys are required only in public.',
+        'TRUST_TAILSCALE_HEADERS=',
+        'CROSSBAR_REQUIRE_DEVICE_AUTH=',
+        MODE_END,
+    ];
+    const lines = content.split('\n');
+    const begin = lines.findIndex((line) => line.trim() === MODE_BEGIN);
+    const end = lines.findIndex((line) => line.trim() === MODE_END);
+    // Whatever else in the file names one of these would be read first, and `loadDotEnv`
+    // keeps the first value it sees: a line left over from an earlier hand-edit would
+    // quietly beat the one being written here.
+    const outside = [
+        ...(begin === -1 ? lines : lines.slice(0, begin)),
+        ...(end === -1 ? [] : lines.slice(end + 1)),
+    ].filter((line) => !GENERATED_KEYS.some((key) => line.trim().startsWith(`${key}=`)));
+    return [...outside, ...generated].join('\n');
+}
+
+module.exports = { loadConfig, loadDotEnv, bool, integer, text, applyMode, modeBlock, MODES };
