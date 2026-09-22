@@ -323,7 +323,16 @@ function createInvitation({ store, config, now, userId, createdBy = null, ttlSec
         enrollment,
         // Returned exactly once, and never written down anywhere.
         token,
-        payload: { version: 1, server: config.publicOrigin, enrollment_token: token },
+        // `mode` is what lets the app configure itself from this alone: whether the deployment
+        // it is joining is reached over a network the app has to carry, or at an address on
+        // the internet. Without it the app has to ask, and the question is one the person
+        // holding the code cannot answer.
+        payload: {
+            version: 1,
+            server: config.publicOrigin,
+            mode: config.networkMode,
+            enrollment_token: token,
+        },
     };
 }
 
