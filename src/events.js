@@ -61,13 +61,6 @@ function createEventBus({ store, log, heartbeatMs = HEARTBEAT_MS }) {
             set = new Map();
             streams.set(userId, set);
         }
-        store.touchPresence(userId, new Date().toISOString());
-        // Always the truth, whether or not this is a change. A client replacing its stream —
-        // which a pull-to-refresh does — cancels one and opens another, and the server can
-        // see those in either order. A broadcast that only fires on a transition then leaves
-        // the last word as whatever arrived second, and a phone that heard "offline" about
-        // somebody who is online has no reason to ask again.
-        presence(userId, new Date().toISOString());
 
         const timer = setInterval(() => {
             store.touchPresence(userId, new Date().toISOString());
@@ -79,7 +72,22 @@ function createEventBus({ store, log, heartbeatMs = HEARTBEAT_MS }) {
         }, heartbeatMs);
         timer.unref?.();
 
+        // Registered *before* anything is said about it.
+        //
+        // `isOnline` counts these entries, and this used to happen after the announcement
+        // below — so `presence` counted an empty set and told the household that somebody who
+        // had just connected was offline. Every connect said so. A phone that hears somebody
+        // is offline has no reason to ask again, so the indicator stayed grey until something
+        // else moved it, which is why refreshing appeared to flip it. Measured 2026-09-22,
+        // from the broadcast the server was already writing down.
         set.set(response, timer);
+
+        store.touchPresence(userId, new Date().toISOString());
+        // Always the truth, whether or not this is a change. A client replacing its stream —
+        // which a pull-to-refresh does — cancels one and opens another, and the server can
+        // see those in either order. A broadcast that only fires on a transition then leaves
+        // the last word as whatever arrived second.
+        presence(userId, new Date().toISOString());
 
         return () => {
             clearInterval(timer);

@@ -33,6 +33,22 @@ function bus() {
 
 const about = (events, userId) => events.filter((event) => event.userId === userId);
 
+/// The case the first version of this file got wrong, and missed because its fixture always
+/// had a second stream open: the very first stream for a person.
+test('connecting is announced as online', () => {
+    const received = [];
+    const events = bus();
+
+    events.add('abdullah', stream(received));
+    received.length = 0;
+
+    events.add('mum', stream([]));
+
+    const said = about(received, 'mum');
+    assert.equal(said.length, 1, 'arriving is announced once');
+    assert.equal(said[0].online, true, 'and someone who just connected is online');
+});
+
 test('a person whose stream is replaced is never reported as having gone offline', () => {
     const received = [];
     const events = bus();
