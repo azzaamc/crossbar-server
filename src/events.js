@@ -41,6 +41,16 @@ function createEventBus({ store, log, heartbeatMs = HEARTBEAT_MS }) {
 
     function presence(userId, now) {
         const payload = { userId, online: isOnline(userId), lastSeen: now };
+        // Written down, because this is the one fact a client cannot check for itself: a
+        // phone told that somebody is offline has no reason to ask again, so a wrong
+        // broadcast is invisible from the outside until a person notices the dot. With the
+        // stream count, a reproduction says whether they really had none.
+        log.info('presence_broadcast', {
+            userId,
+            online: payload.online,
+            streams: streams.get(userId)?.size || 0,
+            recipients: streams.size,
+        });
         for (const recipientId of streams.keys()) emit(recipientId, 'presence', payload);
     }
 
