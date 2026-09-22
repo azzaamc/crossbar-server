@@ -37,6 +37,9 @@ test('its own files are served, and nothing above them', async (t) => {
     assert.equal((await get(base, '/admin/')).status, 200);
     assert.equal((await get(base, '/admin/admin.js')).status, 200);
     assert.equal((await get(base, '/admin/admin.css')).status, 200);
+    // The page loads these by name, so they have to be there under those names.
+    assert.equal((await get(base, '/admin/device.js')).status, 200);
+    assert.equal((await get(base, '/admin/qrcode.js')).status, 200);
     assert.equal((await get(base, '/admin/nothing-here')).status, 404);
     // A path that climbs out of the console's directory is refused, never resolved.
     assert.equal((await get(base, '/admin/..%2fsrc%2fserver.js')).status, 400);

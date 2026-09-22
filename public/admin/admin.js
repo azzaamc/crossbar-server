@@ -7,26 +7,26 @@
 // request goes to the same origin, so the content-security-policy the server sends
 // needs no exception, and no value that came from the server is ever inserted as HTML.
 
-const TOKEN_KEY = 'crossbar-admin-token';
-
-/** The session token, if this browser was handed one. Held for the tab, not the disk. */
-function heldToken() {
-    const given = new URLSearchParams(location.search).get('token');
-    if (given) {
-        sessionStorage.setItem(TOKEN_KEY, given.trim());
-        // Out of the address bar and out of any bookmark, without a reload.
-        history.replaceState(null, '', location.pathname);
-    }
-    return sessionStorage.getItem(TOKEN_KEY) || '';
-}
-
 async function call(path, options = {}) {
     const headers = { ...(options.headers || {}) };
-    const token = heldToken();
+    const token = CrossbarDevice.token();
     if (token) headers['x-crossbar-session'] = token;
     if (options.body !== undefined) headers['content-type'] = 'application/json';
+
     const response = await fetch(path, { ...options, headers });
     const data = await response.json().catch(() => ({}));
+
+    // A session that has expired is not a refusal of what was asked: the key is still here,
+    // so ask for another one and do the thing once more. 401 only — a 403 says this person
+    // may not, and asking again would not change that.
+    if (response.status === 401 && !options.afterRenewal && CrossbarDevice.supported) {
+        try {
+            if (await CrossbarDevice.session()) return call(path, { ...options, afterRenewal: true });
+        } catch {
+            // Fall through to the server's own refusal, which says more than this could.
+        }
+    }
+
     if (!response.ok) throw new Error(data?.error?.message || `The server refused that (HTTP ${response.status}).`);
     return data;
 }
@@ -264,6 +264,64 @@ function enrollmentsView(enrollments, people, refresh) {
         ...grantsView());
 }
 
+/**
+ * What to show a browser the server does not recognise.
+ *
+ * On a public deployment nothing vouches for a request, so a browser needs a key of its own
+ * before any of this will answer — the same thing the phone app holds. The code comes from
+ * Crossbar on a device that is already enrolled; the key that spends it is made here and
+ * kept unreadable, even to this page.
+ */
+function showEnrolment(notice) {
+    const code = el('input', { type: 'password', placeholder: 'Enrolment code', autocomplete: 'off' });
+    const message = el('p', { class: notice ? 'failed' : 'muted', text: notice || '' });
+    const button = el('button', { type: 'button', class: 'primary', text: 'Enrol this browser' });
+    button.addEventListener('click', async () => {
+        button.disabled = true;
+        message.className = 'muted';
+        message.textContent = 'Enrolling…';
+        try {
+            const device = await CrossbarDevice.enroll(code.value);
+            message.textContent = `Enrolled as ${device.name || device.id}.`;
+            await refresh();
+        } catch (error) {
+            message.className = 'failed';
+            message.textContent = error.message;
+            button.disabled = false;
+        }
+    });
+
+    main.replaceChildren(
+        el('h2', { text: 'This browser' }),
+        el('p', {
+            text: 'Nothing vouches for a browser on this deployment, so it needs a key of its '
+                + 'own — the same thing the phone app holds. Get an enrolment code from Crossbar '
+                + 'on a device that is already enrolled, and enter it here.',
+        }),
+        el('div', { class: 'grant' }, [el('div', { class: 'row' }, [code, button]), message]),
+    );
+}
+
+/** What this browser is, and the way to stop being it. */
+function browserFoot() {
+    const forget = el('button', { type: 'button', class: 'danger', text: 'Forget this browser' });
+    forget.addEventListener('click', async () => {
+        if (!confirm('Forget the key this browser holds? Enrolling it again needs a new code.')) return;
+        await CrossbarDevice.forget();
+        show('This browser has been forgotten. Reload to enrol it again.');
+    });
+
+    return el('p', { class: 'foot' }, [
+        el('span', {
+            class: 'muted',
+            text: CrossbarDevice.supported
+                ? 'This browser signs in with a key of its own, kept unreadable on this device.'
+                : 'This browser cannot keep a key: it needs a secure connection to this server.',
+        }),
+        forget,
+    ]);
+}
+
 // ── Wiring ──────────────────────────────────────────────────────────────────────
 
 const main = document.getElementById('main');
@@ -274,6 +332,21 @@ function show(text, failed = false) {
 
 async function refresh() {
     try {
+        // A public deployment trusts nothing about a request, so this browser has to be a
+        // device before the server will answer anything at all. A private one has the
+        // tailnet behind it and arrives already known.
+        if (!CrossbarDevice.token()) {
+            const identity = await call('/api/session');
+            if (!identity.authenticated) {
+                const known = CrossbarDevice.supported ? await CrossbarDevice.identity() : null;
+                if (known?.deviceId) await CrossbarDevice.session();
+                if (!CrossbarDevice.token()) {
+                    showEnrolment();
+                    return;
+                }
+            }
+        }
+
         const [status, people, devices, enrollments] = await Promise.all([
             call('/api/admin/status'),
             call('/api/admin/users'),
@@ -285,6 +358,7 @@ async function refresh() {
             peopleView(people.users),
             devicesView(devices.devices, refresh),
             enrollmentsView(enrollments.enrollments, people.users, refresh),
+            browserFoot(),
         );
     } catch (error) {
         show(error.message, true);
