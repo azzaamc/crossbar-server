@@ -136,16 +136,94 @@ function serverView(status) {
         ]));
 }
 
-function peopleView(users) {
-    const rows = users.map((user) => el('tr', {}, [
-        el('td', { text: user.displayName }),
-        el('td', { text: user.admin ? 'administrator' : '—' }),
-        el('td', { class: 'numeric', text: user.activeDevices ?? 0 }),
-        el('td', { text: user.login }),
-        el('td', { text: when(user.lastAuthenticated) }),
+/** A short id derived from a name, for the records: "Sara Ahmed" becomes "sara-ahmed". */
+const slug = (text) => String(text || '').toLowerCase().trim()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 32);
+
+function peopleView(people, refresh) {
+    const rows = people.map((person) => el('tr', { class: person.suspended ? 'inactive' : '' }, [
+        el('td', { text: person.displayName }),
+        el('td', { text: person.admin ? 'administrator' : '—' }),
+        el('td', { text: person.suspended ? 'suspended' : 'in the household' }),
+        el('td', { class: 'numeric', text: person.devices }),
+        el('td', { text: person.login }),
+        el('td', { text: when(person.lastAuthenticated) }),
+        el('td', {}, [el('div', { class: 'actions' }, [
+            el('button', {
+                type: 'button',
+                text: person.suspended ? 'Restore' : 'Suspend',
+                onClick: async () => {
+                    // Suspending keeps everything about them except the ability to sign in.
+                    await call(`/api/admin/people/${encodeURIComponent(person.id)}`, {
+                        method: 'POST',
+                        body: JSON.stringify({ enabled: person.suspended }),
+                    });
+                    await refresh();
+                },
+            }),
+            el('button', {
+                type: 'button',
+                class: 'danger',
+                text: 'Remove',
+                onClick: async () => {
+                    if (!confirm(`Take ${person.displayName} out of the household?\n\n`
+                        + 'Their devices stop working, and their calls stay in the records.')) return;
+                    await call(`/api/admin/people/${encodeURIComponent(person.id)}/remove`, { method: 'POST' });
+                    await refresh();
+                },
+            }),
+        ])]),
     ]));
-    if (!rows.length) return section('People', el('p', { class: 'muted', text: 'Nobody is in the household file.' }));
-    return section('People', table(['Name', 'Role', 'Devices', 'Login', 'Last authenticated'], rows, { numeric: ['Devices'] }));
+
+    const name = el('input', { placeholder: 'Name', autocomplete: 'off' });
+    const id = el('input', { placeholder: 'id', autocomplete: 'off', size: '12' });
+    const login = el('input', { placeholder: 'Tailscale login', autocomplete: 'off', size: '22' });
+    let idTouched = false;
+    name.addEventListener('input', () => {
+        if (!idTouched) id.value = slug(name.value);
+    });
+    id.addEventListener('input', () => { idTouched = true; });
+
+    const notice = el('p', { class: 'muted' });
+    const add = el('button', { type: 'button', class: 'primary', text: 'Add' });
+    add.addEventListener('click', async () => {
+        add.disabled = true;
+        notice.className = 'muted';
+        notice.textContent = 'Adding…';
+        try {
+            await call('/api/admin/people', {
+                method: 'POST',
+                body: JSON.stringify({
+                    id: id.value,
+                    displayName: name.value,
+                    tailscaleLogin: login.value,
+                }),
+            });
+            notice.textContent = '';
+            await refresh();
+        } catch (error) {
+            notice.className = 'failed';
+            notice.textContent = error.message;
+            add.disabled = false;
+        }
+    });
+
+    const addCard = el('div', { class: 'grant' }, [
+        el('p', {
+            text: 'A person needs a name and a login. The login is how the tailnet finds '
+                + 'them; on a server reached with device keys it is only a record, but a '
+                + 'household without one cannot be reached over a tailnet at all.',
+        }),
+        el('div', { class: 'row' }, [name, id, login, add]),
+        notice,
+    ]);
+
+    return section('People',
+        table(['Name', 'Role', 'State', 'Devices', 'Login', 'Last authenticated', ''], rows,
+            { numeric: ['Devices'] }),
+        addCard);
 }
 
 function devicesView(devices, refresh) {
@@ -429,14 +507,14 @@ async function refresh() {
     try {
         const [status, people, devices, enrollments] = await Promise.all([
             call('/api/admin/status'),
-            call('/api/admin/users'),
+            call('/api/admin/people'),
             call('/api/admin/devices'),
             call('/api/admin/enrollments'),
         ]);
         main.replaceChildren(
             serverView(status),
-            inviteView(people.users, refresh),
-            peopleView(people.users),
+            inviteView(people.people, refresh),
+            peopleView(people.people, refresh),
             devicesView(devices.devices, refresh),
             enrollmentsView(enrollments.enrollments, refresh),
             browserFoot(),

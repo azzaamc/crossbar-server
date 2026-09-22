@@ -12,6 +12,7 @@ const path = require('node:path');
 const { resolveIdentity, isLoopback } = require('./identity');
 const { DEVICE_ID_PATTERN } = require('./db');
 const auth = require('./auth');
+const householdFile = require('./household');
 const { iceConfigFor } = require('./ice');
 
 const MIME = {
@@ -530,6 +531,86 @@ function createRequestHandler({ config, store, bus, push, lifecycle, log, client
                 };
             }
 
+            // ── The household ───────────────────────────────────────────────────
+            //
+            // Who is in this household is written in a file, and the database's people are
+            // derived from it on every start — so these edit the file and re-sync, rather
+            // than writing rows that the next start would overwrite. What a household may
+            // be is checked before anything is written, and the file is replaced in one
+            // move with the version before it kept beside.
+            const currentHousehold = () => householdFile.read(config.familyConfigPath);
+
+            /** Writes the household file, then makes the database agree with it. */
+            function saveHousehold(next) {
+                householdFile.write(config.familyConfigPath, next);
+                store.syncFamilyConfig(config.familyConfigPath);
+            }
+
+            // Who is in the household, as the file says — with what the database knows about
+            // them. The two can disagree, by design, for somebody who has been taken out of
+            // the file: their row stays so their history does, and this is where that is
+            // visible rather than confusing.
+            if (req.method === 'GET' && pathname === '/api/admin/people') {
+                const known = new Map(store.listUsers().map((user) => [user.id, user]));
+                return sendJson(res, 200, {
+                    people: currentHousehold().users.map((user) => ({
+                        id: user.id,
+                        displayName: user.displayName,
+                        login: user.tailscaleLogin,
+                        avatar: user.avatar || '',
+                        admin: Boolean(user.admin),
+                        suspended: user.enabled === false,
+                        devices: known.get(user.id)?.activeDevices ?? 0,
+                        lastAuthenticated: known.get(user.id)?.lastAuthenticated ?? null,
+                    })),
+                });
+            }
+
+            if (req.method === 'POST' && pathname === '/api/admin/people') {
+                const body = await readJsonOrRefuse(req, res);
+                if (!body) return;
+                try {
+                    saveHousehold(householdFile.withPerson(currentHousehold(), body));
+                } catch (error) {
+                    return sendError(res, 400, 'HOUSEHOLD_INVALID', error.message);
+                }
+                log.info('household_person_added', { personId: body.id, by: actor });
+                return sendJson(res, 201, { users: store.listUsers() });
+            }
+
+            const personMatch = pathname.match(/^\/api\/admin\/people\/([A-Za-z0-9_-]{1,64})$/);
+            if (req.method === 'POST' && personMatch) {
+                const body = await readJsonOrRefuse(req, res);
+                if (!body) return;
+                try {
+                    saveHousehold(householdFile.withChanges(currentHousehold(), personMatch[1], body));
+                } catch (error) {
+                    return sendError(res, 400, 'HOUSEHOLD_INVALID', error.message);
+                }
+                log.info('household_person_changed', { personId: personMatch[1], by: actor });
+                return sendJson(res, 200, { users: store.listUsers() });
+            }
+
+            const removalMatch = pathname.match(/^\/api\/admin\/people\/([A-Za-z0-9_-]{1,64})\/remove$/);
+            if (req.method === 'POST' && removalMatch) {
+                const id = removalMatch[1];
+                try {
+                    saveHousehold(householdFile.withoutPerson(currentHousehold(), id));
+                } catch (error) {
+                    return sendError(res, 400, 'HOUSEHOLD_INVALID', error.message);
+                }
+                // Their row stays, disabled. Calls, participants and devices all point at it,
+                // and a household's history is not something to erase to tidy a list.
+                store.setUserEnabled(id, false);
+                // Their devices go with them: a key left behind is a key that still opens the
+                // door, and the person it belonged to is no longer in the household.
+                const now = new Date().toISOString();
+                const devices = store.allDevices(id);
+                for (const device of devices) store.revokeDevice(device.id, now);
+                log.info('household_person_removed', { personId: id, devices: devices.length, by: actor });
+                return sendJson(res, 200, { users: store.listUsers(), revokedDevices: devices.length });
+            }
+
             if (req.method === 'GET' && pathname === '/api/admin/status') {
                 const now = new Date().toISOString();
                 return sendJson(res, 200, {
@@ -546,7 +627,10 @@ function createRequestHandler({ config, store, bus, push, lifecycle, log, client
                             ttlSeconds: config.turn.ttlSeconds,
                         }
                         : null,
-                    users: store.listUsers().length,
+                    // The household's people, not the rows: somebody taken out of the file
+                    // keeps their row for the history's sake, and counting rows here would
+                    // make this card disagree with the People table beneath it.
+                    users: householdFile.read(config.familyConfigPath).users.length,
                     devices: store.allDevices().length,
                     openEnrollments: store.enrollments(now).filter((item) => item.state === 'open').length,
                 });

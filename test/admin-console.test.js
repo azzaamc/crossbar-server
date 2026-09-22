@@ -134,3 +134,56 @@ test('guessing is rate limited', async (t) => {
     // And the right password is behind the same limit, not beside it.
     assert.equal((await signIn(base, PASSWORD)).status, 429);
 });
+
+test('the household can be changed from the console, and suspending is not removing', async (t) => {
+    const { server, base } = await startTestServer(WITH_PASSWORD);
+    t.after(() => server.close());
+    const { cookie } = await signIn(base, PASSWORD);
+    const asOperator = async (route, body) => {
+        const response = await fetch(`${base}${route}`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json', cookie: cookiePair(cookie) },
+            body: body === undefined ? undefined : JSON.stringify(body),
+        });
+        return { status: response.status, data: await response.json().catch(() => ({})) };
+    };
+
+    const added = await asOperator('/api/admin/people', {
+        id: 'sara',
+        displayName: 'Sara',
+        tailscaleLogin: 'sara@example.com',
+    });
+    assert.equal(added.status, 201, JSON.stringify(added.data));
+    assert.ok(added.data.users.some((user) => user.id === 'sara'));
+
+    // Suspended: still a member of the household, no longer somebody who can be signed in as.
+    assert.equal((await asOperator('/api/admin/people/sara', { enabled: false })).status, 200);
+    assert.equal(server.store.userById('sara'), null);
+    assert.ok(server.store.listUsers().some((user) => user.id === 'sara'), 'still in the household');
+
+    // Restored, and able to be recognised again.
+    assert.equal((await asOperator('/api/admin/people/sara', { enabled: true })).status, 200);
+    assert.ok(server.store.userById('sara'));
+
+    // A household may not lose its last administrator, whoever is asking.
+    const lastAdmin = await asOperator('/api/admin/people/abdullah', { enabled: false });
+    assert.equal(lastAdmin.status, 400);
+    assert.equal(lastAdmin.data.error.code, 'HOUSEHOLD_INVALID');
+
+    const removed = await asOperator('/api/admin/people/sara/remove');
+    assert.equal(removed.status, 200);
+
+    // Gone from the household — the file no longer names her — and unable to be signed in
+    // as. Still in the records, which is where the calls she was part of point.
+    const people = await fetch(`${base}/api/admin/people`, { headers: { cookie: cookiePair(cookie) } });
+    const listed = (await people.json()).people.map((person) => person.id);
+    assert.deepEqual(listed, ['abdullah', 'dad', 'mum']);
+    assert.equal(server.store.userById('sara'), null);
+    assert.equal(removed.data.revokedDevices, 0);
+
+    // And the count the console shows is the household's, not the rows': her row remains,
+    // which is the point, and counting it would make the server card disagree with the table.
+    const status = await fetch(`${base}/api/admin/status`, { headers: { cookie: cookiePair(cookie) } });
+    assert.equal((await status.json()).users, 3);
+    assert.equal(server.store.listUsers().length, 4, 'the row is still there, disabled');
+});

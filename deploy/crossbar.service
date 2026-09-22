@@ -12,7 +12,7 @@ Environment=NODE_ENV=production
 Environment=NODE_NO_WARNINGS=ExperimentalWarning
 EnvironmentFile=/home/admin/crossbar/.env
 ExecStart=/usr/bin/node /home/admin/crossbar/src/server.js
-Restart=on-failure
+Restart=always
 RestartSec=5
 TimeoutStopSec=10
 UMask=0077

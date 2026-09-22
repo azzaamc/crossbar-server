@@ -296,13 +296,13 @@ class Store {
             }
 
             const upsert = this.db.prepare(`
-                INSERT INTO users (id, tailscale_login, display_name, avatar, admin)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO users (id, tailscale_login, display_name, avatar, admin, enabled)
+                VALUES (?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET tailscale_login=excluded.tailscale_login,
                   display_name=CASE WHEN users.first_seen_at IS NULL THEN excluded.display_name ELSE users.display_name END,
                   avatar=CASE WHEN users.first_seen_at IS NULL THEN excluded.avatar ELSE users.avatar END,
                   admin=excluded.admin,
-                  enabled=1
+                  enabled=excluded.enabled
             `);
             for (const user of users) {
                 assertId(user.id, 'user id');
@@ -314,6 +314,10 @@ class Store {
                     cleanText(user.displayName, 80, 'display name'),
                     cleanOptional(user.avatar, 500),
                     user.admin ? 1 : 0,
+                    // Suspending is a statement about the household, kept in the file where the
+                    // household is written down: a suspended person keeps their identity, their
+                    // devices and their history, and stops being able to sign in.
+                    user.enabled === false ? 0 : 1,
                 );
             }
 
@@ -578,6 +582,20 @@ class Store {
             WHERE id = ? AND status <> 'revoked'
         `).run(now, deviceId);
         return result.changes === 1;
+    }
+
+    /**
+     * Whether somebody may be signed in as.
+     *
+     * What leaving the household comes to on this side: the file stops naming them, and
+     * their row stays, because calls, participants, devices and authenticators all point at
+     * it and a household's history is not something to erase to tidy a list. `userById` and
+     * `userByLogin` refuse a row that is not enabled, so this is the whole of it.
+     */
+    setUserEnabled(id, enabled) {
+        const wanted = enabled ? 1 : 0;
+        return this.db.prepare('UPDATE users SET enabled = ? WHERE id = ? AND enabled <> ?')
+            .run(wanted, id, wanted).changes > 0;
     }
 
     /** Every device, for an operator. Not filtered by anything the caller claims. */
