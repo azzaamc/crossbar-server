@@ -7,6 +7,9 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
 
 const { startTestServer, api } = require('./helpers');
 const auth = require('../src/auth');
@@ -133,6 +136,33 @@ test('guessing is rate limited', async (t) => {
     assert.equal(answers.at(-1), 429, `attempts: ${answers.join(', ')}`);
     // And the right password is behind the same limit, not beside it.
     assert.equal((await signIn(base, PASSWORD)).status, 429);
+});
+
+test('a setting that would stop the server starting is refused, and put back', async (t) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'crossbar-settings-'));
+    const envFile = path.join(dir, '.env');
+    fs.writeFileSync(envFile, 'MAX_PARTICIPANTS=4\n'
+        + 'CROSSBAR_TURN_MIN_PORT=49160\nCROSSBAR_TURN_MAX_PORT=49200\n');
+    const { server, base } = await startTestServer({ ...WITH_PASSWORD, envFile });
+    t.after(() => server.close());
+    const { cookie } = await signIn(base, PASSWORD);
+    const change = (changes) => fetch(`${base}/api/admin/settings`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', cookie: cookiePair(cookie) },
+        body: JSON.stringify({ changes }),
+    });
+
+    // A relay range that runs backwards loads into a configuration the server refuses.
+    const before = fs.readFileSync(envFile, 'utf8');
+    const refused = await change({ CROSSBAR_TURN_MIN_PORT: '51000', CROSSBAR_TURN_MAX_PORT: '50000' });
+    assert.equal(refused.status, 400);
+    assert.equal((await refused.json()).error.code, 'SETTINGS_REFUSED');
+    assert.equal(fs.readFileSync(envFile, 'utf8'), before, 'a refused change leaves the file as it was');
+
+    // A value it already holds is not a change, so nothing is written and nothing restarts.
+    const unchanged = await change({ MAX_PARTICIPANTS: '4' });
+    assert.equal(unchanged.status, 200);
+    assert.deepEqual(await unchanged.json(), { ok: true, changed: false, restarting: false });
 });
 
 test('the household can be changed from the console, and suspending is not removing', async (t) => {

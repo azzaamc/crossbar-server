@@ -8,7 +8,9 @@
 // requires an origin that matches (or is absent — a native client sends none).
 
 const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
+const { MODES, KNOBS, modeBlock, applyMode, applyKnobs, verifyEnvFile } = require('./config');
 const { resolveIdentity, isLoopback } = require('./identity');
 const { DEVICE_ID_PATTERN } = require('./db');
 const auth = require('./auth');
@@ -609,6 +611,153 @@ function createRequestHandler({ config, store, bus, push, lifecycle, log, client
                 for (const device of devices) store.revokeDevice(device.id, now);
                 log.info('household_person_removed', { personId: id, devices: devices.length, by: actor });
                 return sendJson(res, 200, { users: store.listUsers(), revokedDevices: devices.length });
+            }
+
+            // ── Settings, and the mode ──────────────────────────────────────────
+            //
+            // The settings an operator may change, and nothing else: these are the ones
+            // whose worst case is a server that behaves differently, rather than one nobody
+            // can reach. Every change is checked before it is written, the file is then
+            // checked as a process starting from it would read it, and it is put back if
+            // that fails — a setting that stops the server starting is worse than any
+            // setting is good. A change that holds is followed by a restart, because the
+            // configuration is read once and that is the only moment it is consistent.
+            const envPath = config.envFile;
+            const envContent = () => fs.readFileSync(envPath, 'utf8');
+
+            /** Rewrites `.env` and verifies the result, undoing it if the result is broken. */
+            function writeEnv(change, event, detail) {
+                const before = envContent();
+                let after;
+                try {
+                    after = change(before);
+                } catch (error) {
+                    return { ok: false, changed: false, message: error.message };
+                }
+                if (after === before) return { ok: true, changed: false };
+
+                fs.writeFileSync(envPath, after);
+                // Verified in the directory of the file just written, not of the process: on a
+                // deployment they are the same, and anywhere else the answer must still be
+                // about this file rather than whatever the working directory happens to hold.
+                const check = verifyEnvFile(path.dirname(envPath));
+                if (!check.ok) {
+                    fs.writeFileSync(envPath, before);
+                    return { ok: false, changed: false, message: check.message };
+                }
+                log.info(event, detail);
+                return { ok: true, changed: true };
+            }
+
+            /** Answers first, then leaves: the restart must not beat the response out. */
+            function restarting(res, changed) {
+                if (changed) setTimeout(() => process.exit(0), 400);
+                return sendJson(res, 200, { ok: true, changed, restarting: changed });
+            }
+
+            /** What a setting is now, as this process is using it. */
+            function currentValue(key) {
+                switch (key) {
+                    case 'MAX_PARTICIPANTS': return config.maxParticipants;
+                    case 'CALL_RING_SECONDS': return config.callRingSeconds;
+                    case 'ALLOW_SELF_CALLS': return config.allowSelfCalls;
+                    case 'AUTO_ENROL_IDENTITIES': return config.autoEnrolIdentities;
+                    case 'CROSSBAR_ENROLLMENT_TTL_SECONDS': return config.enrollmentTtlSeconds;
+                    case 'CROSSBAR_SESSION_TTL_SECONDS': return config.sessionTtlSeconds;
+                    case 'CROSSBAR_CHALLENGE_TTL_SECONDS': return config.challengeTtlSeconds;
+                    case 'ICE_STUN_URL': return config.iceServers?.[0]?.urls || '';
+                    case 'CROSSBAR_TURN_HOST': return config.turn.host;
+                    case 'CROSSBAR_TURN_PORT': return config.turn.port;
+                    case 'CROSSBAR_TURN_MIN_PORT': return config.turn.minPort;
+                    case 'CROSSBAR_TURN_MAX_PORT': return config.turn.maxPort;
+                    case 'CROSSBAR_TURN_TTL_SECONDS': return config.turn.ttlSeconds;
+                    case 'MAX_MESSAGE_BYTES': return config.messageBytes;
+                    case 'PING_INTERVAL_MS': return config.pingIntervalMs;
+                    case 'PING_TIMEOUT_MS': return config.pingTimeoutMs;
+                    case 'RELAY_PER_SECOND': return config.relayPerSecond;
+                    case 'MALFORMED_LIMIT': return config.malformedLimit;
+                    default: return '';
+                }
+            }
+
+            if (req.method === 'GET' && pathname === '/api/admin/settings') {
+                const content = envContent();
+                return sendJson(res, 200, {
+                    mode: config.networkMode,
+                    modes: MODES.map((mode) => ({
+                        mode,
+                        hostname: modeBlock(content, mode).HOSTNAME,
+                        origin: modeBlock(content, mode).ORIGIN,
+                        inForce: mode === config.networkMode,
+                    })),
+                    knobs: KNOBS.map((knob) => ({ ...knob, value: currentValue(knob.key) })),
+                });
+            }
+
+            if (req.method === 'POST' && pathname === '/api/admin/settings') {
+                const body = await readJsonOrRefuse(req, res);
+                if (!body) return;
+                const outcome = writeEnv((content) => applyKnobs(content, body.changes),
+                    'settings_changed', { changed: Object.keys(body.changes || {}), by: actor });
+                if (!outcome.ok) return sendError(res, 400, 'SETTINGS_REFUSED', outcome.message);
+                return restarting(res, outcome.changed);
+            }
+
+            if (req.method === 'POST' && pathname === '/api/admin/mode') {
+                const body = await readJsonOrRefuse(req, res);
+                if (!body) return;
+                const wanted = String(body.mode || '');
+                if (!MODES.includes(wanted)) {
+                    return sendError(res, 400, 'MODE_REFUSED', `The mode has to be one of ${MODES.join(', ')}.`);
+                }
+                const outcome = writeEnv((content) => applyMode(content, wanted),
+                    'mode_changed', { mode: wanted, by: actor });
+                if (!outcome.ok) return sendError(res, 400, 'MODE_REFUSED', outcome.message);
+                return restarting(res, outcome.changed);
+            }
+
+            // ── What has happened, and what this machine is doing ───────────────
+            if (req.method === 'GET' && pathname === '/api/admin/usage') {
+                const since = new Date(Date.now() - 13 * 86400000).toISOString().slice(0, 10);
+                // Every day, including the quiet ones: a chart that only drew the days with
+                // calls in them would put a fortnight in the space of an afternoon.
+                const recorded = new Map(store.usageByDay(since).map((row) => [row.day, row]));
+                const days = [];
+                for (let back = 13; back >= 0; back -= 1) {
+                    const day = new Date(Date.now() - back * 86400000).toISOString().slice(0, 10);
+                    days.push(recorded.get(day) || { day, calls: 0, answered: 0, minutes: 0 });
+                }
+                return sendJson(res, 200, {
+                    days,
+                    pairs: store.callPairs(since),
+                    invitations: store.invitationTally(),
+                    platforms: store.devicePlatforms(),
+                });
+            }
+
+            if (req.method === 'GET' && pathname === '/api/admin/host') {
+                const load = os.loadavg();
+                const memory = { total: os.totalmem(), free: os.freemem() };
+                let disk = null;
+                try {
+                    const stats = fs.statfsSync(config.dataDir);
+                    disk = { total: stats.blocks * stats.bsize, free: stats.bavail * stats.bsize };
+                } catch {
+                    // A filesystem that will not answer is not a reason to refuse the rest.
+                }
+                let database = 0;
+                try {
+                    database = fs.statSync(path.join(config.dataDir, 'crossbar.sqlite')).size;
+                } catch {
+                    database = 0;
+                }
+                return sendJson(res, 200, {
+                    load: { one: load[0], five: load[1], fifteen: load[2], cpus: os.cpus().length || 1 },
+                    memory: { ...memory, process: process.memoryUsage().rss },
+                    disk,
+                    database,
+                    uptime: { host: os.uptime(), process: process.uptime() },
+                });
             }
 
             if (req.method === 'GET' && pathname === '/api/admin/status') {

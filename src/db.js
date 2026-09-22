@@ -660,6 +660,57 @@ class Store {
         return result.changes === 1;
     }
 
+    // ── What has happened ───────────────────────────────────────────────────────
+
+    /**
+     * Calls per day, and what came of them.
+     *
+     * Read from the call records themselves rather than from anything counted while they
+     * happened: a counter is a thing that drifts, and these are the same rows the call
+     * history is made of. `minutes` only counts calls that were answered and ended, so a
+     * call still ringing does not read as a duration.
+     */
+    usageByDay(since) {
+        return this.db.prepare(`
+            SELECT substr(created_at, 1, 10) AS day,
+              COUNT(*) AS calls,
+              SUM(CASE WHEN answered_at IS NOT NULL THEN 1 ELSE 0 END) AS answered,
+              SUM(CASE WHEN answered_at IS NOT NULL AND ended_at IS NOT NULL
+                       THEN (julianday(ended_at) - julianday(answered_at)) * 1440 ELSE 0 END) AS minutes
+            FROM calls WHERE created_at >= ? GROUP BY day ORDER BY day
+        `).all(`${since}T00:00:00.000Z`);
+    }
+
+    /** Who rings whom, for the pairs that actually do. */
+    callPairs(since, limit = 8) {
+        return this.db.prepare(`
+            SELECT c.caller_user_id AS "from", p.user_id AS "to", COUNT(*) AS calls
+            FROM calls c JOIN call_participants p ON p.call_id = c.id
+            WHERE c.created_at >= ? AND p.user_id <> c.caller_user_id
+            GROUP BY "from", "to" ORDER BY calls DESC LIMIT ?
+        `).all(`${since}T00:00:00.000Z`, Math.min(50, Math.max(1, Number(limit) || 8)));
+    }
+
+    /** Invitations, by what became of them. */
+    invitationTally() {
+        const row = this.db.prepare(`
+            SELECT COUNT(*) AS issued,
+              SUM(CASE WHEN used_at IS NOT NULL THEN 1 ELSE 0 END) AS used,
+              SUM(CASE WHEN revoked_at IS NOT NULL THEN 1 ELSE 0 END) AS revoked
+            FROM enrollment_tokens
+        `).get();
+        return { issued: row.issued || 0, used: row.used || 0, revoked: row.revoked || 0 };
+    }
+
+    /** Devices by platform, counting the ones still in use. */
+    devicePlatforms() {
+        return this.db.prepare(`
+            SELECT platform, COUNT(*) AS total,
+              SUM(CASE WHEN revoked_at IS NULL THEN 1 ELSE 0 END) AS active
+            FROM devices GROUP BY platform ORDER BY total DESC
+        `).all();
+    }
+
     enrollments(now, limit = 50) {
         return this.db.prepare(`
             SELECT id, created_at AS createdAt, expires_at AS expiresAt, used_at AS usedAt,

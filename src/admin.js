@@ -12,8 +12,7 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
-const { spawnSync } = require('node:child_process');
-const { loadConfig, applyMode, modeBlock, MODES } = require('./config');
+const { loadConfig, applyMode, modeBlock, MODES, setEnvLine, verifyEnvFile } = require('./config');
 const { Store } = require('./db');
 const auth = require('./auth');
 const { diagnose } = require('./diagnostics');
@@ -99,26 +98,6 @@ function printEnrollments(store) {
     }
 }
 
-/**
- * What the selected configuration makes of itself, read by a child process with nothing
- * but the file in its environment — which is the question a restart asks. Inheriting this
- * process's environment would answer a different one: this process read `.env` when it
- * started, and `loadDotEnv` never overwrites a variable that is already set, so anything
- * held here would hide what the file now says.
- */
-function loadFresh(cwd, mode) {
-    const result = spawnSync(process.execPath, [
-        '-e', `require(${JSON.stringify(path.join(__dirname, 'config.js'))}).loadConfig()`,
-    ], {
-        cwd,
-        env: { PATH: process.env.PATH, CROSSBAR_NETWORK_MODE: mode },
-        encoding: 'utf8',
-    });
-    const stderr = (result.stderr || '').split('\n').map((line) => line.trim()).filter(Boolean);
-    const failure = stderr.find((line) => /Error: /.test(line)) || stderr[stderr.length - 1] || '';
-    return { ok: result.status === 0, message: failure.replace(/^\w*Error: /, '') };
-}
-
 /** A line typed without appearing on the screen, which is what a password deserves. */
 function readPassword(prompt) {
     return new Promise((resolve) => {
@@ -157,15 +136,6 @@ function readPassword(prompt) {
 
         stdin.on('data', onData);
     });
-}
-
-/** One key set to one value, in place, with every other line left exactly as it was. */
-function setEnvLine(content, key, value) {
-    const lines = content.split('\n');
-    const index = lines.findIndex((line) => line.trim().startsWith(`${key}=`));
-    const line = `${key}=${value}`;
-    if (index === -1) return [...lines, line].join('\n');
-    return [...lines.slice(0, index), line, ...lines.slice(index + 1)].join('\n');
 }
 
 async function main(argv) {
@@ -293,7 +263,7 @@ async function main(argv) {
                             + (block.ORIGIN || '(unset: invitations would carry the default origin)'),
                         );
                     }
-                    const check = loadFresh(process.cwd(), config.networkMode);
+                    const check = verifyEnvFile(process.cwd(), config.networkMode);
                     console.log(check.ok
                         ? `\n${config.networkMode} is in force, and loads cleanly.`
                         : `\n${config.networkMode} is in force but does not load: ${check.message}`);
@@ -314,7 +284,7 @@ async function main(argv) {
                 // hold up. A switch that leaves a deployment unable to start is worse
                 // than no switch at all.
                 fs.writeFileSync(file, applyMode(content, wanted));
-                const check = loadFresh(process.cwd(), wanted);
+                const check = verifyEnvFile(process.cwd(), wanted);
                 if (!check.ok) {
                     fs.writeFileSync(file, content);
                     console.error(`Cannot switch to ${wanted}: ${check.message}`);

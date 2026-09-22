@@ -10,6 +10,7 @@ Group=admin
 WorkingDirectory=/home/admin/crossbar
 Environment=NODE_ENV=production
 Environment=NODE_NO_WARNINGS=ExperimentalWarning
+WorkingDirectory=/home/admin/crossbar
 EnvironmentFile=/home/admin/crossbar/.env
 ExecStart=/usr/bin/node /home/admin/crossbar/src/server.js
 Restart=always

@@ -495,6 +495,208 @@ function browserFoot() {
     ]);
 }
 
+/**
+ * A bar per day. A fortnight of calls needs nothing more elaborate than that, and a chart
+ * library would be a page of JavaScript to draw twenty-eight rectangles.
+ */
+function callChart(days) {
+    const width = 640;
+    const height = 120;
+    const peak = Math.max(1, ...days.map((day) => day.calls));
+    const slot = width / Math.max(1, days.length);
+    const barWidth = Math.max(6, Math.min(26, slot - 6));
+    const pieces = [];
+
+    days.forEach((day, index) => {
+        const barHeight = Math.round((day.calls / peak) * (height - 30));
+        const x = index * slot + (slot - barWidth) / 2;
+        pieces.push(svg('rect', {
+            x,
+            y: height - 20 - barHeight,
+            width: barWidth,
+            height: Math.max(barHeight, 1),
+            rx: 3,
+            // A day where everything was answered reads as the accent; a day with a missed
+            // call in it does not, which is the one thing worth telling apart at a glance.
+            fill: day.answered === day.calls ? 'var(--accent)' : 'var(--muted)',
+        }));
+        if (index % 2 === 0) {
+            pieces.push(svg('text', {
+                x: x + barWidth / 2,
+                y: height - 6,
+                'text-anchor': 'middle',
+                'font-size': '9',
+                fill: 'var(--muted)',
+            }, [day.day.slice(5)]));
+        }
+    });
+
+    return svg('svg', {
+        viewBox: `0 0 ${width} ${height}`,
+        width: '100%',
+        height,
+        role: 'img',
+        'aria-label': `Calls per day over ${days.length} days`,
+    }, pieces);
+}
+
+const gigabytes = (bytes) => `${(Number(bytes || 0) / 1024 / 1024 / 1024).toFixed(1)} GB`;
+
+const duration = (seconds) => {
+    const days = Math.floor(seconds / 86400);
+    const hours = Math.floor((seconds % 86400) / 3600);
+    return days ? `${days}d ${hours}h` : `${hours}h ${Math.floor((seconds % 3600) / 60)}m`;
+};
+
+const statCard = (label, value) => el('div', { class: 'card' }, [
+    el('div', { class: 'label', text: label }),
+    el('div', { class: 'value', text: String(value) }),
+]);
+
+function usageView(usage, people) {
+    const known = new Map(people.map((person) => [person.id, person.displayName]));
+    const total = usage.days.reduce((sum, day) => ({
+        calls: sum.calls + day.calls,
+        answered: sum.answered + day.answered,
+        minutes: sum.minutes + (day.minutes || 0),
+    }), { calls: 0, answered: 0, minutes: 0 });
+
+    const pairs = usage.pairs.map((pair) => el('tr', {}, [
+        el('td', { text: known.get(pair.from) || pair.from }),
+        el('td', { text: known.get(pair.to) || pair.to }),
+        el('td', { class: 'numeric', text: pair.calls }),
+    ]));
+
+    return section('Usage, the last fortnight',
+        el('div', { class: 'cards' }, [
+            statCard('Calls', total.calls),
+            statCard('Answered', total.answered),
+            statCard('Typical call', total.answered ? `${Math.round(total.minutes / total.answered)} min` : '—'),
+            statCard('Invitations', `${usage.invitations.used} of ${usage.invitations.issued} used`),
+            statCard('Devices', usage.platforms.reduce((sum, row) => sum + row.active, 0)),
+        ]),
+        el('div', { class: 'chart' }, [callChart(usage.days)]),
+        usage.pairs.length
+            ? table(['Who', 'Called', 'Times'], pairs, { numeric: ['Times'] })
+            : el('p', { class: 'muted', text: 'Nobody has called anybody yet.' }));
+}
+
+function hostView(host) {
+    return section('This machine',
+        el('div', { class: 'cards' }, [
+            statCard('Load', `${host.load.one.toFixed(2)} · ${host.load.five.toFixed(2)} · ${host.load.fifteen.toFixed(2)}`),
+            statCard('Cores', host.load.cpus),
+            statCard('Memory used', `${gigabytes(host.memory.total - host.memory.free)} of ${gigabytes(host.memory.total)}`),
+            statCard('Disk free', host.disk ? gigabytes(host.disk.free) : 'not readable'),
+            statCard('Database', gigabytes(host.database)),
+            statCard('Machine up', duration(host.uptime.host)),
+            statCard('Server up', duration(host.uptime.process)),
+        ]));
+}
+
+/**
+ * Asks for a change, waits for the server to come back, and reloads.
+ *
+ * Every change here restarts the service, because the configuration is read once at start
+ * and that is the only moment it is consistent. The page says so, then waits on
+ * `/api/health`, which is the one route answered before anything else can be.
+ */
+async function applyChange(route, body, question) {
+    if (question && !confirm(question)) return;
+    show('Applying…');
+    try {
+        const result = await call(route, { method: 'POST', body: JSON.stringify(body) });
+        if (!result.restarting) {
+            await refresh();
+            return;
+        }
+    } catch (error) {
+        show(error.message, true);
+        return;
+    }
+
+    show('Restarting. This page reloads when the server is back.');
+    for (let attempt = 0; attempt < 60; attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        try {
+            const response = await fetch('/api/health', { cache: 'no-store' });
+            if (response.ok) {
+                location.reload();
+                return;
+            }
+        } catch {
+            // Still down, which is what a restart looks like from here.
+        }
+    }
+    show('It has not come back. It will need looking at on the box.', true);
+}
+
+function settingsView(settings) {
+    const fields = new Map();
+    const rows = settings.knobs.map((knob) => {
+        const input = knob.type === 'boolean'
+            ? el('select', {}, [
+                el('option', { value: 'true', text: 'on', selected: knob.value === true }),
+                el('option', { value: 'false', text: 'off', selected: knob.value === false }),
+            ])
+            : el('input', { value: String(knob.value ?? ''), size: '14', autocomplete: 'off' });
+        fields.set(knob.key, { knob, input });
+        return el('tr', {}, [
+            el('td', {}, [
+                el('div', { text: knob.label }),
+                knob.help ? el('div', { class: 'muted', text: knob.help }) : null,
+            ]),
+            el('td', { class: 'mono', text: knob.key }),
+            el('td', {}, [input]),
+            el('td', { class: 'muted', text: knob.unit || (knob.type === 'boolean' ? 'on / off' : '') }),
+        ]);
+    });
+
+    const notice = el('p', { class: 'muted' });
+    const save = el('button', { type: 'button', class: 'primary', text: 'Save and restart' });
+    save.addEventListener('click', async () => {
+        const changes = {};
+        for (const [key, { knob, input }] of fields) {
+            const value = knob.type === 'boolean' ? input.value === 'true' : input.value;
+            if (String(value) !== String(knob.value === true ? 'true' : knob.value === false ? 'false' : knob.value)) {
+                changes[key] = value;
+            }
+        }
+        if (!Object.keys(changes).length) {
+            notice.textContent = 'Nothing has changed.';
+            return;
+        }
+        save.disabled = true;
+        await applyChange('/api/admin/settings', { changes }, null);
+        save.disabled = false;
+    });
+
+    const modeCards = settings.modes.map((entry) => el('div', { class: `card${entry.inForce ? ' active' : ''}` }, [
+        el('div', { class: 'label', text: entry.inForce ? `${entry.mode} — in force` : entry.mode }),
+        el('div', { class: 'value', text: entry.hostname || 'not configured' }),
+        entry.origin ? el('div', { class: 'muted mono', text: entry.origin }) : null,
+        entry.inForce ? null : el('button', {
+            type: 'button',
+            text: `Switch to ${entry.mode}`,
+            onClick: () => applyChange('/api/admin/mode', { mode: entry.mode },
+                `Switch this server to ${entry.mode}?\n\nIt restarts, and everyone reconnects. `
+                + (entry.hostname ? `It will be reached at ${entry.origin}.` : 'That mode has no address set, so this will be refused.')),
+        }),
+    ]));
+
+    return section('Settings',
+        el('p', {
+            class: 'muted',
+            text: 'Changing anything here writes it to the server’s configuration and restarts it. '
+                + 'Everything is checked first, and undone if the server would not start — the '
+                + 'settings that could lock you out are not on this list.',
+        }),
+        table(['Setting', 'Name', 'Value', ''], rows),
+        el('div', { class: 'row' }, [save, notice]),
+        el('h3', { text: 'Where this server is reached' }),
+        el('div', { class: 'cards' }, modeCards));
+}
+
 // ── Wiring ──────────────────────────────────────────────────────────────────────
 
 const main = document.getElementById('main');
@@ -505,11 +707,14 @@ function show(text, failed = false) {
 
 async function refresh() {
     try {
-        const [status, people, devices, enrollments] = await Promise.all([
+        const [status, people, devices, enrollments, usage, host, settings] = await Promise.all([
             call('/api/admin/status'),
             call('/api/admin/people'),
             call('/api/admin/devices'),
             call('/api/admin/enrollments'),
+            call('/api/admin/usage'),
+            call('/api/admin/host'),
+            call('/api/admin/settings'),
         ]);
         main.replaceChildren(
             serverView(status),
@@ -517,6 +722,9 @@ async function refresh() {
             peopleView(people.people, refresh),
             devicesView(devices.devices, refresh),
             enrollmentsView(enrollments.enrollments, refresh),
+            usageView(usage, people.people),
+            hostView(host),
+            settingsView(settings),
             browserFoot(),
         );
     } catch (error) {

@@ -5,6 +5,7 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
+const { spawnSync } = require('node:child_process');
 
 function loadDotEnv(filePath) {
     if (!fs.existsSync(filePath)) return;
@@ -23,7 +24,9 @@ function loadDotEnv(filePath) {
     }
 }
 
-loadDotEnv(path.resolve(process.cwd(), '.env'));
+/** The file this configuration was read from — what a mode switch or a setting rewrites. */
+const ENV_FILE = path.resolve(process.cwd(), '.env');
+loadDotEnv(ENV_FILE);
 
 function bool(name, fallback = false) {
     const value = process.env[name];
@@ -189,6 +192,9 @@ function loadConfig() {
         // read by anything that can read the service's configuration. Set it with
         // `node src/admin.js password`, which is the only thing that writes it.
         adminPasswordHash: text('CROSSBAR_ADMIN_PASSWORD_HASH', ''),
+        // Where the settings and the mode are written back to. The file this process read,
+        // not whatever the working directory happens to be by the time a request arrives.
+        envFile: ENV_FILE,
         sessionSecret,
         sessionTtlSeconds: integer('CROSSBAR_SESSION_TTL_SECONDS', 43200, 60, 2592000),
         challengeTtlSeconds: integer('CROSSBAR_CHALLENGE_TTL_SECONDS', 120, 30, 900),
@@ -310,4 +316,123 @@ function applyMode(content, mode) {
     return [...outside, ...generated].join('\n');
 }
 
-module.exports = { loadConfig, loadDotEnv, bool, integer, text, applyMode, modeBlock, MODES };
+// ── Changing the configuration from somewhere that is not a shell ───────────────
+//
+// Two things write `.env`: the CLI and the console. Both go through here, so there is one
+// implementation of "change one line, check what the file now makes of itself, and put it
+// back if that does not hold up" rather than two that drift apart.
+
+/**
+ * What an operator may change, and what each one means.
+ *
+ * A whitelist, not the file: these are the settings whose worst case is a server that
+ * behaves differently. The ones whose worst case is a server nobody can reach — the
+ * listener, the origin, the signing secret, the addresses a mode is reached at — are not on
+ * it, and neither is anything that is a secret.
+ */
+const KNOBS = Object.freeze([
+    { key: 'MAX_PARTICIPANTS', label: 'People in a call', type: 'integer', min: 2, max: 8,
+      help: 'The most anyone can be in a call with at once.' },
+    { key: 'CALL_RING_SECONDS', label: 'Ringing time', type: 'integer', min: 10, max: 600, unit: 'seconds',
+      help: 'How long a call rings before it gives up.' },
+    { key: 'ALLOW_SELF_CALLS', label: 'Calls with yourself', type: 'boolean',
+      help: 'Whether one person may ring their own other devices. Useful for testing, odd otherwise.' },
+    { key: 'AUTO_ENROL_IDENTITIES', label: 'Enrol arrivals automatically', type: 'boolean',
+      help: 'On, a login arriving from the tailnet joins the household by itself; off, only people already in the file are accepted.' },
+    { key: 'CROSSBAR_ENROLLMENT_TTL_SECONDS', label: 'Invitation lifetime', type: 'integer', min: 60, max: 86400, unit: 'seconds',
+      help: 'How long an enrolment code stays usable.' },
+    { key: 'CROSSBAR_SESSION_TTL_SECONDS', label: 'Session lifetime', type: 'integer', min: 60, max: 2592000, unit: 'seconds',
+      help: 'How long a device — or this console — stays signed in before proving itself again.' },
+    { key: 'CROSSBAR_CHALLENGE_TTL_SECONDS', label: 'Challenge lifetime', type: 'integer', min: 30, max: 900, unit: 'seconds',
+      help: 'How long a device has to answer a challenge. Shorter is safer and slower.' },
+    { key: 'ICE_STUN_URL', label: 'STUN server', type: 'url',
+      help: 'Where clients ask for their own address, which is how a direct connection is found.' },
+    { key: 'CROSSBAR_TURN_HOST', label: 'Relay host', type: 'text',
+      help: 'Empty means no relay. Set, media that cannot go direct is relayed through this host.' },
+    { key: 'CROSSBAR_TURN_PORT', label: 'Relay port', type: 'integer', min: 1, max: 65535 },
+    { key: 'CROSSBAR_TURN_MIN_PORT', label: 'Relay port range starts', type: 'integer', min: 1024, max: 65535 },
+    { key: 'CROSSBAR_TURN_MAX_PORT', label: 'Relay port range ends', type: 'integer', min: 1024, max: 65535 },
+    { key: 'CROSSBAR_TURN_TTL_SECONDS', label: 'Relay credential lifetime', type: 'integer', min: 60, max: 86400, unit: 'seconds' },
+    { key: 'MAX_MESSAGE_BYTES', label: 'Largest signal', type: 'integer', min: 4096, max: 1048576, unit: 'bytes',
+      help: 'The most one signalling message may be. Offers and answers are the large ones.' },
+    { key: 'PING_INTERVAL_MS', label: 'Keepalive interval', type: 'integer', min: 1000, max: 120000, unit: 'ms' },
+    { key: 'PING_TIMEOUT_MS', label: 'Connection timeout', type: 'integer', min: 1000, max: 120000, unit: 'ms',
+      help: 'How long a silent client is given before it is considered gone.' },
+    { key: 'RELAY_PER_SECOND', label: 'Messages a second', type: 'integer', min: 1, max: 1000,
+      help: 'The most one client may signal per second before it is throttled.' },
+    { key: 'MALFORMED_LIMIT', label: 'Malformed messages tolerated', type: 'integer', min: 1, max: 1000,
+      help: 'How many bad messages a client may send before it is disconnected.' },
+]);
+
+const knobFor = (key) => KNOBS.find((knob) => knob.key === String(key).toUpperCase()) || null;
+
+/** One value, as the file should hold it, or a refusal that says what is wrong. */
+function validateKnob(knob, value) {
+    if (knob.type === 'boolean') return /^(1|true|yes)$/i.test(String(value)) ? 'true' : 'false';
+    if (knob.type === 'integer') {
+        const number = Number.parseInt(String(value), 10);
+        if (!Number.isFinite(number)) throw new Error(`${knob.label} has to be a whole number.`);
+        if (number < knob.min || number > knob.max) {
+            throw new Error(`${knob.label} has to be between ${knob.min} and ${knob.max}.`);
+        }
+        return String(number);
+    }
+    const text = String(value ?? '').trim();
+    if (knob.type === 'url' && text && !/^(stun|turn|turns):\S+$/i.test(text)) {
+        throw new Error(`${knob.label} has to look like stun:host:port.`);
+    }
+    return text;
+}
+
+/** One key set to one value, in place, with every other line left exactly as it was. */
+function setEnvLine(content, key, value) {
+    const lines = content.split('\n');
+    const index = lines.findIndex((line) => line.trim().startsWith(`${key}=`));
+    const line = `${key}=${value}`;
+    if (index === -1) return [...lines, line].join('\n');
+    return [...lines.slice(0, index), line, ...lines.slice(index + 1)].join('\n');
+}
+
+/** The `.env` those changes produce, with every value checked before anything is written. */
+function applyKnobs(content, changes) {
+    let next = String(content);
+    for (const [key, value] of Object.entries(changes || {})) {
+        const knob = knobFor(key);
+        if (!knob) throw new Error(`${key} is not a setting this console may change.`);
+        next = setEnvLine(next, knob.key, validateKnob(knob, value));
+    }
+    return next;
+}
+
+/**
+ * What a `.env` makes of itself, read by a child process with nothing but that file in its
+ * environment — which is the question a restart asks. Answers `{ ok, message }`.
+ */
+function verifyEnvFile(dir, mode = null) {
+    const env = { PATH: process.env.PATH };
+    if (mode) env.CROSSBAR_NETWORK_MODE = mode;
+    const result = spawnSync(process.execPath, [
+        '-e', `require(${JSON.stringify(path.join(__dirname, 'config.js'))}).loadConfig()`,
+    ], { cwd: dir, env, encoding: 'utf8' });
+
+    const stderr = String(result.stderr || '').split('\n').map((line) => line.trim()).filter(Boolean);
+    const failure = stderr.find((line) => /Error: /.test(line)) || stderr[stderr.length - 1] || '';
+    return { ok: result.status === 0, message: failure.replace(/^\w*Error: /, '') };
+}
+
+module.exports = {
+    loadConfig,
+    loadDotEnv,
+    bool,
+    integer,
+    text,
+    applyMode,
+    modeBlock,
+    MODES,
+    KNOBS,
+    knobFor,
+    validateKnob,
+    setEnvLine,
+    applyKnobs,
+    verifyEnvFile,
+};
