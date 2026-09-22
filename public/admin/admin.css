@@ -87,6 +87,9 @@ input, select {
 .card .label { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); }
 .card .value { margin-top: 0.2rem; font-variant-numeric: tabular-nums; word-break: break-word; }
 
+.qr { margin: 0.7rem 0; }
+.qr svg { display: block; border-radius: 6px; }
+
 .grant { margin-top: 0.75rem; padding: 0.85rem; border: 1px solid var(--accent); border-radius: 8px; background: var(--wash); }
 .grant p { margin: 0 0 0.5rem; }
 .grant code {

@@ -45,6 +45,52 @@ function el(tag, props = {}, children = []) {
     return node;
 }
 
+/** SVG has its own namespace: `createElement('svg')` makes an element nothing draws. */
+function svg(tag, props = {}, children = []) {
+    const node = document.createElementNS('http://www.w3.org/2000/svg', tag);
+    for (const [key, value] of Object.entries(props)) {
+        if (value === undefined || value === null) continue;
+        node.setAttribute(key, String(value));
+    }
+    node.append(...children);
+    return node;
+}
+
+/**
+ * The invitation payload as a QR code.
+ *
+ * Scanning is the point of enrolment — a code copied by hand is a code mistyped — and the
+ * encoder is vendored beside this file rather than fetched, because the policy the server
+ * sends allows no other script. Drawn as modules in an SVG, with four modules of quiet
+ * zone and its own white field, so it reads the same off a dark page as a light one and
+ * survives a screenshot.
+ */
+function qrSvg(text, size = 180) {
+    const code = qrcode(0, 'M');
+    code.addData(text, 'Byte');
+    code.make();
+    const count = code.getModuleCount();
+    const modules = [];
+    for (let row = 0; row < count; row += 1) {
+        for (let column = 0; column < count; column += 1) {
+            if (code.isDark(row, column)) modules.push(`M${column} ${row}h1v1h-1z`);
+        }
+    }
+    const quiet = 4;
+    const side = count + quiet * 2;
+    return svg('svg', {
+        viewBox: `${-quiet} ${-quiet} ${side} ${side}`,
+        width: size,
+        height: size,
+        role: 'img',
+        'aria-label': 'Invitation QR code',
+        'shape-rendering': 'crispEdges',
+    }, [
+        svg('rect', { x: -quiet, y: -quiet, width: side, height: side, fill: '#ffffff' }),
+        svg('path', { d: modules.join(''), fill: '#000000' }),
+    ]);
+}
+
 const when = (value) => (value ? value.replace('T', ' ').replace(/\..*$/, ' UTC') : 'never');
 
 function section(title, ...children) {
@@ -152,8 +198,9 @@ const grants = [];
 function grantsView() {
     return grants.map((grant) => el('div', { class: 'grant' }, [
         el('p', { text: `${grant.for} — expires ${when(grant.expiresAt)}` }),
+        el('div', { class: 'qr' }, [qrSvg(JSON.stringify(grant.payload))]),
+        el('p', { text: 'Give this to the device. It can scan the code, or take the token:' }),
         el('code', { text: grant.token }),
-        el('p', { text: 'Give this to the device. It accepts the token, or the whole payload:' }),
         el('code', { text: JSON.stringify(grant.payload) }),
     ]));
 }
