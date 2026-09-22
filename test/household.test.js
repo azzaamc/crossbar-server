@@ -122,3 +122,38 @@ test('a login can be cleared, which is what leaving a tailnet looks like', () =>
     // And where a login is how people are found, taking somebody's away is refused.
     assert.throws(() => household.validate(cleared), /no login/);
 });
+
+test('reaching somebody is written in both directions, or it is not written', () => {
+    const next = household.withContact(three(), 'dad', 'mum');
+    const pairs = next.contacts.map((contact) => `${contact.ownerId}→${contact.contactId}`);
+
+    // A list where you appear to somebody who does not appear to you is a half-relationship
+    // nobody asked for, and it would take an operator checking both cells to find it.
+    assert.ok(pairs.includes('dad→mum'), `expected dad→mum in ${JSON.stringify(pairs)}`);
+    assert.ok(pairs.includes('mum→dad'), `expected mum→dad in ${JSON.stringify(pairs)}`);
+});
+
+test('taking a pair away takes it both ways, whichever way it is named', () => {
+    // Named in the order the pair was not written in, because removal is about the two
+    // people rather than about a direction somebody happened to type.
+    const severed = household.withoutContact(three(), 'dad', 'abdullah');
+    assert.deepEqual(severed.contacts, [], 'the only pair in the fixture mentioned both of them');
+});
+
+test('everybody connected is a complete graph, and replaces what was there', () => {
+    const next = household.withEveryoneConnected(three());
+    assert.equal(next.contacts.length, 6, 'three people, each reaching the other two');
+    assert.ok(!next.contacts.some((contact) => contact.ownerId === contact.contactId));
+});
+
+test('a contact has to name two people who are both here', () => {
+    assert.throws(
+        () => household.validate({ ...three(), contacts: [{ ownerId: 'abdullah', contactId: 'nobody' }] }),
+        /not in the household/,
+        'a row the database cannot hold should fail where it is written, not at the next start');
+    assert.throws(
+        () => household.validate({ ...three(), contacts: [{ ownerId: 'dad', contactId: 'dad' }] }),
+        /their own contact/);
+    assert.throws(() => household.withContact(three(), 'abdullah', 'nobody'), /nobody with the id/);
+    assert.throws(() => household.withContact(three(), 'dad', 'dad'), /cannot reach themselves/);
+});

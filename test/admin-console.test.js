@@ -7,6 +7,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const crypto = require('node:crypto');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
@@ -279,4 +280,103 @@ test('a login can be taken off somebody who leaves the tailnet', async (t) => {
     assert.equal(cleared.status, 200, JSON.stringify(await cleared.json().catch(() => ({}))));
     assert.equal(server.store.userByLogin('dad@dev'), null);
     assert.ok(server.store.userById('dad'), 'they keep their identity and their history');
+});
+
+/** A device key, as a client makes one: P-256, as the SPKI DER a server can read. */
+function deviceKey() {
+    const { publicKey } = crypto.generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
+    return { publicKey: publicKey.export({ type: 'spki', format: 'der' }).toString('base64') };
+}
+
+test('the console decides who can reach whom, and a call follows it', async (t) => {
+    // A deployment that recognises nobody by where they are connecting from. This is the
+    // case the household file is the only source of contacts; where a proxy names the
+    // caller, arriving makes people mutually visible and masks how thin this is.
+    const { server, base } = await startTestServer({
+        ...WITH_PASSWORD,
+        networkMode: 'public',
+        trustTailscaleHeaders: false,
+        allowDevIdentity: false,
+        requireDeviceAuth: true,
+    });
+    t.after(() => server.close());
+
+    const cookie = cookiePair((await signIn(base, PASSWORD)).cookie);
+    const asOperator = async (route, body) => {
+        const response = await fetch(`${base}${route}`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json', cookie },
+            body: JSON.stringify(body ?? {}),
+        });
+        return { status: response.status, data: await response.json().catch(() => ({})) };
+    };
+
+    /** Somebody arrives the way they really do: a device, from an invitation. */
+    async function arrive(userId) {
+        const invitation = auth.createInvitation({
+            store: server.store, config: server.config, now: new Date().toISOString(), userId,
+        });
+        const enrolled = await api(base, null, '/api/auth/enroll', {
+            method: 'POST',
+            body: {
+                token: invitation.token,
+                publicKey: deviceKey().publicKey,
+                algorithm: 'ES256',
+                deviceName: 'Test iPhone',
+                platform: 'ios',
+            },
+        });
+        assert.equal(enrolled.status, 200, JSON.stringify(enrolled.data));
+        return enrolled.data.session.token;
+    }
+
+    const abdullah = await arrive('abdullah');
+    await arrive('dad');
+    const sees = async (token) => (await api(base, null, '/api/bootstrap', {
+        headers: { authorization: `Bearer ${token}` },
+    })).data.contacts.map((contact) => contact.id).sort();
+
+    assert.deepEqual(await sees(abdullah), ['dad'], 'the fixture pairs them, and Dad has arrived');
+
+    // Taking the pair away is not hiding somebody: it stops the call.
+    assert.equal((await asOperator('/api/admin/contacts/remove', { ownerId: 'abdullah', contactId: 'dad' })).status, 200);
+    assert.deepEqual(await sees(abdullah), [], 'and the app reads as empty, which is the report this came from');
+
+    const refused = await api(base, null, '/api/calls', {
+        method: 'POST',
+        headers: { authorization: `Bearer ${abdullah}` },
+        body: { inviteeIds: ['dad'] },
+    });
+    assert.equal(refused.status, 403);
+    assert.equal(refused.data.error.code, 'CONTACT_NOT_ALLOWED');
+
+    // And back again, which is what ticking the box does.
+    assert.equal((await asOperator('/api/admin/contacts', { ownerId: 'abdullah', contactId: 'dad' })).status, 200);
+    assert.deepEqual(await sees(abdullah), ['dad']);
+});
+
+test('everybody can reach everybody, and somebody who has never signed in is still unseen', async (t) => {
+    const { server, base } = await startTestServer(WITH_PASSWORD);
+    t.after(() => server.close());
+    const { cookie } = await signIn(base, PASSWORD);
+    const asOperator = async (route, body) => {
+        const response = await fetch(`${base}${route}`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json', cookie: cookiePair(cookie) },
+            body: JSON.stringify(body ?? {}),
+        });
+        return { status: response.status, data: await response.json().catch(() => ({})) };
+    };
+
+    const opened = await asOperator('/api/admin/contacts/everyone');
+    assert.equal(opened.status, 200, JSON.stringify(opened.data));
+
+    // Three people, both directions each: the graph is complete before the arrival filter
+    // is applied, which is a different thing from everybody being visible.
+    assert.equal(opened.data.contacts.length, 6);
+
+    const listed = await fetch(`${base}/api/admin/people`, { headers: { cookie: cookiePair(cookie) } });
+    const page = await listed.json();
+    assert.ok(page.people.every((person) => !person.arrived), 'nobody has signed in on this server');
+    assert.deepEqual(Object.keys(page.contacts[0]).sort(), ['contactId', 'ownerId', 'sortOrder']);
 });

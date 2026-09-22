@@ -607,12 +607,18 @@ function createRequestHandler({ config, store, bus, push, lifecycle, log, client
             // visible rather than confusing.
             if (req.method === 'GET' && pathname === '/api/admin/people') {
                 const known = new Map(store.listUsers().map((user) => [user.id, user]));
+                const household = currentHousehold();
                 return sendJson(res, 200, {
                     // Whether a login is how somebody is found here, so the console can ask
                     // for one where it is identity and leave the field optional where it is
                     // only a record of who somebody is elsewhere.
                     requireLogins,
-                    people: currentHousehold().users.map((user) => ({
+                    // Who can reach whom, as the file says. The app's entire list of people
+                    // is this and nothing else, so a household that has everybody in it and
+                    // no pairs in it reads as an empty app — a state an operator has to be
+                    // able to see rather than deduce.
+                    contacts: household.contacts || [],
+                    people: household.users.map((user) => ({
                         id: user.id,
                         displayName: user.displayName,
                         login: user.tailscaleLogin || '',
@@ -621,6 +627,10 @@ function createRequestHandler({ config, store, bus, push, lifecycle, log, client
                         suspended: user.enabled === false,
                         devices: known.get(user.id)?.activeDevices ?? 0,
                         lastAuthenticated: known.get(user.id)?.lastAuthenticated ?? null,
+                        // Whether they have ever signed in. Until they have, nobody sees
+                        // them whatever the contacts say — which is the difference between
+                        // a household that is wired up and one that only looks broken.
+                        arrived: Boolean(known.get(user.id)?.firstSeen),
                     })),
                 });
             }
@@ -668,6 +678,55 @@ function createRequestHandler({ config, store, bus, push, lifecycle, log, client
                 for (const device of devices) store.revokeDevice(device.id, now);
                 log.info('household_person_removed', { personId: id, devices: devices.length, by: actor });
                 return sendJson(res, 200, { users: store.listUsers(), revokedDevices: devices.length });
+            }
+
+            // ── Who can reach whom ──────────────────────────────────────────────
+            //
+            // The app's list of people is the contacts and nothing else, and a call is
+            // refused unless every invitee is one — so this is what makes somebody
+            // reachable, as opposed to merely present in the household. Both directions are
+            // written, because that is what reaching somebody is: the file can hold a
+            // one-way pair and the server reads one, but a list where you appear to
+            // somebody who does not appear to you is not a control anybody asked for.
+            /** The two ids a contact change names, or null after answering with a refusal. */
+            async function contactPair(req, res) {
+                const body = await readJsonOrRefuse(req, res);
+                if (!body) return null;
+                return { ownerId: String(body.ownerId || ''), contactId: String(body.contactId || '') };
+            }
+
+            if (req.method === 'POST' && pathname === '/api/admin/contacts') {
+                const pair = await contactPair(req, res);
+                if (!pair) return;
+                try {
+                    saveHousehold(householdFile.withContact(currentHousehold(), pair.ownerId, pair.contactId));
+                } catch (error) {
+                    return sendError(res, 400, 'HOUSEHOLD_INVALID', error.message);
+                }
+                log.info('household_contact_added', { ...pair, by: actor });
+                return sendJson(res, 200, { contacts: currentHousehold().contacts || [] });
+            }
+
+            if (req.method === 'POST' && pathname === '/api/admin/contacts/remove') {
+                const pair = await contactPair(req, res);
+                if (!pair) return;
+                try {
+                    saveHousehold(householdFile.withoutContact(currentHousehold(), pair.ownerId, pair.contactId));
+                } catch (error) {
+                    return sendError(res, 400, 'HOUSEHOLD_INVALID', error.message);
+                }
+                log.info('household_contact_removed', { ...pair, by: actor });
+                return sendJson(res, 200, { contacts: currentHousehold().contacts || [] });
+            }
+
+            if (req.method === 'POST' && pathname === '/api/admin/contacts/everyone') {
+                try {
+                    saveHousehold(householdFile.withEveryoneConnected(currentHousehold()));
+                } catch (error) {
+                    return sendError(res, 400, 'HOUSEHOLD_INVALID', error.message);
+                }
+                log.info('household_contacts_opened', { people: currentHousehold().users.length, by: actor });
+                return sendJson(res, 200, { contacts: currentHousehold().contacts || [] });
             }
 
             // ── Settings, and the mode ──────────────────────────────────────────

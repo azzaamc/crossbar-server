@@ -54,6 +54,18 @@ function validate(household, { requireLogins = true } = {}) {
         }
     }
 
+    // A contact is a pair of people in this file, so both ends have to be here. A
+    // reference to somebody who is not is a row the database cannot hold, and it used to
+    // fail at the next start rather than at the edit that made it.
+    for (const contact of Array.isArray(household?.contacts) ? household.contacts : []) {
+        const owner = clean(contact?.ownerId).toLowerCase();
+        const other = clean(contact?.contactId).toLowerCase();
+        if (!ids.has(owner) || !ids.has(other)) {
+            throw new Error(`A contact names somebody who is not in the household: ${owner} → ${other}.`);
+        }
+        if (owner === other) throw new Error(`${owner} cannot be their own contact.`);
+    }
+
     // A household nobody can administer is a state not worth being able to reach.
     if (!users.some((user) => user.admin && user.enabled !== false)) {
         throw new Error('A household needs an administrator who is not suspended.');
@@ -152,6 +164,67 @@ function withoutPerson(household, id) {
     };
 }
 
+/**
+ * The file with two people able to reach each other, checked but not written.
+ *
+ * Reaching somebody is something two people do together: it is what puts each of them in
+ * the other's list, and what lets either of them ring the other. So this writes both
+ * directions. The file can hold a one-way pair and the server reads one, but nothing the
+ * console does makes one — a list where you appear to somebody who does not appear to you
+ * is not a control anybody asked for.
+ */
+function withContact(household, ownerId, contactId) {
+    const owner = clean(ownerId).toLowerCase();
+    const other = clean(contactId).toLowerCase();
+    for (const id of [owner, other]) {
+        if (!household.users.some((user) => user.id.toLowerCase() === id)) {
+            throw new Error(`There is nobody with the id ${id}.`);
+        }
+    }
+    if (owner === other) throw new Error(`${owner} cannot reach themselves.`);
+
+    const contacts = [...(household.contacts || [])];
+    const held = new Set(contacts.map((item) => `${clean(item.ownerId).toLowerCase()}→${clean(item.contactId).toLowerCase()}`));
+    const order = contacts.reduce((most, item) => Math.max(most, Number(item.sortOrder) || 0), 0);
+    const put = (from, to) => {
+        if (!held.has(`${from}→${to}`)) contacts.push({ ownerId: from, contactId: to, sortOrder: order + 1 });
+    };
+    put(owner, other);
+    put(other, owner);
+    return { ...household, contacts };
+}
+
+/** The file with two people no longer able to reach each other, in either direction. */
+function withoutContact(household, ownerId, contactId) {
+    const owner = clean(ownerId).toLowerCase();
+    const other = clean(contactId).toLowerCase();
+    const isThePair = (item) => {
+        const from = clean(item.ownerId).toLowerCase();
+        const to = clean(item.contactId).toLowerCase();
+        return (from === owner && to === other) || (from === other && to === owner);
+    };
+    return { ...household, contacts: (household.contacts || []).filter((item) => !isThePair(item)) };
+}
+
+/**
+ * The file with everybody able to reach everybody.
+ *
+ * The state a household with one group of people wants, and the one an operator would
+ * otherwise assemble a pair at a time. It replaces the contacts rather than adding to
+ * them, because that is what "everybody" means — an exclusion somebody asked for is not
+ * something this should quietly leave in place.
+ */
+function withEveryoneConnected(household) {
+    const ids = household.users.map((user) => user.id.toLowerCase());
+    const contacts = [];
+    for (const owner of ids) {
+        for (const other of ids) {
+            if (owner !== other) contacts.push({ ownerId: owner, contactId: other, sortOrder: 0 });
+        }
+    }
+    return { ...household, contacts };
+}
+
 /** A key set to undefined is a key that was never meant to be written. */
 function stripUndefined(user) {
     return Object.fromEntries(Object.entries(user).filter(([, value]) => value !== undefined));
@@ -164,6 +237,9 @@ module.exports = {
     withPerson,
     withChanges,
     withoutPerson,
+    withContact,
+    withoutContact,
+    withEveryoneConnected,
     backupPath: (filePath) => `${filePath}.previous`,
     path: (dir) => path.resolve(dir, 'family.json'),
 };

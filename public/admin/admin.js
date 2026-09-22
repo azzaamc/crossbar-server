@@ -146,7 +146,7 @@ function peopleView(people, refresh, requireLogins) {
     const rows = people.map((person) => el('tr', { class: person.suspended ? 'inactive' : '' }, [
         el('td', { text: person.displayName }),
         el('td', { text: person.admin ? 'administrator' : '—' }),
-        el('td', { text: person.suspended ? 'suspended' : 'in the household' }),
+        el('td', { text: person.suspended ? 'suspended' : person.arrived ? 'in the household' : 'has not signed in' }),
         el('td', { class: 'numeric', text: person.devices }),
         el('td', { text: person.login || '—' }),
         el('td', { text: when(person.lastAuthenticated) }),
@@ -241,6 +241,70 @@ function peopleView(people, refresh, requireLogins) {
         table(['Name', 'Role', 'State', 'Devices', 'Login', 'Last authenticated', ''], rows,
             { numeric: ['Devices'] }),
         addCard);
+}
+
+/**
+ * Who can reach whom.
+ *
+ * The app's entire list of people is this and nothing else, which is why a household with
+ * everybody in it can still read as "no one is here yet": being in the household is not
+ * the same as being reachable, and it is not the same as being able to ring anybody.
+ *
+ * A matrix rather than a list of pairs, because a tick always has its opposite — reaching
+ * somebody is something two people do together — and a grid is the only shape where that
+ * shows itself without being explained.
+ */
+function contactsView(people, contacts, refresh) {
+    if (people.length < 2) {
+        return section('Who can reach whom',
+            el('p', { class: 'muted', text: 'Reaching somebody takes two people. Add another one first.' }));
+    }
+
+    const reaches = new Set(contacts.map((item) => `${item.ownerId}→${item.contactId}`));
+
+    // Each row has to be a `tr`: the table helper appends what it is given, and an array
+    // of cells is appended as a string rather than as a row.
+    const rows = people.map((owner) => el('tr', {}, [
+        el('td', {}, [
+            el('div', { text: owner.displayName }),
+            owner.arrived ? null : el('div', { class: 'muted', text: 'has not signed in yet' }),
+        ]),
+        ...people.map((other) => {
+            if (other.id === owner.id) return el('td', { class: 'muted', text: '—' });
+            return el('td', {}, [el('input', {
+                type: 'checkbox',
+                checked: reaches.has(`${owner.id}→${other.id}`),
+                'aria-label': `${owner.displayName} can reach ${other.displayName}`,
+                onClick: async (event) => {
+                    const wanted = event.currentTarget.checked;
+                    await call(wanted ? '/api/admin/contacts' : '/api/admin/contacts/remove', {
+                        method: 'POST',
+                        body: JSON.stringify({ ownerId: owner.id, contactId: other.id }),
+                    });
+                    await refresh();
+                },
+            })]);
+        }),
+    ]));
+
+    const everyone = el('button', { type: 'button', class: 'primary', text: 'Everybody can reach everybody' });
+    everyone.addEventListener('click', async () => {
+        if (!confirm(`Let all ${people.length} people reach each other?\n\n`
+            + 'This replaces whatever is ticked now, including anybody you have left out.')) return;
+        await call('/api/admin/contacts/everyone', { method: 'POST', body: '{}' });
+        await refresh();
+    });
+
+    return section('Who can reach whom',
+        el('p', {
+            class: 'muted',
+            text: 'Ticking a box ticks its opposite: reaching somebody is something two people '
+                + 'do together, so a half-relationship cannot be made here by accident. Somebody '
+                + 'who has not signed in yet is shown to nobody until they do, whatever is '
+                + 'ticked — an invitation tells them how to arrive.',
+        }),
+        table(['', ...people.map((person) => person.displayName)], rows),
+        el('div', { class: 'row' }, [everyone]));
 }
 
 function devicesView(devices, refresh) {
@@ -755,6 +819,7 @@ async function refresh() {
             serverView(status),
             inviteView(people.people, refresh),
             peopleView(people.people, refresh, people.requireLogins),
+            contactsView(people.people, people.contacts || [], refresh),
             devicesView(devices.devices, refresh),
             enrollmentsView(enrollments.enrollments, refresh),
             usageView(usage, people.people),
