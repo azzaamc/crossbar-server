@@ -22,7 +22,6 @@ CREATE TABLE IF NOT EXISTS users (
   id TEXT PRIMARY KEY,
   tailscale_login TEXT NOT NULL UNIQUE COLLATE NOCASE,
   display_name TEXT NOT NULL,
-  relationship TEXT NOT NULL DEFAULT '',
   avatar TEXT NOT NULL DEFAULT '',
   enabled INTEGER NOT NULL DEFAULT 1,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -115,6 +114,14 @@ function addColumnIfMissing(db, table, column, definition) {
     return true;
 }
 
+/** The other direction: a column this server no longer has a use for. */
+function dropColumnIfPresent(db, table, column) {
+    const columns = db.prepare(`PRAGMA table_info(${table})`).all().map((row) => row.name);
+    if (!columns.includes(column)) return false;
+    db.exec(`ALTER TABLE ${table} DROP COLUMN ${column}`);
+    return true;
+}
+
 /**
  * Schema changes that have to land on a database which already exists.
  *
@@ -204,6 +211,17 @@ const MIGRATIONS = [
             `);
         },
     },
+    {
+        version: 3,
+        apply(db) {
+            // `relationship` labelled a person to the household — "Father", "Me" — and it
+            // turned out to carry nothing: no screen needed it, and a label a person cannot
+            // change about themselves is worse than no label at all. It is gone from the
+            // household file, the API and the app; this takes it off databases that already
+            // have it.
+            dropColumnIfPresent(db, 'users', 'relationship');
+        },
+    },
 ];
 
 class Store {
@@ -278,11 +296,10 @@ class Store {
             }
 
             const upsert = this.db.prepare(`
-                INSERT INTO users (id, tailscale_login, display_name, relationship, avatar, admin)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO users (id, tailscale_login, display_name, avatar, admin)
+                VALUES (?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET tailscale_login=excluded.tailscale_login,
                   display_name=CASE WHEN users.first_seen_at IS NULL THEN excluded.display_name ELSE users.display_name END,
-                  relationship=excluded.relationship,
                   avatar=CASE WHEN users.first_seen_at IS NULL THEN excluded.avatar ELSE users.avatar END,
                   admin=excluded.admin,
                   enabled=1
@@ -295,7 +312,6 @@ class Store {
                     user.id,
                     login,
                     cleanText(user.displayName, 80, 'display name'),
-                    cleanOptional(user.relationship, 80),
                     cleanOptional(user.avatar, 500),
                     user.admin ? 1 : 0,
                 );
@@ -322,7 +338,7 @@ class Store {
 
     userByLogin(login) {
         return this.db.prepare(`
-            SELECT id, display_name AS displayName, relationship, avatar, admin,
+            SELECT id, display_name AS displayName, avatar, admin,
               first_seen_at AS firstSeen, last_authenticated_at AS lastAuthenticated
             FROM users WHERE tailscale_login = ? COLLATE NOCASE AND enabled = 1
         `).get(login) || null;
@@ -330,7 +346,7 @@ class Store {
 
     userById(id) {
         return this.db.prepare(`
-            SELECT id, display_name AS displayName, relationship, avatar, admin,
+            SELECT id, display_name AS displayName, avatar, admin,
               first_seen_at AS firstSeen, last_authenticated_at AS lastAuthenticated
             FROM users WHERE id = ? AND enabled = 1
         `).get(id) || null;
@@ -339,7 +355,7 @@ class Store {
     /** Everyone the household file knows, for an operator. */
     listUsers() {
         return this.db.prepare(`
-            SELECT u.id, u.display_name AS displayName, u.relationship, u.tailscale_login AS login,
+            SELECT u.id, u.display_name AS displayName, u.tailscale_login AS login,
               u.admin, u.enabled, u.first_seen_at AS firstSeen, u.last_authenticated_at AS lastAuthenticated,
               (SELECT COUNT(*) FROM devices d WHERE d.user_id = u.id AND d.status = 'active') AS activeDevices
             FROM users u ORDER BY u.display_name
@@ -391,9 +407,9 @@ class Store {
                 const id = `ts_${crypto.createHash('sha256').update(login).digest('hex').slice(0, 24)}`;
                 this.db.prepare(`
                     INSERT INTO users
-                      (id, tailscale_login, display_name, relationship, avatar, enabled,
+                      (id, tailscale_login, display_name, avatar, enabled,
                        first_seen_at, last_authenticated_at, identity_source)
-                    VALUES (?, ?, ?, '', ?, 1, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, 1, ?, ?, ?)
                 `).run(id, login, displayName, avatar, now, now, identity.source || 'tailscale');
                 existing = { id };
             }
@@ -431,7 +447,7 @@ class Store {
 
     contactsFor(userId) {
         return this.db.prepare(`
-            SELECT u.id, u.display_name AS displayName, u.relationship, u.avatar,
+            SELECT u.id, u.display_name AS displayName, u.avatar,
               p.last_seen_at AS lastSeen
             FROM contacts c
             JOIN users u ON u.id = c.contact_user_id AND u.enabled = 1

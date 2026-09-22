@@ -13,8 +13,8 @@ const path = require('node:path');
 
 const { Store } = require('../src/db');
 
-const ABDULLAH = { id: 'abdullah', tailscaleLogin: 'one@dev', displayName: 'Abdullah', relationship: 'Me' };
-const DAD = { id: 'dad', tailscaleLogin: 'two@dev', displayName: 'Dad', relationship: 'Father' };
+const ABDULLAH = { id: 'abdullah', tailscaleLogin: 'one@dev', displayName: 'Abdullah' };
+const DAD = { id: 'dad', tailscaleLogin: 'two@dev', displayName: 'Dad' };
 
 function familyFile(dir, name, users) {
     const file = path.join(dir, name);

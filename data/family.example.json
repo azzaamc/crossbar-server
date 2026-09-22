@@ -4,21 +4,18 @@
       "id": "abdullah",
       "tailscaleLogin": "abdullah@dev",
       "displayName": "Abdullah",
-      "relationship": "Me",
       "avatar": ""
     },
     {
       "id": "dad",
       "tailscaleLogin": "dad@dev",
       "displayName": "Dad",
-      "relationship": "Father",
       "avatar": ""
     },
     {
       "id": "mum",
       "tailscaleLogin": "mum@dev",
       "displayName": "Mum",
-      "relationship": "Mother",
       "avatar": ""
     }
   ],

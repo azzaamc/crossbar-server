@@ -17,9 +17,9 @@ const DEV_USERS = ['abdullah@dev', 'dad@dev', 'mum@dev'];
 
 const FAMILY = {
     users: [
-        { id: 'abdullah', tailscaleLogin: 'abdullah@dev', displayName: 'Abdullah', relationship: 'Me', avatar: '', admin: true },
-        { id: 'dad', tailscaleLogin: 'dad@dev', displayName: 'Dad', relationship: 'Father', avatar: '' },
-        { id: 'mum', tailscaleLogin: 'mum@dev', displayName: 'Mum', relationship: 'Mother', avatar: '' },
+        { id: 'abdullah', tailscaleLogin: 'abdullah@dev', displayName: 'Abdullah', avatar: '', admin: true },
+        { id: 'dad', tailscaleLogin: 'dad@dev', displayName: 'Dad', avatar: '' },
+        { id: 'mum', tailscaleLogin: 'mum@dev', displayName: 'Mum', avatar: '' },
     ],
     contacts: [
         { ownerId: 'abdullah', contactId: 'dad', sortOrder: 1 },
