@@ -26,6 +26,7 @@ const USAGE = `Crossbar administration
   revoke-enrollment <id>                 Withdraw an invitation that has not been used
   rename-device <deviceId> <label>       Give a device a name a person recognises
   revoke-device <deviceId>               Take a device's key out of use
+  remove-device <deviceId>               Take a revoked device out of the records
   status                                 Configuration and counts
   mode                                   Both configurations, and which is in force
   mode private|public                    Switch this deployment to that one
@@ -221,6 +222,24 @@ async function main(argv) {
                     ? `Revoked ${deviceId} (${device.label || 'unlabelled'}). They keep their other devices.`
                     : `${deviceId} was already revoked.`);
                 return revoked ? 0 : 1;
+            }
+
+            case 'remove-device': {
+                const [deviceId] = positional;
+                if (!deviceId) { console.error('remove-device needs a device id.'); return 1; }
+                const device = store.deviceIdentity(deviceId);
+                if (!device) { console.error(`No device ${deviceId}.`); return 1; }
+                if (device.status === 'active') {
+                    console.error(`${deviceId} still works. Run "revoke-device ${deviceId}" first.`);
+                    return 1;
+                }
+                const removed = store.removeDevice(deviceId);
+                // What the person did in a call is recorded by user and is not touched:
+                // removing a phone is not removing the calls it was in.
+                console.log(removed
+                    ? `Removed ${deviceId} (${device.label || 'unlabelled'}) from the records.`
+                    : `No device ${deviceId}.`);
+                return removed ? 0 : 1;
             }
 
             case 'password': {

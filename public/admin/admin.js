@@ -277,16 +277,34 @@ function devicesView(devices, refresh) {
                         await call(`/api/admin/devices/${encodeURIComponent(device.id)}/revoke`, { method: 'POST' });
                         await refresh();
                     },
-                }) : null,
+                }) : el('button', {
+                    // Offered only once a device has been taken out of use. Revoking stops
+                    // the key working and keeps the record; this is the record going too,
+                    // and it cannot be undone, so the two are never the same click.
+                    type: 'button',
+                    class: 'danger',
+                    text: 'Remove',
+                    onClick: async () => {
+                        if (!confirm(`Remove ${device.label || device.id} from the records?\n\n`
+                            + 'Revoking it stopped it working. This takes the row away as well. '
+                            + 'The calls it was in are kept, because those are recorded by person.')) return;
+                        await call(`/api/admin/devices/${encodeURIComponent(device.id)}/remove`, { method: 'POST' });
+                        await refresh();
+                    },
+                }),
             ])]),
         ]);
         return row;
     });
     if (!rows.length) return section('Devices', el('p', { class: 'muted', text: 'No device has been enrolled yet.' }));
-    return section('Devices', table(
-        ['Device', 'Person', 'Platform', 'State', 'Key', 'Push', 'Last seen', ''],
-        rows,
-    ));
+    return section('Devices',
+        el('p', {
+            class: 'muted',
+            text: 'A revoked device keeps its row: the key stops working, and the record of the '
+                + 'phone that held it stays. Remove takes the row away as well, and appears only '
+                + 'once a device has been revoked.',
+        }),
+        table(['Device', 'Person', 'Platform', 'State', 'Key', 'Push', 'Last seen', ''], rows));
 }
 
 /**

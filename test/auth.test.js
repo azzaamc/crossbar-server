@@ -9,7 +9,7 @@ const crypto = require('node:crypto');
 const WebSocket = require('ws');
 
 const auth = require('../src/auth');
-const { startTestServer, api } = require('./helpers');
+const { startTestServer, api, createCall, accept } = require('./helpers');
 
 /**
  * The exact bytes a device signs.
@@ -613,4 +613,59 @@ test('an invitation a device makes for itself is short-lived whatever the server
     const life = Date.parse(made.data.enrollment.expiresAt) - Date.now();
     assert.ok(life > 0, 'it is not born expired');
     assert.ok(life <= 15 * 60 * 1000 + 5000, `expected about a quarter of an hour, got ${Math.round(life / 1000)}s`);
+});
+
+// ── Removing a device ───────────────────────────────────────────────────────────
+
+test('a device that still works is not removable, and a revoked one is', async (t) => {
+    const { server, base } = await startTestServer(AVAILABLE);
+    t.after(() => server.close());
+
+    const { device } = await enrolledDevice(base, 'dad');
+    const act = (what) => api(base, 'abdullah@dev', `/api/admin/devices/${device.id}/${what}`, { method: 'POST' });
+
+    // Removing is not a synonym for revoking. A phone that still works is refused, so
+    // taking a live one out of the records is two deliberate steps rather than one.
+    const early = await act('remove');
+    assert.equal(early.status, 409);
+    assert.equal(early.data.error.code, 'DEVICE_STILL_ACTIVE');
+    assert.ok(server.store.deviceIdentity(device.id), 'and it is still there');
+
+    assert.equal((await act('revoke')).status, 200);
+
+    const gone = await act('remove');
+    assert.equal(gone.status, 200, JSON.stringify(gone.data));
+    assert.deepEqual(gone.data, { removed: true });
+
+    // Out of the records, and out of the list an operator sees — which is the whole of
+    // what this exists for.
+    assert.equal(server.store.deviceIdentity(device.id), null);
+    assert.ok(!server.store.allDevices().some((item) => item.id === device.id));
+});
+
+test('removing a device takes its place in a call with it, and leaves the call alone', async (t) => {
+    const { server, base } = await startTestServer(AVAILABLE);
+    t.after(() => server.close());
+
+    const mine = await enrolledDevice(base, 'abdullah');
+    await enrolledDevice(base, 'dad');
+
+    // A real call, with this device in it.
+    const call = await createCall(base, 'abdullah@dev', ['dad'], { deviceId: mine.device.id });
+    await accept(base, 'dad@dev', call.call.id);
+    const before = await api(base, 'abdullah@dev', '/api/calls/history');
+    assert.ok(server.store.callById(call.call.id).devices.some((item) => item.deviceId === mine.device.id),
+        'the device is recorded as having been in the call');
+
+    await api(base, 'abdullah@dev', `/api/admin/devices/${mine.device.id}/revoke`, { method: 'POST' });
+    const removed = await api(base, 'abdullah@dev', `/api/admin/devices/${mine.device.id}/remove`, { method: 'POST' });
+    assert.equal(removed.status, 200, JSON.stringify(removed.data));
+
+    // Its row in the call goes with it, because that named a device which no longer
+    // exists. What the *person* did does not: that is recorded by user, so removing a
+    // phone is never a rewritten history.
+    assert.ok(server.store.callById(call.call.id), 'the call is still there');
+    assert.deepEqual(server.store.callById(call.call.id).devices, []);
+    const after = await api(base, 'abdullah@dev', '/api/calls/history');
+    assert.deepEqual(after.data.calls, before.data.calls);
 });

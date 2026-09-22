@@ -650,6 +650,30 @@ class Store {
     }
 
     /**
+     * A device taken out of the records entirely.
+     *
+     * Revoking is the ordinary end of a device: the key stops working and the row stays,
+     * because a phone that was replaced is a fact worth keeping. This is for the row that
+     * has stopped being that — a device enrolled by mistake, or one nobody will look for
+     * again. It refuses a device that still works, so taking a live phone out of the
+     * records is two deliberate steps rather than one.
+     *
+     * Its authenticators and challenges go with it, by cascade. So does its row in each
+     * call, which names a device that no longer exists — but not what the *person* did in
+     * those calls, which is recorded by user: removing a phone never rewrites a history.
+     */
+    removeDevice(deviceId) {
+        return this.transaction(() => {
+            const removed = this.db.prepare("DELETE FROM devices WHERE id = ? AND status <> 'active'")
+                .run(deviceId).changes === 1;
+            if (removed) {
+                this.db.prepare('DELETE FROM call_devices WHERE device_id = ?').run(deviceId);
+            }
+            return removed;
+        });
+    }
+
+    /**
      * Whether somebody may be signed in as.
      *
      * What leaving the household comes to on this side: the file stops naming them, and

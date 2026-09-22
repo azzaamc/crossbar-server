@@ -883,16 +883,32 @@ function createRequestHandler({ config, store, bus, push, lifecycle, log, client
                 });
             }
 
-            const deviceMatch = pathname.match(/^\/api\/admin\/devices\/([A-Za-z0-9_-]{8,64})\/(revoke|rename)$/);
+            const deviceMatch = pathname.match(/^\/api\/admin\/devices\/([A-Za-z0-9_-]{8,64})\/(revoke|rename|remove)$/);
             if (req.method === 'POST' && deviceMatch) {
                 const target = store.deviceIdentity(deviceMatch[1]);
                 if (!target) return sendError(res, 404, 'DEVICE_UNKNOWN', 'That device is not enrolled with this server.');
                 const now = new Date().toISOString();
+
+                // The one action here that cannot be undone, and the reason it is offered
+                // only for a device that has already been taken out of use: revoking stops a
+                // key working and keeps the record, and this is the record going too. A
+                // single click that did both would make the accident unrecoverable.
+                if (deviceMatch[2] === 'remove') {
+                    if (target.status === 'active') {
+                        return sendError(res, 409, 'DEVICE_STILL_ACTIVE',
+                            'That device still works. Take its key out of use first, then remove it.');
+                    }
+                    store.removeDevice(target.id);
+                    log.info('device_removed', { deviceId: target.id, userId: target.userId, by: actor });
+                    return sendJson(res, 200, { removed: true });
+                }
+
                 if (deviceMatch[2] === 'revoke') {
                     store.revokeDevice(target.id, now);
                     log.info('device_revoked', { deviceId: target.id, userId: target.userId, by: actor });
                     return sendJson(res, 200, { device: adminDevice(store.deviceIdentity(target.id)) });
                 }
+
                 const body = await readJsonOrRefuse(req, res);
                 if (!body) return;
                 store.renameDevice(target.id, body.label, now);
