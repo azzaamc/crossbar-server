@@ -46,7 +46,10 @@ function el(tag, props = {}, children = []) {
         else if (key === 'class') node.className = value;
         else node.setAttribute(key, value === true ? '' : String(value));
     }
-    node.append(...children);
+    // Nothing that is not an element or a string is appended: `append` turns a null child
+    // into the word "null", which is how a conditional cell with nothing in it — the
+    // actions on a spent invitation, say — used to read.
+    node.append(...children.filter((child) => child !== null && child !== undefined && child !== false));
     return node;
 }
 
@@ -57,7 +60,7 @@ function svg(tag, props = {}, children = []) {
         if (value === undefined || value === null) continue;
         node.setAttribute(key, String(value));
     }
-    node.append(...children);
+    node.append(...children.filter((child) => child !== null && child !== undefined && child !== false));
     return node;
 }
 
@@ -210,30 +213,21 @@ function grantsView() {
     ]));
 }
 
-function enrollmentsView(enrollments, people, refresh) {
-    const rows = enrollments.map((item) => el('tr', { class: item.state === 'open' ? '' : 'inactive' }, [
-        el('td', { text: item.id }),
-        el('td', { text: item.intendedUserId || '—' }),
-        el('td', { text: item.state }),
-        el('td', { text: when(item.expiresAt) }),
-        el('td', { text: item.createdBy || 'cli' }),
-        el('td', {}, [item.state === 'open' ? el('button', {
-            type: 'button',
-            class: 'danger',
-            text: 'Withdraw',
-            onClick: async () => {
-                await call(`/api/admin/enrollments/${encodeURIComponent(item.id)}/revoke`, { method: 'POST' });
-                await refresh();
-            },
-        }) : null]),
-    ]));
-
-    // An invitation always names the person it is for: an unbound code would let
-    // whoever held it choose whose identity to take.
+/**
+ * Inviting a device, which is the one thing an operator does most.
+ *
+ * Its own section, above the history and above the people, because it is the action this
+ * page exists for — and because the code it hands out is shown exactly once, so it has to
+ * be somewhere the eye already is.
+ */
+function inviteView(people, refresh) {
     const person = el('select', {}, people.map((user) => el('option', { value: user.id, text: user.displayName })));
     const ttl = el('input', { type: 'number', min: '60', step: '60', placeholder: 'seconds', size: '7' });
     const card = el('div', { class: 'grant' }, [
-        el('p', { text: 'Invite a device. The code is shown once and cannot be read back.' }),
+        el('p', {
+            text: 'An invitation ties one device to one person, and it carries the address of '
+                + 'this server, so the device does not have to be told it separately.',
+        }),
         el('div', { class: 'row' }, [
             person,
             ttl,
@@ -263,10 +257,34 @@ function enrollmentsView(enrollments, people, refresh) {
         ]),
     ]);
 
+    return section('Invite someone', card, ...grantsView());
+}
+
+function enrollmentsView(enrollments, refresh) {
+    const rows = enrollments.map((item) => el('tr', { class: item.state === 'open' ? '' : 'inactive' }, [
+        el('td', { text: item.id }),
+        el('td', { text: item.intendedUserId || '—' }),
+        el('td', { text: item.state }),
+        el('td', { text: when(item.expiresAt) }),
+        el('td', { text: item.createdBy || 'the command line' }),
+        el('td', {}, [item.state === 'open' ? el('button', {
+            type: 'button',
+            class: 'danger',
+            text: 'Withdraw',
+            onClick: async () => {
+                await call(`/api/admin/enrollments/${encodeURIComponent(item.id)}/revoke`, { method: 'POST' });
+                await refresh();
+            },
+        }) : null]),
+    ]));
+
     return section('Invitations',
-        table(['Id', 'For', 'State', 'Expires', 'Created by', ''], rows),
-        card,
-        ...grantsView());
+        el('p', {
+            class: 'muted',
+            text: 'Every invitation this server has issued. A code is shown once, when it is '
+                + 'created, and only its hash is kept — it cannot be read back from here.',
+        }),
+        table(['Id', 'For', 'State', 'Expires', 'Created by', ''], rows));
 }
 
 /**
@@ -417,9 +435,10 @@ async function refresh() {
         ]);
         main.replaceChildren(
             serverView(status),
+            inviteView(people.users, refresh),
             peopleView(people.users),
             devicesView(devices.devices, refresh),
-            enrollmentsView(enrollments.enrollments, people.users, refresh),
+            enrollmentsView(enrollments.enrollments, refresh),
             browserFoot(),
         );
     } catch (error) {
