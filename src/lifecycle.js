@@ -37,7 +37,7 @@ function createLimiter() {
     };
 }
 
-function createLifecycle({ config, store, bus, push, log }) {
+function createLifecycle({ config, store, bus, push, apns, log }) {
     const limiter = createLimiter();
     const now = () => new Date().toISOString();
 
@@ -85,13 +85,37 @@ function createLifecycle({ config, store, bus, push, log }) {
         return unique.every((id) => ID_PATTERN.test(id)) ? unique : null;
     }
 
+    /**
+     * Rings everybody who is not already holding a connection.
+     *
+     * Two transports, because a browser and a phone are woken by different things: Web Push
+     * reaches a page, and nothing but a VoIP push reaches a suspended app. Each reports the
+     * addresses it could not reach, and each of those is cleared where its own rows live —
+     * a refusal from the transport is the only evidence that a token has died.
+     */
     async function pushIncoming(call, inviteeIds) {
-        const subscriptions = store.pushSubscriptionsFor(inviteeIds);
         const caller = store.userById(call.callerId);
-        const stale = await push.incoming(subscriptions, call, caller?.displayName || 'A family member');
-        for (const endpoint of stale) store.deletePushEndpoint(endpoint);
-        if (subscriptions.length) {
-            log.info('push_dispatched', { callId: call.id, devices: subscriptions.length, stale: stale.length });
+        // The name is drawn on a lock screen before that phone has spoken to this server at
+        // all, so it has to travel in the push. "Someone" is what is left when the caller
+        // has no name — deliberately not a relationship, which the server is in no position
+        // to assert about two people.
+        const callerName = caller?.displayName || 'Someone';
+
+        const subscriptions = store.pushSubscriptionsFor(inviteeIds);
+        const staleEndpoints = await push.incoming(subscriptions, call, callerName);
+        for (const endpoint of staleEndpoints) store.deletePushEndpoint(endpoint);
+
+        const devices = store.voipTokensFor(inviteeIds);
+        const deadTokens = await apns.incoming(devices, call, callerName);
+        for (const device of deadTokens) store.clearVoipToken(device.deviceId);
+
+        if (subscriptions.length || devices.length) {
+            log.info('push_dispatched', {
+                callId: call.id,
+                subscriptions: subscriptions.length,
+                phones: devices.length,
+                dropped: staleEndpoints.length + deadTokens.length,
+            });
         }
     }
 

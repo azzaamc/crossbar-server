@@ -23,7 +23,7 @@ function createPushNotifier({ config, log }) {
         const payload = JSON.stringify({
             type: 'incoming-call',
             callId: call.id,
-            title: 'Incoming Family Call',
+            title: 'Incoming call',
             body: `${callerName} is calling`,
         });
         const stale = [];

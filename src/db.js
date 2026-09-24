@@ -257,6 +257,18 @@ const MIGRATIONS = [
             `);
         },
     },
+    {
+        version: 5,
+        apply(db) {
+            // A phone has two tokens, not one: the alert token a notification arrives on,
+            // and the VoIP token a ringing call arrives on. They are issued to different
+            // parts of the system, change at different times, and are each valid only
+            // against the environment that issued them — so the second needs somewhere of
+            // its own rather than sharing the first one's column.
+            addColumnIfMissing(db, 'devices', 'voip_token', 'TEXT');
+            addColumnIfMissing(db, 'devices', 'voip_environment', 'TEXT');
+        },
+    },
 ];
 
 class Store {
@@ -588,10 +600,53 @@ class Store {
         this.db.prepare('UPDATE devices SET last_seen_at = ? WHERE id = ?').run(now, deviceId);
     }
 
-    savePushToken({ deviceId, token, environment, now }) {
+    /**
+     * Where a device can be reached when it is not connected.
+     *
+     * Two tokens live on a device because they are two different things: an alert token is
+     * for anything that is merely worth telling somebody, and a VoIP token is for a call
+     * that has to wake the phone. `kind` chooses which one is being written, and the
+     * environment travels with the token because a token is only valid at the host that
+     * issued it — a phone in a debug build is not reachable at the production one.
+     */
+    savePushToken({ deviceId, token, environment, kind = 'alert', now }) {
+        const value = cleanOptional(token, 400);
+        const where = cleanOptional(environment, 20) || 'production';
+        if (kind === 'voip') {
+            this.db.prepare(`
+                UPDATE devices SET voip_token = ?, voip_environment = ?, last_seen_at = ? WHERE id = ?
+            `).run(value, where, now, deviceId);
+            return;
+        }
         this.db.prepare(`
             UPDATE devices SET push_token = ?, push_environment = ?, last_seen_at = ? WHERE id = ?
-        `).run(cleanOptional(token, 400), cleanOptional(environment, 20) || 'production', now, deviceId);
+        `).run(value, where, now, deviceId);
+    }
+
+    /**
+     * Every live device of these people, with the token a call is rung at.
+     *
+     * A revoked device is not rung: its row is kept because a phone that was replaced is a
+     * fact worth keeping, but waking it to a call would be a call it cannot answer.
+     */
+    voipTokensFor(userIds) {
+        const ids = [...new Set(userIds)].filter(Boolean);
+        if (!ids.length) return [];
+        const places = ids.map(() => '?').join(',');
+        return this.db.prepare(`
+            SELECT id AS deviceId, user_id AS userId, voip_token AS token,
+              COALESCE(NULLIF(voip_environment, ''), 'production') AS environment
+            FROM devices
+            WHERE user_id IN (${places}) AND status = 'active'
+              AND voip_token IS NOT NULL AND voip_token <> ''
+        `).all(...ids);
+    }
+
+    /** A token Apple has said is dead, which is the only thing that can prove one is. */
+    clearVoipToken(deviceId) {
+        return this.db.prepare(`
+            UPDATE devices SET voip_token = NULL, voip_environment = NULL WHERE id = ?
+        `).run(deviceId).changes === 1;
     }
 
     devicesFor(userId) {
@@ -693,7 +748,8 @@ class Store {
         return this.db.prepare(`
             SELECT d.id, d.user_id AS userId, u.display_name AS userName, d.label, d.platform,
               d.status, d.key_algorithm AS keyAlgorithm, (d.public_key IS NOT NULL) AS hasKey,
-              (d.push_token IS NOT NULL) AS hasPushToken, d.created_at AS createdAt,
+              (d.push_token IS NOT NULL) AS hasPushToken, (d.voip_token IS NOT NULL) AS hasVoipToken,
+              d.created_at AS createdAt,
               d.last_seen_at AS lastSeenAt, d.revoked_at AS revokedAt
             FROM devices d JOIN users u ON u.id = d.user_id ${where}
             ORDER BY u.display_name, d.last_seen_at DESC

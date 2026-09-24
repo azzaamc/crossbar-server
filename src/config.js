@@ -244,6 +244,17 @@ function loadConfig() {
         vapidPrivateKey: text('VAPID_PRIVATE_KEY', ''),
         vapidSubject: text('VAPID_SUBJECT', ''),
 
+        // APNs, for ringing a phone that is asleep. The key is the `.p8` from the developer
+        // account, named by file rather than pasted into an environment: it is a secret with
+        // newlines in it, and a deployment already has somewhere to keep one.
+        apnsKeyId: text('CROSSBAR_APNS_KEY_ID', ''),
+        apnsTeamId: text('CROSSBAR_APNS_TEAM_ID', ''),
+        apnsKeyPath: text('CROSSBAR_APNS_KEY_PATH', ''),
+        apnsKey: text('CROSSBAR_APNS_KEY', ''),
+        // The app's bundle id. The topic a call is pushed on is this with `.voip` on the
+        // end, which is the only topic a PushKit registry may be sent.
+        apnsTopic: text('CROSSBAR_APNS_TOPIC', ''),
+
         nodeEnv: text('NODE_ENV', 'development'),
     });
 }

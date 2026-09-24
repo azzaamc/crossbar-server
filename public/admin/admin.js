@@ -315,7 +315,13 @@ function devicesView(devices, refresh) {
             el('td', { text: device.platform || '—' }),
             el('td', { text: device.status }),
             el('td', { text: device.hasKey ? 'yes' : 'no' }),
-            el('td', { text: device.hasPushToken ? 'yes' : 'no' }),
+            // Whether a phone can be rung while it is asleep is a different fact from
+            // whether it can be told anything, and it is the first thing to check when a
+            // call does not arrive.
+            el('td', {
+                text: [device.hasVoipToken ? 'ring' : null, device.hasPushToken ? 'alerts' : null]
+                    .filter(Boolean).join(' + ') || '—',
+            }),
             el('td', { text: when(device.lastSeenAt) }),
             el('td', {}, [el('div', { class: 'actions' }, [
                 el('button', {

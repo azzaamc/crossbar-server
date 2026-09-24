@@ -14,6 +14,7 @@ const { createLogger } = require('./log');
 const { Store } = require('./db');
 const { createEventBus } = require('./events');
 const { createPushNotifier } = require('./push');
+const { createApnsNotifier } = require('./apns');
 const { createLifecycle } = require('./lifecycle');
 const { createRequestHandler } = require('./api');
 const { createSignalServer } = require('./signal');
@@ -28,10 +29,13 @@ function createCrossbarServer({ config = loadConfig(), log } = {}) {
     });
     const bus = createEventBus({ store, log: logger });
     const push = createPushNotifier({ config, log: logger });
-    const lifecycle = createLifecycle({ config, store, bus, push, log: logger });
+    // Two transports, because a browser and a phone are woken by different things and fail
+    // in different ways: Web Push rings a page, APNs rings a phone that is asleep.
+    const apns = createApnsNotifier({ config, log: logger });
+    const lifecycle = createLifecycle({ config, store, bus, push, apns, log: logger });
 
     const clientRoot = path.join(__dirname, '..', 'public');
-    const handler = createRequestHandler({ config, store, bus, push, lifecycle, log: logger, clientRoot });
+    const handler = createRequestHandler({ config, store, bus, push, apns, lifecycle, log: logger, clientRoot });
     const httpServer = http.createServer(handler);
 
     // Upgraded sockets are not covered by `closeAllConnections`, and `close()` waits
@@ -128,6 +132,9 @@ function createCrossbarServer({ config = loadConfig(), log } = {}) {
 
         signal.close();
         bus.close();
+        // The APNs connections are HTTP/2 sessions, and an open one is a handle the process
+        // will not let go of by itself.
+        apns.close();
         return new Promise((resolve) => {
             httpServer.close(() => {
                 store.close();
@@ -145,6 +152,7 @@ function createCrossbarServer({ config = loadConfig(), log } = {}) {
         store,
         bus,
         push,
+        apns,
         lifecycle,
         signal,
         httpServer,

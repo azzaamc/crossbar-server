@@ -74,7 +74,7 @@ const AUTH_MESSAGE = {
     RATE_LIMITED: 'Too many attempts. Try again shortly.',
 };
 
-function createRequestHandler({ config, store, bus, push, lifecycle, log, clientRoot }) {
+function createRequestHandler({ config, store, bus, push, apns, lifecycle, log, clientRoot }) {
     const websocketOrigin = (() => {
         const url = new URL(config.publicOrigin);
         url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -575,6 +575,9 @@ function createRequestHandler({ config, store, bus, push, lifecycle, log, client
                     algorithm: device.keyAlgorithm || null,
                     hasKey: Boolean(device.hasKey ?? device.publicKey),
                     hasPushToken: Boolean(device.hasPushToken),
+                    // Whether this phone can be rung while it is asleep, which is a
+                    // different fact from whether it can be sent anything at all.
+                    hasVoipToken: Boolean(device.hasVoipToken),
                     createdAt: device.createdAt,
                     lastSeenAt: device.lastSeenAt,
                     revokedAt: device.revokedAt || null,
@@ -884,6 +887,11 @@ function createRequestHandler({ config, store, bus, push, lifecycle, log, client
                     origin: config.publicOrigin,
                     requireDeviceAuth: config.requireDeviceAuth,
                     deviceAuthEnabled: Boolean(config.sessionSecret),
+                    // Whether a phone can be rung while it is asleep. Without this the app
+                    // still works with the screen on and a locked phone simply never rings,
+                    // which is the kind of fault that reads as the app's rather than the
+                    // deployment's.
+                    apns: { enabled: Boolean(apns?.enabled), topic: apns?.topic || '' },
                     turn: config.turn?.host
                         ? {
                             host: config.turn.host,
@@ -1032,7 +1040,14 @@ function createRequestHandler({ config, store, bus, push, lifecycle, log, client
             store.savePushToken({
                 deviceId: id,
                 token: String(body.token || ''),
-                environment: String(body.environment || 'production'),
+                // A token is only valid at the host that issued it, so this selects where a
+                // push is sent and is not free text. Anything else would be a token that
+                // silently never arrives.
+                environment: body.environment === 'sandbox' ? 'sandbox' : 'production',
+                // Two kinds, because a phone holds two tokens: the alert token a notification
+                // goes to, and the VoIP token a ringing call goes to. Omitted means the
+                // alert one, which is what a client written before this existed sends.
+                kind: body.kind === 'voip' ? 'voip' : 'alert',
                 now: new Date().toISOString(),
             });
             return sendJson(res, 200, { saved: true });
