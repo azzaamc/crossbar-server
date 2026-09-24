@@ -107,8 +107,11 @@ test('the request it builds is the one APNs documents', async () => {
     assert.match(request.headers.authorization, /^bearer \S+\.\S+\.\S+$/);
 
     // The payload carries the whole call, because the phone has to draw it before it is
-    // allowed to say anything to this server at all.
+    // allowed to say anything to this server at all — and it carries `aps`, because a push
+    // without one is a push APNs may decline to deliver, silently, on this side of the
+    // world. The `aps` itself has nothing to show: CallKit draws the call.
     assert.deepEqual(JSON.parse(request.body), {
+        aps: { 'content-available': 1 },
         callId: call.id,
         kind: 'video',
         caller: 'Faisal',

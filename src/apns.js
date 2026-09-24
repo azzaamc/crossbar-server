@@ -183,15 +183,20 @@ function createApnsNotifier({ config, log, transport = httpTransport() }) {
     /**
      * Rings every device in `devices`, and answers with the ones whose token is dead.
      *
-     * Only a ringing call uses this, which is why the payload is shaped for CallKit rather
-     * than for a notification: there is no `aps` dictionary here, because a VoIP push is
-     * not shown to anybody — the system draws the call out of what the app reports.
+     * Only a ringing call uses this. The payload is shaped for CallKit rather than for a
+     * notification, because a VoIP push is not shown to anybody: the call on the screen is
+     * drawn by the app, out of what travels here.
      */
     async function incoming(devices, call, callerName) {
         if (!enabled || !devices.length) return [];
 
         const expiresAt = Date.parse(call.createdAt) + config.callRingSeconds * 1000;
         const body = JSON.stringify({
+            // Required for delivery, and carrying nothing to show. A VoIP push is not a
+            // notification — it is handed to the app and drawn by CallKit out of the keys
+            // below — so this is the shape that asks for no user-visible alert. An `alert`
+            // here would be a second thing claiming the same attention as the ring.
+            aps: { 'content-available': 1 },
             callId: call.id,
             kind: call.kind === 'audio' ? 'audio' : 'video',
             caller: callerName,
