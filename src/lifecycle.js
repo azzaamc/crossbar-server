@@ -119,6 +119,49 @@ function createLifecycle({ config, store, bus, push, apns, log }) {
         }
     }
 
+    /**
+     * The people a call was placed to who never answered it.
+     *
+     * `invited` is somebody still being rung and `missed` is somebody it has already rung
+     * out for — the sweep marks them before anybody gets to look — and both are the same
+     * thing: rung, and never spoken to. Nobody else is.
+     */
+    function unanswered(call) {
+        return (call?.participants || [])
+            .filter((participant) => participant.status === 'invited' || participant.status === 'missed')
+            .map((participant) => participant.userId);
+    }
+
+    /**
+     * Tells the people who were rung and did not answer.
+     *
+     * A ring is a VoIP push because nothing else reaches a suspended app. A missed call is
+     * the other way round: nobody is waiting for it, the app may never be opened, and what
+     * is wanted is a line on a lock screen — so it goes through the notification system,
+     * which is a different token and a different topic.
+     *
+     * Only to somebody who was not holding a connection while it rang. A person whose app
+     * was open was told by the call itself, and telling them again in writing is how an app
+     * teaches somebody to turn its notifications off.
+     */
+    async function pushMissed(call, inviteeIds) {
+        const absent = inviteeIds.filter((id) => !bus.isOnline(id));
+        if (!absent.length) return;
+
+        const caller = store.userById(call.callerId);
+        const devices = store.alertTokensFor(absent);
+        const dead = await apns.alert(devices, {
+            callId: call.id,
+            title: `Missed call from ${caller?.displayName || 'Someone'}`,
+            body: call.kind === 'audio' ? 'Audio call' : 'Video call',
+        });
+        for (const device of dead) store.clearAlertToken(device.deviceId);
+
+        if (devices.length) {
+            log.info('push_missed', { callId: call.id, phones: devices.length, dropped: dead.length });
+        }
+    }
+
     function createCall({ user, inviteeIds, deviceId, kind = 'video' }) {
         if (!limiter.take(`${user.id}:create`, 6, 60000)) return { ok: false, reason: 'RATE_LIMITED' };
         const ids = validIds(inviteeIds);
@@ -247,10 +290,21 @@ function createLifecycle({ config, store, bus, push, apns, log }) {
     }
 
     function end({ user, callId }) {
+        // Read before it ends: whether anybody ever picked up is the difference between a
+        // call that finished and one that was never answered, and afterwards there is
+        // nothing left to ask.
+        const before = store.callById(callId);
         const result = store.endCall(callId, user.id, now());
         if (!result.ok) return result;
         emitToParticipants(result.call);
         bus.broadcast('ongoing-call', publicCall(result.call));
+
+        // Hung up while it was still ringing: these people were rung and never got to speak,
+        // which is the whole of what a missed call is.
+        if (before?.status === 'ringing') {
+            void pushMissed(before, unanswered(before))
+                .catch((error) => log.warn('push_failed', { message: String(error.message).slice(0, 120) }));
+        }
         log.info('call_ended', { callId, userId: user.id, status: result.call.status });
         return result;
     }
@@ -277,7 +331,12 @@ function createLifecycle({ config, store, bus, push, apns, log }) {
         const expired = store.expireCalls(cutoff, now());
         for (const callId of expired) {
             const call = store.callById(callId);
-            if (call) emitToParticipants(call);
+            if (call) {
+                emitToParticipants(call);
+                // Read after the sweep, which has just marked the unanswered as missed.
+                void pushMissed(call, unanswered(call))
+                    .catch((error) => log.warn('push_failed', { message: String(error.message).slice(0, 120) }));
+            }
             log.info('call_missed', { callId });
         }
         return expired;

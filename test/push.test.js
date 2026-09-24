@@ -12,6 +12,7 @@ const assert = require('node:assert/strict');
 const crypto = require('node:crypto');
 
 const { createApnsNotifier, providerToken } = require('../src/apns');
+const { createLifecycle } = require('../src/lifecycle');
 const { startTestServer, api } = require('./helpers');
 
 const quiet = { warn() {}, info() {}, error() {} };
@@ -162,27 +163,59 @@ test('an expired provider token is minted again, and another refusal is not retr
     assert.equal(attempts.length, 1, 'anything else is a refusal, not a reason to try twice');
 });
 
-test('a device holds two tokens, and a revoked or dead one is not rung', async (t) => {
+test('a missed call is a notification, on the other topic and the other token', async () => {
+    const { sent, transport } = recorder();
+    const apns = createApnsNotifier({ config: configured(), log: quiet, transport });
+
+    const dead = await apns.alert(
+        [{ deviceId: 'dev_a', token: 'aabbccdd', environment: 'production' }],
+        { callId: call.id, title: 'Missed call from Faisal', body: 'Video call' },
+    );
+    assert.deepEqual(dead, []);
+
+    const [request] = sent;
+    // The bare bundle id, not `.voip`: the topic is what decides which part of the app iOS
+    // wakes, and a missed call must not arrive at the PushKit registry as an incoming one.
+    assert.equal(request.headers['apns-topic'], 'com.example.Crossbar');
+    assert.equal(request.headers['apns-push-type'], 'alert');
+    assert.equal(request.headers['apns-collapse-id'], `missed-${call.id}`,
+        'so a second push about the same call replaces the first rather than stacking');
+
+    const payload = JSON.parse(request.body);
+    assert.deepEqual(payload.aps.alert, { title: 'Missed call from Faisal', body: 'Video call' });
+    assert.ok(payload.aps.sound, 'a missed call is worth making a noise about');
+    assert.equal(payload.callId, call.id);
+});
+
+test('a device holds two tokens, and neither is the other', async (t) => {
     const { server, base } = await startTestServer();
     t.after(() => server.close());
     const now = new Date().toISOString();
     const enrol = (deviceId) => server.store.registerDevice({
         userId: 'dad', deviceId, label: 'Dad', platform: 'ios', now,
     });
+    const save = (deviceId, kind, token, environment = 'production') => api(base, 'dad@dev', '/api/devices/push-token', {
+        method: 'POST',
+        body: { deviceId, token, environment, kind },
+    });
 
     enrol('dev_ringme00001');
-    const saved = await api(base, 'dad@dev', '/api/devices/push-token', {
-        method: 'POST',
-        body: { deviceId: 'dev_ringme00001', token: 'voiptoken', environment: 'sandbox', kind: 'voip' },
-    });
-    assert.equal(saved.status, 200, JSON.stringify(saved.data));
+    assert.equal((await save('dev_ringme00001', 'voip', 'the-voip-one', 'sandbox')).status, 200);
+    assert.equal((await save('dev_ringme00001', 'alert', 'the-alert-one')).status, 200);
 
     // Two slots, not one: a VoIP token and an alert token are issued to different parts of
-    // the system and are valid against different hosts.
+    // the system, are valid against different hosts, and are not interchangeable — a phone
+    // that can be told something is not thereby a phone that can be woken for a call.
     const device = server.store.devicesFor('dad').find((item) => item.id === 'dev_ringme00001');
-    assert.equal(device.pushToken, null, 'writing the VoIP token leaves the alert slot alone');
+    assert.equal(device.pushToken, 'the-alert-one');
     assert.deepEqual(server.store.voipTokensFor(['dad']).map((row) => [row.token, row.environment]),
-        [['voiptoken', 'sandbox']]);
+        [['the-voip-one', 'sandbox']]);
+    assert.deepEqual(server.store.alertTokensFor(['dad']).map((row) => row.token), ['the-alert-one']);
+
+    // And they die independently: clearing one leaves the other where it was.
+    assert.equal(server.store.clearAlertToken('dev_ringme00001'), true);
+    assert.deepEqual(server.store.alertTokensFor(['dad']), []);
+    assert.deepEqual(server.store.voipTokensFor(['dad']).map((row) => row.token), ['the-voip-one']);
 
     // Revoking is what stops a phone being woken, and the row stays.
     server.store.revokeDevice('dev_ringme00001', now);
@@ -191,10 +224,7 @@ test('a device holds two tokens, and a revoked or dead one is not rung', async (
 
     // And a token Apple has refused is cleared, rather than being tried for ever.
     enrol('dev_ringme00002');
-    await api(base, 'dad@dev', '/api/devices/push-token', {
-        method: 'POST',
-        body: { deviceId: 'dev_ringme00002', token: 'stale', environment: 'production', kind: 'voip' },
-    });
+    await save('dev_ringme00002', 'voip', 'stale', 'production');
     assert.equal(server.store.clearVoipToken('dev_ringme00002'), true);
     assert.deepEqual(server.store.voipTokensFor(['dad']), []);
 });
@@ -217,4 +247,105 @@ test('the console can see whether a device can be rung asleep', async (t) => {
     const phone = listed.data.devices.find((item) => item.id === 'dev_quietphone1');
     assert.equal(phone.hasVoipToken, true);
     assert.equal(phone.hasPushToken, false);
+});
+
+/**
+ * A lifecycle over the running fixture's own store, with a notifier that records what it was
+ * asked to send instead of sending it. The rules about *who* is told are the substance of a
+ * missed call, and they are the part a real push cannot be asked about in a test.
+ */
+function watching(server) {
+    const alerts = [];
+    const lifecycle = createLifecycle({
+        config: server.config,
+        store: server.store,
+        bus: server.bus,
+        push: { incoming: async () => [] },
+        apns: {
+            enabled: true,
+            incoming: async () => [],
+            alert: async (devices, message) => {
+                alerts.push({ devices, message });
+                return [];
+            },
+        },
+        log: quiet,
+    });
+    return { alerts, lifecycle };
+}
+
+/** A person with a phone that can be told things. */
+function reachable(server, userId, deviceId, now) {
+    server.store.registerDevice({ userId, deviceId, label: userId, platform: 'ios', now });
+    server.store.savePushToken({ deviceId, token: `alert-for-${userId}`, environment: 'production', kind: 'alert', now });
+    return deviceId;
+}
+
+test('a call nobody answered tells the people who were out, and not the one who was there', async (t) => {
+    const { server } = await startTestServer();
+    t.after(() => server.close());
+    const { alerts, lifecycle } = watching(server);
+    const now = new Date().toISOString();
+
+    reachable(server, 'dad', 'dev_dadphone0001', now);
+    reachable(server, 'mum', 'dev_mumphone0001', now);
+
+    const call = server.store.createCall({
+        id: crypto.randomUUID(),
+        roomId: crypto.randomUUID(),
+        callerId: 'abdullah',
+        deviceId: null,
+        inviteeIds: ['dad', 'mum'],
+        kind: 'video',
+        now,
+    });
+
+    // Mum has the app open, so the call itself told her. Telling her again in writing is how
+    // an app teaches somebody to turn its notifications off.
+    server.bus.add('mum', { write() {} });
+
+    lifecycle.end({ user: { id: 'abdullah' }, callId: call.id });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    assert.equal(alerts.length, 1, 'one alert, for the one person who was not there');
+    assert.deepEqual(alerts[0].devices.map((device) => device.deviceId), ['dev_dadphone0001']);
+    assert.match(alerts[0].message.title, /^Missed call from /);
+});
+
+test('a ring that times out tells everybody who never answered, and nobody who did', async (t) => {
+    const { server } = await startTestServer();
+    t.after(() => server.close());
+    const { alerts, lifecycle } = watching(server);
+    // Older than the fixture's ringing time, so the sweep below has something to expire.
+    const long = new Date(Date.now() - 5 * 60 * 1000).toISOString();
+
+    reachable(server, 'dad', 'dev_dadphone0002', long);
+    reachable(server, 'mum', 'dev_mumphone0002', long);
+
+    const call = server.store.createCall({
+        id: crypto.randomUUID(),
+        roomId: crypto.randomUUID(),
+        callerId: 'abdullah',
+        deviceId: null,
+        inviteeIds: ['dad', 'mum'],
+        kind: 'audio',
+        now: long,
+    });
+    // Dad saw it and said no, so he is not somebody who missed it.
+    server.store.respond(call.id, 'dad', 'declined', new Date().toISOString());
+
+    lifecycle.expire();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    assert.equal(alerts.length, 1);
+    assert.deepEqual(alerts[0].devices.map((device) => device.deviceId), ['dev_mumphone0002']);
+    assert.equal(alerts[0].message.body, 'Audio call');
+
+    // And the call it is about is one she can go and look at. The alert promises a missed call,
+    // and a missed call is a row in the history rather than something to answer — a notification
+    // pointing at a call that is not there would be worse than none, because it moves the
+    // question from "did anybody try to reach me" to "where did it go".
+    const [recent] = server.store.callHistory('mum');
+    assert.equal(recent.callId, call.id);
+    assert.equal(recent.joinedAt, null, 'never joined, which is how the app reads a missed call');
 });

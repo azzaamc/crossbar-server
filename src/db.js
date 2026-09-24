@@ -649,6 +649,33 @@ class Store {
         `).run(deviceId).changes === 1;
     }
 
+    /**
+     * Every live device of these people, with the token a notification goes to.
+     *
+     * The same rows as `voipTokensFor` and the other column: a phone that can be *told*
+     * something is not thereby a phone that can be *woken for a call*. The two tokens are
+     * issued to different parts of the system and are not interchangeable.
+     */
+    alertTokensFor(userIds) {
+        const ids = [...new Set(userIds)].filter(Boolean);
+        if (!ids.length) return [];
+        const places = ids.map(() => '?').join(',');
+        return this.db.prepare(`
+            SELECT id AS deviceId, user_id AS userId, push_token AS token,
+              COALESCE(NULLIF(push_environment, ''), 'production') AS environment
+            FROM devices
+            WHERE user_id IN (${places}) AND status = 'active'
+              AND push_token IS NOT NULL AND push_token <> ''
+        `).all(...ids);
+    }
+
+    /** A notification token Apple has said is dead. */
+    clearAlertToken(deviceId) {
+        return this.db.prepare(`
+            UPDATE devices SET push_token = NULL, push_environment = NULL WHERE id = ?
+        `).run(deviceId).changes === 1;
+    }
+
     devicesFor(userId) {
         return this.db.prepare(`
             SELECT id, label, platform, push_token AS pushToken, push_environment AS pushEnvironment,

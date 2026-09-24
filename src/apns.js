@@ -110,7 +110,11 @@ function httpTransport() {
 function createApnsNotifier({ config, log, transport = httpTransport() }) {
     const privateKey = readKey({ ...config, log });
     const enabled = Boolean(privateKey && config.apnsKeyId && config.apnsTeamId && config.apnsTopic);
-    const topic = `${config.apnsTopic}.voip`;
+    // Two topics, because the topic is what decides which part of the app iOS wakes: a
+    // PushKit registry may only ever be sent on `.voip`, and a notification on the bundle id
+    // itself. Sending a call on the wrong one is a push nobody handles.
+    const voipTopic = `${config.apnsTopic}.voip`;
+    const alertTopic = config.apnsTopic;
 
     // Apple rejects a provider token older than an hour, and asks that it not be refreshed
     // more than once every twenty minutes. Forty-five sits inside both.
@@ -130,8 +134,14 @@ function createApnsNotifier({ config, log, transport = httpTransport() }) {
         return held.value;
     }
 
-    /** One device, with the reason it could not be reached when that is worth acting on. */
-    async function deliver(device, body, expiration) {
+    /**
+     * One device, with the reason it could not be reached when that is worth acting on.
+     *
+     * One function for both kinds of push, because the difference between them is entirely
+     * in the shape — which topic, which part of the app, what is inside — and everything
+     * else about delivering one is the same.
+     */
+    async function deliver(device, shape) {
         for (let attempt = 0; attempt < 2; attempt += 1) {
             let answer;
             try {
@@ -140,17 +150,17 @@ function createApnsNotifier({ config, log, transport = httpTransport() }) {
                     `/3/device/${device.token}`,
                     {
                         authorization: `bearer ${token()}`,
-                        'apns-topic': topic,
-                        'apns-push-type': 'voip',
-                        // A ring is worth waking a radio for, and is worthless late: the
-                        // expiration is the moment the call gives up, so a phone that was
-                        // unreachable throughout is not woken afterwards to a call that is
-                        // already over.
+                        'apns-topic': shape.topic,
+                        'apns-push-type': shape.pushType,
+                        // Both kinds are things a person is waiting to find out about — a call
+                        // that is ringing, or one they missed — so neither is sent at the
+                        // lower priority a background fetch would use.
                         'apns-priority': '10',
-                        'apns-expiration': String(expiration),
+                        'apns-expiration': String(shape.expiration),
                         'apns-id': crypto.randomUUID(),
+                        ...(shape.collapseId ? { 'apns-collapse-id': shape.collapseId } : {}),
                     },
-                    body,
+                    shape.body,
                 );
             } catch (error) {
                 log.warn('apns_unreachable', { message: String(error.message).slice(0, 120) });
@@ -209,9 +219,14 @@ function createApnsNotifier({ config, log, transport = httpTransport() }) {
         }
 
         const expiration = Math.floor(expiresAt / 1000);
+        return fanOut(devices, { topic: voipTopic, pushType: 'voip', body, expiration });
+    }
+
+    /** Every device in parallel, answering with the ones whose token is dead. */
+    async function fanOut(devices, shape) {
         const dead = [];
         await Promise.all(devices.map(async (device) => {
-            const outcome = await deliver(device, body, expiration);
+            const outcome = await deliver(device, shape);
             if (outcome.drop) {
                 dead.push(device);
                 log.info('apns_token_dropped', { deviceId: device.deviceId, reason: outcome.reason });
@@ -220,7 +235,36 @@ function createApnsNotifier({ config, log, transport = httpTransport() }) {
         return dead;
     }
 
-    return { enabled, topic, incoming, close: transport.close };
+    /**
+     * A call that was missed, as an ordinary notification.
+     *
+     * This is the other way round from a ring. Nobody is waiting for it and the app may never
+     * be opened, so the whole point is a line on a lock screen — which means the notification
+     * system, the bundle id topic, and a token that is not the VoIP one. It must never
+     * present as an incoming call: the call is over, and an answer button for it would be a
+     * lie.
+     */
+    async function alert(devices, { callId, title, body }) {
+        if (!enabled || !devices.length) return [];
+
+        const payload = JSON.stringify({
+            aps: { alert: { title, body }, sound: 'default' },
+            callId,
+        });
+        return fanOut(devices, {
+            topic: alertTopic,
+            pushType: 'alert',
+            // One per call, so a second push about the same missed call replaces the first
+            // rather than stacking a second line saying the same thing.
+            collapseId: `missed-${callId}`,
+            // Worth knowing about for a while, and noise after that: an afternoon-old
+            // "somebody called" is not worth waking a phone for.
+            expiration: Math.floor(Date.now() / 1000) + 3600,
+            body: payload,
+        });
+    }
+
+    return { enabled, topic: voipTopic, incoming, alert, close: transport.close };
 }
 
 module.exports = { createApnsNotifier, providerToken, httpTransport };
