@@ -28,6 +28,118 @@ function loadDotEnv(filePath) {
 const ENV_FILE = path.resolve(process.cwd(), '.env');
 loadDotEnv(ENV_FILE);
 
+// ── What a `.env` may name ──────────────────────────────────────────────────────
+//
+// `loadDotEnv` keeps every line it is given — it has no way to tell a setting from a
+// typo — and reads are by name, so a name nothing reads does nothing at all, in
+// silence. Measured 2026-09-26: `CROSSBAR_SESSION_SECERT` in a `.env` left the server
+// with no session secret and no complaint anywhere. `doctor` warns about the names
+// below that a file is missing, which is the only place that mistake can be caught.
+//
+// The list is what this file reads *and* what the rest of the deployment is handed:
+// the mode's generated section writes `CROSSBAR_BIND_ADDRESS` for the Caddyfile and the
+// units to expand, and the relay unit renders `CROSSBAR_TURN_EXTERNAL_IP` into coturn.
+// Those are read by the deployment rather than by this process, and leaving them out
+// would make a perfectly correct file warn — which is how an operator learns to ignore
+// the warning. `test/visibility.test.js` holds the documented file (`.env.example`) and
+// the names this process reads side by side, so the two cannot drift apart unnoticed.
+const ENV_KEYS = Object.freeze([
+    // Listener, and the files this server reads and writes
+    'HOST', 'PORT', 'DATA_DIR', 'DIRECTORY_CONFIG_PATH', 'WEB_ROOT',
+    // The mode in force, and both configurations it moves between
+    'CROSSBAR_NETWORK_MODE', 'CROSSBAR_PUBLIC_HOSTNAME', 'PUBLIC_ORIGIN', 'CROSSBAR_BIND_ADDRESS',
+    'NETWORK_MODE_PRIVATE_HOSTNAME', 'NETWORK_MODE_PRIVATE_ORIGIN', 'NETWORK_MODE_PRIVATE_BIND_ADDRESS',
+    'NETWORK_MODE_PUBLIC_HOSTNAME', 'NETWORK_MODE_PUBLIC_ORIGIN', 'NETWORK_MODE_PUBLIC_BIND_ADDRESS',
+    // What may be believed about a request, and how a device proves itself
+    'TRUST_TAILSCALE_HEADERS', 'ALLOW_DEV_IDENTITY', 'DEV_IDENTITIES', 'AUTO_ENROL_IDENTITIES',
+    'CROSSBAR_REQUIRE_DEVICE_AUTH', 'CROSSBAR_SESSION_SECRET', 'CROSSBAR_ADMIN_PASSWORD_HASH',
+    'CROSSBAR_SESSION_TTL_SECONDS', 'CROSSBAR_CHALLENGE_TTL_SECONDS', 'CROSSBAR_ENROLLMENT_TTL_SECONDS',
+    // Calls
+    'CALL_RING_SECONDS', 'MAX_PARTICIPANTS', 'ALLOW_SELF_CALLS',
+    // Signalling
+    'SIGNAL_PATH', 'MAX_MESSAGE_BYTES', 'MAX_SDP_BYTES', 'MAX_ICE_BYTES',
+    'PING_INTERVAL_MS', 'PING_TIMEOUT_MS', 'RELAY_PER_SECOND', 'STATUS_PER_SECOND', 'MALFORMED_LIMIT',
+    // Media: the public STUN server, a static TURN server, and the one this deployment runs
+    'ICE_STUN_URL', 'ICE_TURN_URL', 'ICE_TURN_USERNAME', 'ICE_TURN_CREDENTIAL',
+    'CROSSBAR_TURN_HOST', 'CROSSBAR_TURN_PORT', 'CROSSBAR_TURN_MIN_PORT', 'CROSSBAR_TURN_MAX_PORT',
+    'CROSSBAR_TURN_SHARED_SECRET', 'CROSSBAR_TURN_TTL_SECONDS', 'CROSSBAR_TURN_EXTERNAL_IP',
+    // Push
+    'VAPID_PUBLIC_KEY', 'VAPID_PRIVATE_KEY', 'VAPID_SUBJECT',
+    'CROSSBAR_APNS_KEY_ID', 'CROSSBAR_APNS_TEAM_ID', 'CROSSBAR_APNS_KEY_PATH',
+    'CROSSBAR_APNS_KEY', 'CROSSBAR_APNS_TOPIC',
+    // The one name that is not this project's, but decides how it behaves
+    'NODE_ENV',
+]);
+
+/** The names a `.env` holds, in the order it holds them. Comments and blanks hold none. */
+function envNames(content) {
+    const names = [];
+    for (const rawLine of String(content ?? '').split(/\r?\n/)) {
+        const line = rawLine.trim();
+        if (!line || line.startsWith('#')) continue;
+        // The same shape `loadDotEnv` accepts: `NAME=value`, with something before the `=`.
+        const equals = line.indexOf('=');
+        if (equals < 1) continue;
+        names.push(line.slice(0, equals).trim());
+    }
+    return names;
+}
+
+/** How many single-character edits apart two names are, abandoned once past `cap`. */
+function editDistance(a, b, cap) {
+    let previous = Array.from({ length: b.length + 1 }, (_, index) => index);
+    for (let row = 1; row <= a.length; row += 1) {
+        const current = [row];
+        for (let column = 1; column <= b.length; column += 1) {
+            current[column] = Math.min(
+                previous[column] + 1,
+                current[column - 1] + 1,
+                previous[column - 1] + (a[row - 1] === b[column - 1] ? 0 : 1),
+            );
+        }
+        if (Math.min(...current) > cap) return cap + 1;
+        previous = current;
+    }
+    return previous[b.length];
+}
+
+/** The name on the list closest to this one, if any is close enough to be worth naming. */
+function nearestEnvKey(name) {
+    // Three edits for a long name, two for a short one: `CROSSBAR_SESSION_SECERT` is two
+    // from `CROSSBAR_SESSION_SECRET`, and a name that is not close to anything gets no
+    // suggestion rather than a wrong one — a wrong one costs an operator more than it saves.
+    const allowed = Math.max(2, Math.round(name.length / 6));
+    let best = null;
+    let bestDistance = allowed + 1;
+    for (const key of ENV_KEYS) {
+        const distance = editDistance(name, key, bestDistance);
+        if (distance < bestDistance) {
+            best = key;
+            bestDistance = distance;
+        }
+    }
+    return best;
+}
+
+/**
+ * The names a `.env` holds that nothing reads, each with the name probably meant.
+ *
+ * Only the names this project owns are reported: the ones beginning `CROSSBAR_` or
+ * `NETWORK_MODE_`, and `DATA_DIR`. `HOST`, `PORT`, `NODE_ENV` and their like are shared
+ * with other tools, and a name typed beside them that is not ours is not evidence of a
+ * mistake here. Nothing in this project writes a setting it does not read, so a name of
+ * ours that is not on the list is a typo by definition.
+ */
+function unreadEnvKeys(content) {
+    const owned = (name) => /^(CROSSBAR_|NETWORK_MODE_)/.test(name) || name === 'DATA_DIR';
+    const unread = [];
+    for (const name of new Set(envNames(content))) {
+        if (ENV_KEYS.includes(name) || !owned(name)) continue;
+        unread.push({ key: name, suggestion: nearestEnvKey(name) });
+    }
+    return unread;
+}
+
 function bool(name, fallback = false) {
     const value = process.env[name];
     if (value === undefined || value === '') return fallback;
@@ -293,6 +405,31 @@ function modeBlock(content, mode) {
 }
 
 /**
+ * The mode the file itself says is in force, or null when it does not say.
+ *
+ * Deliberately not the same question as which mode the configuration resolves to:
+ * `loadConfig` defaults to `private`, so a `.env` with no generated section — which is what
+ * `deploy/.env.example` produces, because the section is written by the first switch — is in
+ * force as private while saying nothing at all. Something outside this process reads the
+ * line: both mode shapers run under
+ * `ExecCondition=/usr/bin/grep -qx CROSSBAR_NETWORK_MODE=<mode> …`, so a fresh install whose
+ * file does not carry it configures no front door — the server is healthy on loopback and
+ * nobody on the tailnet can reach it, which `status` and `/api/health` both report as fine.
+ * A value that is merely the default still has to be written down, and this is why.
+ *
+ * The first occurrence wins, because `loadDotEnv` keeps the first value it sees.
+ */
+function writtenMode(content) {
+    for (const rawLine of String(content ?? '').split(/\r?\n/)) {
+        const line = rawLine.trim();
+        if (!line.startsWith('CROSSBAR_NETWORK_MODE=')) continue;
+        const value = line.slice('CROSSBAR_NETWORK_MODE='.length).trim().toLowerCase();
+        return MODES.includes(value) ? value : null;
+    }
+    return null;
+}
+
+/**
  * The `.env` a switch produces: the selected mode's own values written under the names
  * everything downstream reads — the server, Caddy, the units — inside the generated section,
  * and the overrides that would contradict the mode emptied, so the mode's own defaults
@@ -334,8 +471,9 @@ function applyMode(content, mode) {
         throw new Error('The generated section is damaged: this file has one of its two marker lines without the other, or has them the wrong way round. Fix that, then switch.');
     }
     const section = begin !== -1;
-    // Which line matters: the operator has to find the one line to remove, and a file with two
-    // of these names in it has no way to say which one the mode would lose to.
+    // The message carries the line number on purpose: the operator has to find the one line to
+    // remove, and a file that names a generated key in two places is exactly the file where
+    // that is not obvious from the text alone.
     for (let index = 0; index < lines.length; index += 1) {
         if (section && index >= begin && index <= end) continue;
         const key = GENERATED_KEYS.find((name) => lines[index].trim().startsWith(`${name}=`));
@@ -457,19 +595,39 @@ function verifyEnvFile(dir, mode = null) {
 }
 
 /**
- * Where a write stages and what it keeps: inside the data directory, which the service may
- * already write, so the hardened unit needs no new allowance and still cannot touch its code.
+ * Where a write keeps what it replaces, and why it lands on `.env` itself: the service's
+ * sandbox grants write to the data directory and to `.env`, and to nothing else — least of all
+ * the code directory `.env` sits in.
  *
- * A plain `writeFileSync` of `.env` is one crash away from a truncated file, and a truncated
- * `.env` breaks the server and both units' `ExecCondition` greps at once — neither Caddy nor
- * Tailscale Serve gets configured, and the box has no front door. So: stage a neighbour inside
- * the data directory, keep the file as it was, then move the staged one into place. The move is
- * a single filesystem operation, so a reader sees the whole old file or the whole new one.
+ * A rename is atomic — a reader sees the whole old file or the whole new one — and it is what
+ * this writer used to do, staging `<dataDir>/.env.writing` and `renameSync`ing it onto `.env`,
+ * on the reasoning that a rename works across directories and so needs no new allowance. That
+ * reasoning is wrong about *which* directory it needs. A rename needs write permission on the
+ * directory the name lands in, and the directory holding `.env` is the code directory the unit
+ * deliberately cannot write: `ProtectSystem=strict` with `ReadWritePaths=<repo>/data
+ * <repo>/.env` is enough for a write to that file and not for a rename onto it. Measured on
+ * the live deployment, 2026-09-26: the console's mode switch and its settings changes failed
+ * `EACCES`, whole and correct from the CLI, which runs in an unsandboxed shell — so the
+ * console could not move the box and the tool the console wraps could. The write therefore
+ * goes through the one permission the sandbox does grant, onto the file itself.
  *
- * The staged name is deliberately not beside `.env`: `renameSync` works across directories on
- * one filesystem, and the service's sandbox allows the data directory but not its own code.
- * The `mkdirSync` is the same one `db.js` does for the same directory, so a first switch on a
- * machine that has not yet started the server cannot fail here where a plain write succeeded.
+ * In place is not atomic, and that is the price, stated plainly: a crash between the truncate
+ * and the last byte leaves a partial `.env`, where a rename would have left one of the two
+ * whole files. The recovery path is `<dataDir>/env.previous`, written before the new content
+ * and readable by whoever has the machine; and a file truncated past its generated section no
+ * longer says which mode it is in, which is the doctor's mode check (`src/diagnostics.js`,
+ * `writtenMode`). Trading atomicity for reachability is what makes the console able to reshape
+ * a hardened box at all.
+ *
+ * Nothing of the file's identity changes, and in place is what guarantees it: the same inode
+ * keeps its owner and its mode. The rename did not — it gave `.env` the *staging* file's
+ * identity. Measured on Debian, 2026-09-26: `sudo node src/admin.js mode private`, the thing
+ * every runbook reaches for when the service user cannot write its own tree, left `.env` owned
+ * by root, mode 600, correct in every way the operator could see, and the service (`User=admin`)
+ * could not start: `errno: -13, code: 'EACCES', path: '/home/admin/crossbar/.env'` — a symptom
+ * that appears at the next start, in a different process, naming a file that looks fine. The
+ * old writer repaired that from the file being replaced; there is now nothing to repair. A
+ * symlinked `.env` is written through rather than replaced for the same reason.
  *
  * Errors are the caller's: a write that cannot complete has to be reported, because the caller
  * is the only thing that knows whether a change still holds without it.
@@ -480,28 +638,62 @@ function writeEnvFile(envPath, content) {
     // do not load, which is the one moment it matters.
     const dataDir = path.resolve(text('DATA_DIR', './data'));
     fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 });
-    const staging = path.join(dataDir, '.env.writing');
     const previous = path.join(dataDir, 'env.previous');
-    fs.writeFileSync(staging, content, { mode: 0o600 });
-    if (fs.existsSync(envPath)) {
+    const held = fs.existsSync(envPath) ? fs.statSync(envPath) : null;
+    // 0o600 is the floor rather than the target. A file that was already private keeps exactly
+    // the mode its operator gave it — `chmod 400 .env` is a decision, and changing a setting is
+    // not a reason to undo it — and anything readable by a group or by everybody is written
+    // back private, because this file holds the session secret and the console's hash.
+    const mode = held && (held.mode & 0o077) === 0 && (held.mode & 0o400) !== 0 ? held.mode & 0o777 : 0o600;
+    let lent = false;
+    if (held) {
+        // Before the new content, because this copy is the file a person reads to put the old
+        // configuration back — and because copying before writing means a copy that fails
+        // leaves `.env` exactly as it was.
         fs.copyFileSync(envPath, previous);
         // `copyFileSync` gives the copy whatever permissions the original had, and `.env` holds
         // the session secret and the console's hash: the kept copy is as sensitive as the file
         // it came from, so it is pinned rather than inherited.
         fs.chmodSync(previous, 0o600);
+        // Writing in place needs the file itself to be writable, which making a new file and
+        // moving it over did not: measured on macOS, 2026-09-26, opening a `chmod 400 .env` for
+        // writing as its owner is `EACCES`. `chmod 400 .env` is a decision this file's contents
+        // justify, and it is kept: the owner-write bit is lent for the duration of one write and
+        // the mode below puts the file back. A crash inside that window leaves it at 0600 rather
+        // than 0400, which is the only other thing the loss of atomicity costs.
+        if ((held.mode & 0o200) === 0) {
+            fs.chmodSync(envPath, (held.mode & 0o777) | 0o200);
+            lent = true;
+        }
     }
-    fs.renameSync(staging, envPath);
+    try {
+        fs.writeFileSync(envPath, content, { mode });
+    } catch (error) {
+        // The lent bit does not outlive the call even when the call fails: whatever state the
+        // write left the file in, it is not left more open than its operator made it. The
+        // error is thrown on, because the caller is the only thing that knows whether the
+        // change it asked for still holds.
+        if (lent) fs.chmodSync(envPath, mode);
+        throw error;
+    }
+    // `mode` on a write applies to a file being created, and a file created through it is
+    // masked by the umask; this is the mode the deployment will be read under, and it is what
+    // puts back a 0400 file lent the write bit above.
+    fs.chmodSync(envPath, mode);
 }
 
 module.exports = {
     loadConfig,
     loadDotEnv,
+    ENV_KEYS,
+    unreadEnvKeys,
     bool,
     integer,
     text,
     writeEnvFile,
     applyMode,
     modeBlock,
+    writtenMode,
     MODES,
     KNOBS,
     knobFor,

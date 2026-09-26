@@ -70,9 +70,9 @@ test('every knob is described well enough to be rendered, and accepts its own bo
 // ── The write both the console and the CLI go through ────────────────────────
 //
 // `.env` is read at start-up by the server and, by `ExecCondition` greps, by both front doors'
-// units: a reader only ever sees one whole file, or neither door is configured. So the write
-// stages inside the data directory — which the service may write and the code directory it may
-// not — keeps what it replaced, and moves the staged file rather than copying it into place.
+// units, and the hardened unit grants write to `data/` and to `.env` and to nothing else. So
+// the write lands on the file itself — the one thing that permission allows — and the file it
+// replaced is kept in the data directory, which is the other.
 
 /** `writeEnvFile` resolves the data directory the way `loadConfig` does: from the environment. */
 function withDataDir(dataDir, body) {
@@ -86,7 +86,7 @@ function withDataDir(dataDir, body) {
     }
 }
 
-test('a staged write keeps the file it replaced, and leaves no half-written file behind', () => {
+test('a write lands on the file it was given, and keeps the file it replaced', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'crossbar-env-'));
     const dataDir = path.join(dir, 'data');
     const envPath = path.join(dir, '.env');
@@ -98,10 +98,44 @@ test('a staged write keeps the file it replaced, and leaves no half-written file
 
     assert.equal(fs.readFileSync(envPath, 'utf8'), 'MAX_PARTICIPANTS=6\n');
     assert.equal(fs.readFileSync(path.join(dataDir, 'env.previous'), 'utf8'), 'MAX_PARTICIPANTS=4\n');
-    assert.equal(fs.existsSync(path.join(dataDir, '.env.writing')), false, 'moved, not left behind');
     // `.env` holds the session secret and the console's hash, and the kept copy holds the same.
     assert.equal(fs.statSync(envPath).mode & 0o777, 0o600);
     assert.equal(fs.statSync(path.join(dataDir, 'env.previous')).mode & 0o777, 0o600);
+    // Nothing anywhere else — no staging name beside the file, and none beside the copy. The
+    // directory holding `.env` is the code directory on a deployment, where a reader must not
+    // find anything this writer left.
+    assert.deepEqual(fs.readdirSync(dir).sort(), ['.env', 'data']);
+    assert.deepEqual(fs.readdirSync(dataDir), ['env.previous']);
+});
+
+test('a write works where the file may be written and the directory holding it may not', (t) => {
+    // The service's sandbox as the unit makes it: `ReadWritePaths=<repo>/data <repo>/.env`
+    // under `ProtectSystem=strict`. Writing the file is allowed; creating or removing a *name*
+    // in the directory it is in is not. A rename needs write permission on the directory the
+    // name lands in, so the staged-and-moved writer failed here with `EACCES` — measured
+    // against the live deployment, 2026-09-26, which is the console's mode switch this stands
+    // for. A directory mode does not deny root, so the test says so instead of passing for the
+    // wrong reason.
+    if (typeof process.getuid === 'function' && process.getuid() === 0) {
+        return t.skip('running as root: a directory mode does not deny it');
+    }
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'crossbar-env-'));
+    const dataDir = path.join(dir, 'data');
+    const envPath = path.join(dir, '.env');
+    fs.mkdirSync(dataDir);
+    fs.writeFileSync(envPath, 'MAX_PARTICIPANTS=4\n', { mode: 0o600 });
+    const ino = fs.statSync(envPath).ino;
+
+    fs.chmodSync(dir, 0o500);
+    try {
+        withDataDir(dataDir, () => writeEnvFile(envPath, 'MAX_PARTICIPANTS=6\n'));
+    } finally {
+        fs.chmodSync(dir, 0o700);
+    }
+
+    assert.equal(fs.readFileSync(envPath, 'utf8'), 'MAX_PARTICIPANTS=6\n');
+    assert.equal(fs.statSync(envPath).ino, ino, 'the same file, written through rather than replaced');
+    assert.equal(fs.readFileSync(path.join(dataDir, 'env.previous'), 'utf8'), 'MAX_PARTICIPANTS=4\n');
 });
 
 test('a write that cannot complete is reported, and the file that was there is still there', () => {
@@ -117,4 +151,70 @@ test('a write that cannot complete is reported, and the file that was there is s
     assert.throws(() => withDataDir(path.join(blocked, 'data'),
         () => writeEnvFile(envPath, 'MAX_PARTICIPANTS=6\n')), /ENOTDIR/);
     assert.equal(fs.readFileSync(envPath, 'utf8'), 'MAX_PARTICIPANTS=4\n');
+});
+
+test('a write keeps a private file private, narrows a public one, and starts at 0600', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'crossbar-env-'));
+    const dataDir = path.join(dir, 'data');
+    const envPath = path.join(dir, '.env');
+
+    // An operator hardened it, which is a decision a settings change is not allowed to undo.
+    fs.writeFileSync(envPath, 'MAX_PARTICIPANTS=4\n');
+    fs.chmodSync(envPath, 0o400);
+    withDataDir(dataDir, () => writeEnvFile(envPath, 'MAX_PARTICIPANTS=6\n'));
+    assert.equal(fs.statSync(envPath).mode & 0o777, 0o400);
+
+    // Readable by everybody is not something this file may be left as: it holds the session
+    // secret and the console's hash.
+    fs.chmodSync(envPath, 0o644);
+    withDataDir(dataDir, () => writeEnvFile(envPath, 'MAX_PARTICIPANTS=8\n'));
+    assert.equal(fs.statSync(envPath).mode & 0o777, 0o600);
+    assert.equal(fs.readFileSync(envPath, 'utf8'), 'MAX_PARTICIPANTS=8\n');
+
+    // And a file that is not there yet: the first write is private, which is the floor the two
+    // cases above narrow to.
+    fs.rmSync(envPath);
+    withDataDir(dataDir, () => writeEnvFile(envPath, 'MAX_PARTICIPANTS=4\n'));
+    assert.equal(fs.statSync(envPath).mode & 0o777, 0o600);
+});
+
+test('a write that fails does not leave the file\u2019s mode lent out', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'crossbar-env-'));
+    const dataDir = path.join(dir, 'data');
+    const envPath = path.join(dir, '.env');
+    fs.writeFileSync(envPath, 'MAX_PARTICIPANTS=4\n');
+    fs.chmodSync(envPath, 0o400);
+
+    // Writing in place means the owner-write bit is lent to the file for the length of one
+    // write, and a write that throws must not hand it back still lent: `chmod 400 .env` is the
+    // whole of what keeps the session secret and the console's hash out of everything else's
+    // reach, and `doctor` is the only thing that would notice it gone. An object is not
+    // something that can be written, which is how a write that throws is reached here without
+    // needing a full disk.
+    assert.throws(() => withDataDir(dataDir, () => writeEnvFile(envPath, { not: 'a file' })));
+    assert.equal(fs.statSync(envPath).mode & 0o777, 0o400);
+    assert.equal(fs.readFileSync(envPath, 'utf8'), 'MAX_PARTICIPANTS=4\n',
+        'and the file that was there is untouched');
+});
+
+test('a write leaves the file\u2019s owner and identity as they were', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'crossbar-env-'));
+    const dataDir = path.join(dir, 'data');
+    const envPath = path.join(dir, '.env');
+    fs.writeFileSync(envPath, 'MAX_PARTICIPANTS=4\n', { mode: 0o600 });
+    const before = fs.statSync(envPath);
+
+    // Writing in place is what keeps this: the inode is the file's own, so its owner and
+    // anything else hung on it stay put. The rename this writer used to do handed `.env` the
+    // *staging* file's identity instead — measured on Debian, 2026-09-26, `sudo node
+    // src/admin.js mode private` left it owned by root and the service (`User=admin`) could not
+    // start, `EACCES` on a file the operator could see and read. There is no longer an owner to
+    // put back, and so no refusal to make: the failure the old writer had to detect cannot
+    // happen, which is why the test it needed is gone rather than adapted.
+    withDataDir(dataDir, () => writeEnvFile(envPath, 'MAX_PARTICIPANTS=6\n'));
+    const after = fs.statSync(envPath);
+    assert.equal(after.uid, before.uid);
+    assert.equal(after.gid, before.gid);
+    assert.equal(after.ino, before.ino, 'the file itself, not a replacement');
+    assert.equal(fs.readFileSync(envPath, 'utf8'), 'MAX_PARTICIPANTS=6\n');
 });

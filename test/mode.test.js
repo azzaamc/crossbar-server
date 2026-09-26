@@ -11,7 +11,7 @@ const os = require('node:os');
 const path = require('node:path');
 const { spawnSync } = require('node:child_process');
 
-const { applyMode } = require('../src/config');
+const { applyMode, writtenMode } = require('../src/config');
 
 const ADMIN = path.join(__dirname, '..', 'src', 'admin.js');
 
@@ -152,6 +152,26 @@ test('switching to the mode already written changes nothing', () => {
     assert.equal(applyMode(once, 'public'), once);
 });
 
+test('a file with no generated section gets one, and the run after that changes nothing', () => {
+    // `deploy/.env.example` is this file: both mode blocks, no section yet, because the section
+    // is what a switch writes. The mode is in force by default — so nothing inside this process
+    // can tell the difference — but both mode shapers run under
+    // `ExecCondition=/usr/bin/grep -qx CROSSBAR_NETWORK_MODE=<mode>`, and a fresh private install
+    // whose file has no such line never runs `tailscale serve`: the server is healthy on loopback
+    // and nobody on the tailnet can reach it. Measured on the rehearsal host, 2026-09-26.
+    const dir = deployment(CONFIGURED);
+    assert.equal(writtenMode(envFile(dir)), null, 'the fixture is a file that does not say');
+
+    const first = admin(dir, 'mode', 'private');
+    assert.equal(first.status, 0, first.stderr);
+    assert.equal(writtenMode(envFile(dir)), 'private');
+
+    const once = envFile(dir);
+    const second = admin(dir, 'mode', 'private');
+    assert.equal(second.status, 0, second.stderr);
+    assert.equal(envFile(dir), once, 'the file says so now, so there is nothing left to write');
+});
+
 test('a switch lands the mode it was asked for, and the file says so', () => {
     const dir = deployment(CONFIGURED);
     const result = admin(dir, 'mode', 'public');
@@ -196,18 +216,35 @@ test('a switch that meets an override outside the section refuses, and the file 
     assert.equal(envFile(dir), before, 'a refusal before the write leaves nothing to put back');
 });
 
-test('a switch stages the write inside the data directory and keeps the file it replaced', () => {
+test('a switch writes in place, where the code directory may not be written, and keeps the file it replaced', () => {
     const dir = deployment(MARKED);
     const before = envFile(dir);
-    const result = admin(dir, 'mode', 'public');
+    const ino = fs.statSync(path.join(dir, '.env')).ino;
+    // The unit's sandbox, as the console meets it: `data/` and `.env` are writable and the
+    // directory holding `.env` is not, under `ProtectSystem=strict`. A rename needs write
+    // permission on the directory the name lands in, so the staged-and-moved writer that was
+    // here first failed with `EACCES` in exactly this shape — which is why the console could
+    // not switch modes while the same command run from a shell could.
+    fs.chmodSync(dir, 0o500);
+    let result;
+    try {
+        result = admin(dir, 'mode', 'public');
+    } finally {
+        fs.chmodSync(dir, 0o700);
+    }
     assert.equal(result.status, 0, result.stderr);
+    assert.match(envFile(dir), /^CROSSBAR_NETWORK_MODE=public$/m);
+
     const dataDir = path.join(dir, 'data');
     assert.equal(fs.readFileSync(path.join(dataDir, 'env.previous'), 'utf8'), before,
         'the file as it was, so a switch that lands wrong can still be undone by hand');
-    assert.equal(fs.existsSync(path.join(dataDir, '.env.writing')), false,
-        'the staged file is moved into place, not left behind where the next write would find it');
+    assert.equal(fs.statSync(path.join(dir, '.env')).ino, ino,
+        'written through, not replaced: the same file keeps its owner and its mode');
     // `.env` carries the session secret and the console's hash, and so does the copy of it:
     // both are readable by their owner and by nobody else.
     assert.equal(fs.statSync(path.join(dataDir, 'env.previous')).mode & 0o777, 0o600);
     assert.equal(fs.statSync(path.join(dir, '.env')).mode & 0o777, 0o600);
+    // And no staging name was left anywhere, in the deployment directory or beside the copy.
+    assert.deepEqual(fs.readdirSync(dir).sort(), ['.env', 'data']);
+    assert.deepEqual(fs.readdirSync(dataDir).sort(), ['directory.json', 'env.previous']);
 });
