@@ -106,9 +106,14 @@ STAGE="$(mktemp -d)"
 # BSD tar alike, without either one's rename flag.
 run install -d -m 0755 "$OUT"
 run install -d -m 0755 "$STAGE/crossbar-server-$VERSION"
+# The artefacts are tracked in this repository on purpose — a release is reproducible from the
+# commit it names — and that is also what puts them in the tree this archive is built from, so a
+# second build embeds the first. Measured 2026-09-26: successive builds of one commit produced
+# 316K, 1.0M and 1.6M tarballs, each carrying the previous one inside it. Excluded here, so what
+# the tarball holds is the deployment rather than the last copy of it.
 run tar -C "$SRC" -cf "$STAGE/tree.tar" \
     --exclude=./node_modules --exclude=./.git --exclude=./.env --exclude=./data \
-    --exclude='*.log' --exclude=./.DS_Store .
+    --exclude='*.log' --exclude=./.DS_Store --exclude='./crossbar-server-*.tar.gz*' .
 run tar -C "$STAGE/crossbar-server-$VERSION" -xf "$STAGE/tree.tar"
 run rm -f "$STAGE/tree.tar"
 run tar -C "$STAGE" -czf "$OUT/$TARBALL" "crossbar-server-$VERSION"
