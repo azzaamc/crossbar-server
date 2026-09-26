@@ -159,6 +159,9 @@ test('a switch changes what the server believes, and the file is the only thing 
     const publicHealth = await ask(port, '/api/health');
     assert.equal(publicHealth.data.mode, 'public');
     assert.match(publicHealth.data.version, /^\d+\.\d+\.\d+$/);
+    assert.equal(publicHealth.data.origin, 'https://calls.example.com',
+        'health answers with the address a device should dial, unauthenticated, so a phone whose '
+        + 'stored address is stale can still ask where the server went');
 
     // Somebody on the network claiming to be a person is not a person here: in public mode the
     // header is not believed at all, so a request with it is as anonymous as one without.
@@ -183,6 +186,7 @@ test('a switch changes what the server believes, and the file is the only thing 
     t.after(() => privateServer.child.kill('SIGKILL'));
     const privateHealth = await ask(port, '/api/health');
     assert.equal(privateHealth.data.mode, 'private');
+    assert.equal(privateHealth.data.origin, 'https://house.tailnet.ts.net:8443');
 
     const abdullah = { 'Tailscale-User-Login': 'abdullah@dev', 'Tailscale-User-Name': 'Abdullah' };
 

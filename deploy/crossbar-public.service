@@ -5,6 +5,19 @@
 # wants this unit and the private one, and the check below means exactly one of them does
 # anything. Nothing has to be remembered, and nothing outside the file has to be kept in
 # step with it.
+#
+# A switch opens the new door and closes the old one later, on a timer, instead of closing
+# it at once. Closing it first -- what this unit used to do -- is destructive for every
+# phone: the app only learns that the server moved by reading `/api/health`, and it can only
+# ask after authenticating. A door closed before the app has read the answer is a device
+# that has to be re-enrolled with a hand-issued code. With the overlap the app polls the
+# address it already knows, finds an `origin` that differs from the one it stored, adopts
+# that origin, and keeps its device key. That is the whole reason the window exists.
+#
+# The overlap is not a hole, because the trust posture follows the mode and not the door: in
+# public mode the identity header is not believed at all, so the tailnet door only admits
+# devices that hold keys. Both directions of that argument are measured on the rehearsal
+# host before a deploy, not inferred here.
 
 [Unit]
 Description=Crossbar in public mode (the public hostname in, the tailnet out)
@@ -25,6 +38,14 @@ Type=oneshot
 # are reading this because you are about to add it: don't.
 EnvironmentFile=/home/admin/crossbar/.env
 
+# How long a switch leaves the outgoing door open, in seconds, and the floor under it. The
+# value in `.env` wins over this line: at spawn the environment is merged as
+# `strv_env_merge(..., context->environment, params->files_env)` and later entries override,
+# so the file's variables are applied last -- not because of which directive comes first
+# here. Measured in systemd v252 (`src/core/execute.c`) and v257 (`src/core/exec-invoke.c`);
+# the order is the same in both. 900 is fifteen minutes.
+Environment=CROSSBAR_SWITCH_GRACE_SECONDS=900
+
 # Which mode this unit is for is answered by the same file the server reads, so there is one
 # answer to "which mode is this deployment in" and no second copy to drift.
 #
@@ -38,28 +59,59 @@ EnvironmentFile=/home/admin/crossbar/.env
 # cannot satisfy it.
 ExecCondition=/usr/bin/grep -qx CROSSBAR_NETWORK_MODE=public /home/admin/crossbar/.env
 
-# The tailnet stops serving first, so the two ways in are never open at the same moment --
-# and a switch interrupted halfway leaves the box reachable by one of them rather than by
-# neither.
-#
-# The node stays joined to the tailnet; only serving stops. `tailscale down` would take the
-# address with it, and coming back would then mean a re-join -- and a re-approval is the one
-# cost a switch should never be able to impose on a directory. An idle node serves nothing.
-#
-# `-` because a deployment that was not serving is already in the state this asks for, and
-# that is not a failure: the `error: failed to remove web serve: handler does not exist` it
-# leaves in the journal is that case being tolerated, not something going wrong.
-ExecStart=-/usr/bin/tailscale serve --https=443 off
-
-# Then the public route comes back.
+# The public route comes back first, so the new way in exists before the old one goes.
 #
 # A command rather than `Wants=caddy.service`, and `crossbar-private.service` is written the
 # same way for the opposite direction. A dependency is resolved while the start is still
 # being planned, before conditions are read, so a `Conflicts=` on the private unit stopped
 # Caddy even on a start whose own condition then declined to make it -- a public outage
 # decided by a check nobody reads. A command here runs only if the check passed, which is
-# is the property the switch rests on. Measured, not assumed, with a stand-in unit.
+# the property the switch rests on. Measured, not assumed, with a stand-in unit.
 ExecStart=/usr/bin/systemctl start caddy
+
+# Then the tailnet door is closed -- but after the window, not now, and by a transient unit
+# so there is nothing to clean up and no fifth unit file to keep in step.
+#
+# The window is `CROSSBAR_SWITCH_GRACE_SECONDS`, set in `.env` or falling back to the 900
+# above. `--on-active=` takes a bare number as seconds, which is what the name says -- do
+# not append an `s`, or a value of `15min` would arrive as `15mins` and be refused.
+#
+# The `grep` in the middle is the important half, and it is the same whole-line check as the
+# condition above, for the same reason: a switch that is switched back inside the window
+# must not have the earlier switch's timer close the door that is now wanted. The close
+# reads the mode in force when it fires, not the mode that scheduled it -- which is also why
+# a switch back inside the window needs no second timer.
+#
+# `-` because that second timer cannot be created: a switch back inside the window finds
+# `crossbar-grace-public.timer` still pending, systemd-run refuses a name that already
+# exists, and the pending timer is the one that does the right thing anyway. `--collect`
+# unloads the unit once it has fired, so a refusal is not a queue that grows.
+#
+# `tailscale serve --https=443 off` can still fail with "handler does not exist" when
+# nothing was serving. That is the state the command asks for and is tolerated, exactly as
+# when it was an `ExecStart=` here -- it is now the transient unit's exit status, so it
+# leaves a failed `crossbar-grace-public.service` line in the journal rather than a failed
+# shaper.
+#
+# `/bin/sh -c` for one reason only: systemd expands `${NAME}` on a command line but has no
+# `${NAME:-default}`. That operator is enabled only while an `EnvironmentFile=` is being
+# read (`src/basic/env-file.c`'s `merge_env_file_push` is the only caller of
+# `replace_env_full` that passes REPLACE_ENV_ALLOW_EXTENDED; inline `Environment=` expands
+# specifiers but no variables at all) and is not enabled for `Exec*=`: the command-line path
+# calls `replace_env_full(..., flags = 0, ...)` and the `:` branch, commented "unsupported
+# syntax, i.e. do no replacement", hands the text through unchanged. A line written as
+# `--on-active=${CROSSBAR_SWITCH_GRACE_SECONDS:-900}` would therefore reach systemd-run as a
+# literal time span and be refused, and `-` would swallow it into a switch that never closes
+# the old door. Measured across systemd v252 to v262 and current main; no version expands it
+# there. The shell, which does have the operator and does have the EnvironmentFile's
+# variables, is the right place for the fallback.
+#
+# The 900 is written in both places on purpose, and they cover different cases: the
+# `Environment=` line above is the value the unit states when the file says nothing, and the
+# shell's operator is what keeps a file that says nothing *by writing an empty line* --
+# `CROSSBAR_SWITCH_GRACE_SECONDS=` -- from expanding to `--on-active=`, which systemd-run
+# refuses and `-` would then swallow into a switch that never closes the old door.
+ExecStart=-/bin/sh -c '/usr/bin/systemd-run --collect --unit=crossbar-grace-public --on-active="${CROSSBAR_SWITCH_GRACE_SECONDS:-900}" /bin/sh -c "/usr/bin/grep -qx CROSSBAR_NETWORK_MODE=public /home/admin/crossbar/.env && exec /usr/bin/tailscale serve --https=443 off"'
 
 # Then the relay, if this box runs one.
 #

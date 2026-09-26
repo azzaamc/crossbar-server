@@ -124,6 +124,11 @@ function serverView(status) {
     ]);
     return section('Server',
         el('div', { class: 'cards' }, [
+            // First, because it is the one fact about a deployment nothing else here can
+            // answer: the files on the box, the checkout somebody edited and the process
+            // answering this page can be three different versions, and only the process
+            // knows which one it is.
+            card('Version', status.version),
             card('Mode', status.mode),
             card('Hostname', status.hostname || 'not set'),
             card('Origin', status.origin),
@@ -254,6 +259,72 @@ function peopleView(people, refresh, requireLogins) {
 }
 
 /**
+ * People the database has and the file does not name.
+ *
+ * A private deployment mints a person for any identity that reaches it, so somebody who
+ * signs in arrives as a real person — devices, calls and history pointing at them — while
+ * the directory file, which is what this page edits, has never heard of them. Measured
+ * 2026-09-26: a probe login was `ts_72497f475e4f76d0b28f57c7 | Someone |
+ * someone@example.com` in the database while the file still listed three people. Nothing
+ * else on this page would show them, and hiding them would not be true: nothing here
+ * decides whether their device key works.
+ *
+ * So the card says what happened and what the two honest answers are — write them into the
+ * file, or take their device out of use — because "why is this person here at all" is not
+ * a question the table can answer by itself.
+ */
+function unlistedView(unlisted, refresh) {
+    if (!unlisted || !unlisted.length) return null;
+
+    const rows = unlisted.map((person) => el('tr', { class: person.takenOutOfTheFile ? 'inactive' : '' }, [
+        el('td', { text: person.displayName }),
+        el('td', { text: person.login || '—' }),
+        el('td', { class: 'numeric', text: person.devices }),
+        el('td', { text: when(person.firstSeen) }),
+        el('td', { text: when(person.lastAuthenticated) }),
+        el('td', { text: person.takenOutOfTheFile ? 'taken out of the file' : 'arrived by signing in' }),
+        el('td', {}, [el('div', { class: 'actions' }, [
+            el('button', {
+                type: 'button',
+                class: 'primary',
+                text: 'Write into the file',
+                onClick: async () => {
+                    // Under the id they already have. Any other id would leave this row
+                    // behind — enabled, still holding their device keys — and make a second
+                    // person of them, so the fix is to name the row that exists.
+                    await call('/api/admin/people', {
+                        method: 'POST',
+                        body: JSON.stringify({
+                            id: person.id,
+                            displayName: person.displayName,
+                            tailscaleLogin: person.login,
+                        }),
+                    });
+                    await refresh();
+                },
+            }),
+        ])]),
+    ]));
+
+    return section('Not in the directory file',
+        el('p', {
+            text: 'These people are in the server’s database and not in the file this page edits. '
+                + 'A private deployment mints a person for any identity that reaches it, and that '
+                + 'person is real whatever the file says: their devices work, their calls are '
+                + 'recorded, and their history points at them.',
+        }),
+        el('p', {
+            text: 'Writing somebody into the file puts them under the id they already have, so their '
+                + 'devices and their history stay theirs, and it is the answer for somebody who '
+                + 'belongs here. For somebody who does not, take their device out of use under '
+                + 'Devices below: the file is not what makes a key work, so leaving a person out of '
+                + 'it would not stop the phone.',
+        }),
+        table(['Name', 'Login', 'Devices', 'First seen', 'Last authenticated', 'Where they came from', ''], rows,
+            { numeric: ['Devices'] }));
+}
+
+/**
  * Who can reach whom.
  *
  * Everybody reaches everybody, and there is nothing here to configure. A table of ticks was
@@ -327,8 +398,13 @@ function devicesView(devices, refresh) {
                 // looked identical here — an empty cell — and a device enrolled during the
                 // launch that gave it its push token files none, which is a state an operator
                 // has to be able to see rather than deduce. Measured 2026-09-24.
-                text: [device.hasVoipToken ? 'ring' : null, device.hasPushToken ? 'alerts' : null].filter(Boolean).join(', ') || 'none'
-                    .filter(Boolean).join(' + ') || '—',
+                //
+                // The `.filter(Boolean).join(' + ')` tail that used to hang off this
+                // expression was dead code with a bug in it: `'none'.filter` is not a
+                // function, so the first time a device had neither token — which is every
+                // device on a first install — opening the console threw instead of drawing
+                // this cell. Measured 2026-09-26.
+                text: [device.hasVoipToken ? 'ring' : null, device.hasPushToken ? 'alerts' : null].filter(Boolean).join(', ') || 'none',
             }),
             el('td', { text: when(device.lastSeenAt) }),
             el('td', {}, [el('div', { class: 'actions' }, [
@@ -830,16 +906,21 @@ async function refresh() {
             call('/api/admin/settings'),
         ]);
         main.replaceChildren(
-            serverView(status),
-            inviteView(people.people, refresh),
-            peopleView(people.people, refresh, people.requireLogins),
-            contactsView(people.people, people.contacts || [], refresh),
-            devicesView(devices.devices, refresh),
-            enrollmentsView(enrollments.enrollments, refresh),
-            usageView(usage, people.people),
-            hostView(host),
-            settingsView(settings),
-            browserFoot(),
+            ...[
+                serverView(status),
+                inviteView(people.people, refresh),
+                peopleView(people.people, refresh, people.requireLogins),
+                // Null when the file and the database agree, which is the ordinary case: a
+                // section that said "none" every day would be a section nobody reads.
+                unlistedView(people.unlisted || [], refresh),
+                contactsView(people.people, people.contacts || [], refresh),
+                devicesView(devices.devices, refresh),
+                enrollmentsView(enrollments.enrollments, refresh),
+                usageView(usage, people.people),
+                hostView(host),
+                settingsView(settings),
+                browserFoot(),
+            ].filter(Boolean),
         );
     } catch (error) {
         // Refused for who this browser is, rather than for what it asked: the answer is the

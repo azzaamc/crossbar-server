@@ -8,7 +8,11 @@
   },
   "scripts": {
     "start": "node src/server.js",
-    "test": "node --test"
+    "test": "node --test",
+    "release": "bash scripts/release.sh",
+    "deploy": "bash scripts/install.sh",
+    "upgrade": "bash scripts/upgrade.sh",
+    "uninstall": "bash scripts/uninstall.sh"
   },
   "author": "",
   "license": "ISC",

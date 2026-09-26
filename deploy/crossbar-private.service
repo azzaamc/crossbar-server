@@ -2,8 +2,16 @@
 #
 # The counterpart to `crossbar-public.service`, and read the comments there first: the same
 # check decides which of the two runs, the same `Before=` keeps the server from opening
-# anything before the box is in shape, and the same reason applies for using commands rather
-# than dependency directives to move Caddy.
+# anything before the box is in shape, the same reason applies for using commands rather
+# than dependency directives to move Caddy, and the same overlap -- the new door opens now
+# and the old one closes on a timer, so a phone can still read `/api/health` on the address
+# it already knows, find the new `origin`, adopt it, and keep its device key.
+#
+# The overlap is not a hole in this direction either, because the trust posture follows the
+# mode and not the door: while this unit leaves Caddy running for the window, Caddy is still
+# stripping the identity headers off every request that arrives from outside
+# (`deploy/Caddyfile:74-77`), so a caller there has no header and no key and is refused.
+# Measured on the rehearsal host before a deploy, as in the other direction.
 
 [Unit]
 Description=Crossbar in private mode (the tailnet in, the public hostname out)
@@ -24,6 +32,23 @@ Type=oneshot
 # are reading this because you are about to add it: don't.
 EnvironmentFile=/home/admin/crossbar/.env
 
+# Two floors, and `.env` wins over both: at spawn the environment is merged as
+# `strv_env_merge(..., context->environment, params->files_env)` and later entries override,
+# so the file's variables are applied last -- not because of which directive comes first in
+# this file. Measured in systemd v252 (`src/core/execute.c`) and v257
+# (`src/core/exec-invoke.c`), identical order in each.
+#
+# `PORT` falls back to the same 3003 the server itself uses, and to the same one Caddy's
+# `reverse_proxy 127.0.0.1:{$PORT:3003}` uses, so the three cannot disagree about a box that
+# never sets it. The server reads it as a number and falls back when the value is unset *or
+# empty* (`src/config.js`: `Number.parseInt(process.env[name] || '', 10)`), which is what the
+# empty case below is about.
+#
+# A deployment that sets `PORT` in `.env` is the deployment the file describes: the line
+# above is the floor for a file that says nothing, not a pin.
+Environment=PORT=3003
+Environment=CROSSBAR_SWITCH_GRACE_SECONDS=900
+
 # Which mode this unit is for is answered by the same file the server reads, so there is one
 # answer to "which mode is this deployment in" and no second copy to drift.
 #
@@ -37,35 +62,41 @@ EnvironmentFile=/home/admin/crossbar/.env
 # cannot satisfy it.
 ExecCondition=/usr/bin/grep -qx CROSSBAR_NETWORK_MODE=private /home/admin/crossbar/.env
 
-# The public route goes first. Caddy is what holds port 443 on the public address, so
-# stopping it is what makes "the tailnet is the way in" true rather than merely preferred --
-# and it happens before the tailnet opens, so the two are never both available.
+# The tailnet opens first, so the new way in exists before the old one goes.
 #
-# Stopping a unit that is already stopped succeeds, so this is also the state it wants.
-ExecStart=/usr/bin/systemctl stop caddy
+# `/bin/sh -c` and `${PORT:-3003}` rather than `$PORT` alone, for two separate reasons that
+# land on the same token. `${NAME}` systemd does expand, but `${NAME:-default}` it does not:
+# that operator is enabled only while an `EnvironmentFile=` is being read, and never for
+# `Exec*=` (the long version of that measurement is in `crossbar-public.service`). And
+# `$PORT` as a word of its own expands to *no argument at all* when it is unset, which
+# leaves `tailscale serve --bg` with no target, while a plain `${PORT}` with an empty
+# `PORT=` would leave it an empty target. The server treats those two as the same case and
+# listens on 3003; the shell's operator is what makes this unit agree.
+ExecStart=/bin/sh -c '/usr/bin/tailscale serve --bg ${PORT:-3003}'
 
-# Then the server's loopback listener, published on the tailnet's own port 443 with a
-# certificate for the node's name -- which is why private mode needs no certificate of its
-# own and no public DNS record. The server stays on loopback in both modes; what the mode
-# changes is which of the two front doors is open onto it.
+# Then the public route goes, on a timer and guarded, rather than now.
 #
-# `${PORT:-3003}`, not `$PORT`: the port is the server's own listener, read from the same
-# file, so the proxy target and the listener cannot disagree -- but a file with no `PORT`
-# line must fall back rather than expand to nothing, which would leave `tailscale serve` an
-# empty argument where the port belongs, with nothing reporting the mismatch. 3003 is the
-# same fallback the server itself uses (`src/config.js`, `integer('PORT', 3003, …)`) and the
-# one Caddy's `reverse_proxy 127.0.0.1:{$PORT:3003}` uses (`deploy/Caddyfile:76`), so all
-# three agree on an unconfigured box. systemd expands `${NAME:-word}` against *this unit's*
-# environment -- the one `EnvironmentFile=` above loads -- not the manager's, which is the
-# opposite of the `ConditionEnvironment=` trap noted above and the reason this is safe here.
-#
-# `tailscaled` keeps this rather than this unit, so a reboot brings the address back on its
-# own; this is here so that a switch reaches the tailnet's configuration too, which a reboot
-# alone would not.
-ExecStart=/usr/bin/tailscale serve --bg ${PORT:-3003}
+# Caddy is what holds port 443 on the public address, so stopping it is what makes "the
+# tailnet is the way in" true rather than merely preferred -- but it is also the only door
+# the app can still ask `/api/health` on, so it stays up for the window. Same shape, same
+# `CROSSBAR_SWITCH_GRACE_SECONDS` setting, same `grep` guard and same reasoning as
+# `crossbar-public.service`, which is where the comments for all of that are.
+ExecStart=-/bin/sh -c '/usr/bin/systemd-run --collect --unit=crossbar-grace-private --on-active="${CROSSBAR_SWITCH_GRACE_SECONDS:-900}" /bin/sh -c "/usr/bin/grep -qx CROSSBAR_NETWORK_MODE=private /home/admin/crossbar/.env && exec /usr/bin/systemctl stop caddy"'
 
-# Then the relay, if this box runs one. Same reason and same shape as in
-# `crossbar-public.service` (read the comment there): coturn renders its `realm` and
-# `external-ip` from `.env` once, at its own start, so a relay kept across a switch goes on
-# advertising the mode just left, and that presents as calls that will not relay.
+# Then the relay, if this box runs one.
+#
+# coturn's whole view of who it is comes from `.env`, and only at its start: `ExecStartPre`
+# renders the template with `envsubst`, taking `realm` from `CROSSBAR_PUBLIC_HOSTNAME`
+# (`deploy/coturn.conf:27`) and `external-ip` from `CROSSBAR_TURN_EXTERNAL_IP`. The switch
+# rewrites `.env`, so a relay left running across one keeps advertising the mode the box
+# just left -- and coturn starts happily on a stale value, so it shows up as media that will
+# not relay rather than as a configuration error. Restarting it here is what makes the relay
+# part of the same switch instead of a second thing an operator has to remember.
+#
+# `try-restart` rather than `restart`: it acts only on a unit that is already running, so a
+# deployment with no relay configured is left alone rather than being pulled in and started
+# by a mode switch. `-` because this is best-effort even so: a box where the unit does not
+# exist answers systemctl with an error rather than the no-op, and a shaper that has already
+# moved the front door must not report itself failed over the relay it was never asked to
+# have.
 ExecStart=-/usr/bin/systemctl try-restart crossbar-turn.service
