@@ -8,25 +8,39 @@ step-by-step for installing a second household.
 
 > **Verification status — 2026-09-26.**
 >
-> Written by reading the code and the unit files. **No agent has connected to production**,
-> and the unit files could not be run where this was written: they were authored on macOS,
-> which has no `systemd-analyze`, and production is not ours to touch. So the integration
-> owner has **not yet** verified:
+> Written by reading the code and the unit files. The integration owner has since **run it on
+> production** — a real box, a real tailnet, a real public hostname — and what that measured is
+> recorded with each claim below and in §3.4. Still **not** verified:
 >
-> - the unit files at all — `deploy/*.service` and `crossbar-backup.timer` are read, not run;
->   the real check (`sudo systemd-analyze verify`) and the first switch happen on the box:
-> - the switch overlap and its grace window (§3.4). The units in this tree still close the
->   old door **first**; opening first and closing on a timer is the design the mode work
->   lands, and the trust-posture claims it rests on are to be measured on a scratch host;
+> - ~~the unit files at all~~ — `sudo systemd-analyze verify` is clean on all of them, and both
+>   modes have been switched against the live deployment: `crossbar-private`, `crossbar-public`,
+>   both grace units, `caddy` and `crossbar-turn` were each observed doing their job, including
+>   the relay's realm following the mode. `scripts/rehearse-switch.sh` has still never been
+>   executed anywhere — it says on its first line not to run it on a deployment anybody is using,
+>   which is now the reason not to;
+> - ~~the switch overlap in a running box (§3.4)~~ — **measured on production, 2026-09-26**: the
+>   new door opened before the old one closed, both doors answered for the whole window, the
+>   close fired from its own timer, and the guard refused a stale grace left over from the other
+>   mode. §3.4 records the responses;
 > - whether a switch made from the **console** (§3.1) reshapes the box. The console exits the
 >   process for systemd's `Restart=always` to start again rather than running
 >   `systemctl restart`, and whether that re-runs the two shaping units is not established
->   here. §3.4 says what to check;
+>   here. What was measured is the writer the console's switch goes through, under the unit's own
+>   hardening and as the service user — it succeeds (§3.2). The route itself has not been driven
+>   end to end, because that needs a browser session;
 > - the backup timer firing, and the restore in §4.4 being rehearsed. `runBackup` is covered
 >   by tests in this tree; the unit wiring and the restore were not;
-> - `origin` in `GET /api/health` (§3.5). It is specified and lands with the mode work; the
->   response in this tree carries `status`, `mode` and `version` only;
-> - the full server test suite on the merged tree.
+> - ~~`origin` in `GET /api/health`~~ (§3.5) — present and in use: a real device compared it,
+>   adopted the new origin and kept its device key, across both directions of a switch;
+> - the four distribution scripts (`scripts/install.sh`, `release.sh`, `upgrade.sh`,
+>   `uninstall.sh`). `bash -n` is clean on all of them and every `--dry-run` was read on macOS —
+>   where there is no systemd, so a real run refuses at that check and says so. The tarball in
+>   §5.1 was built for real and its checksum verified, and the parts of `upgrade.sh` that decide
+>   the verdict (`/api/health` over loopback, the version field, and the failure direction) were
+>   exercised against a stub. **No install, upgrade or uninstall has been run on a Linux host**:
+>   that is the rehearsal host, and §2.10 and §5.1 list what to check there;
+> - ~~the full server test suite on the merged tree~~ — 177 tests, 177 pass, 0 fail, 0 skipped,
+>   the operator path's five and the `doctor` checks' five included.
 >
 > Everywhere a step depends on one of those, the text says so rather than reading as measured.
 
@@ -74,8 +88,8 @@ are to be measured on a scratch host** — see §3.4.
   forwards ports, whether the hostname resolves — **the software cannot see any of that**.
   §8 is the list of those facts.
 - A non-root account that owns the checkout. Everything below assumes `admin` and
-  `/home/admin/crossbar`, which is what the unit files hard-code; a different user or path
-  means editing the units (§2.5).
+  `/home/admin/crossbar`, which is what the unit files in `deploy/` hard-code; a different user
+  or path is what `scripts/install.sh --prefix … --user …` renders the units for (§2.5).
 - **Node 22.5.0 or newer** (`package.json` `engines`). The server uses `node:sqlite`
   (`DatabaseSync`, `VACUUM INTO`), which does not exist in older Node. Check with
   `node --version` before anything else.
@@ -89,8 +103,27 @@ cd /home/admin/crossbar
 npm ci --omit=dev
 ```
 
-There is no build step and no installer. Two runtime dependencies (`ws`, `web-push`) plus
-Node's own `node:sqlite`, and nothing to compile.
+There is no build step: two runtime dependencies (`ws`, `web-push`) plus Node's own
+`node:sqlite`, and nothing to compile.
+
+**`scripts/install.sh` is §2.2–§2.6 as one command**, and is the path to prefer. It does the same
+steps in the same order, with the refusals written down where they cannot be forgotten:
+
+```bash
+sudo scripts/install.sh --dry-run                          # every command, nothing run
+sudo scripts/install.sh                                    # in place, as admin, at /home/admin/crossbar
+sudo scripts/install.sh --prefix /home/other --user other   # a second household elsewhere
+```
+
+It renders the unit files' hardcoded paths for this host (§2.5), stops before installing anything
+if there is no directory file yet (§2.4), creates the data directory, installs dependencies as the
+account that owns the tree, enables the service **and the backup timer**, and finishes by waiting
+for `/api/health` — so "installed" means answering rather than "the files are in `/etc`". It also
+refuses on a host without systemd rather than reporting success with no service; on macOS, where
+this was written, that refusal is the whole of a real run.
+
+Everything below is what it is doing, and what to do by hand if you would rather — or if a step
+fails and you want to see it.
 
 ### 2.3 `.env`
 
@@ -115,6 +148,9 @@ Fill in, at minimum:
 - **One block per mode this deployment can be reached in** — `NETWORK_MODE_PRIVATE_HOSTNAME` /
   `_ORIGIN` and `NETWORK_MODE_PUBLIC_HOSTNAME` / `_ORIGIN` / `_BIND_ADDRESS`. A mode whose
   block is empty is refused at switch time, leaving the file as it was.
+- Optionally, **the switch window** — `CROSSBAR_SWITCH_GRACE_SECONDS`, in seconds, default 900
+  (fifteen minutes). It is read by the mode units, not by the server, and it is not in
+  `.env.example`; add the line only to change the window. See §3.4.
 - `CROSSBAR_ADMIN_PASSWORD_HASH` via `node src/admin.js password`, not by hand.
 
 Do **not** fill in the generated section (between the `>>> the configuration in force >>>`
@@ -123,10 +159,16 @@ markers): that is written by the switch. Do not leave a copy of one of its names
 `CROSSBAR_BIND_ADDRESS`, `TRUST_TAILSCALE_HEADERS`, `CROSSBAR_REQUIRE_DEVICE_AUTH`) anywhere
 else in the file — a switch refuses when you do (§3.2).
 
+**And no name twice, anywhere in the file.** The server takes the **first** match for a name, so a
+line appended below an existing one looks set and is not: on the live box an appended
+`NETWORK_MODE_PUBLIC_BIND_ADDRESS=` was silently dead because the first public block won. A
+duplicate is not refused, and not warned about — it is simply ignored.
+
 `.env` is read by systemd (`EnvironmentFile=` in every unit), by the server, and — through a
-drop-in — by Caddy. Writes go through the data directory (staging `.env.writing`, keeping
-`env.previous`) rather than in place, which is why `crossbar.service`'s `ReadWritePaths` names
-the data directory and `.env` and nothing more.
+drop-in — by Caddy. There is one writer (`writeEnvFile` in `src/config.js`): it keeps a copy of
+the file it replaces at `<DATA_DIR>/env.previous` (mode 0600) and then writes `.env` **in place**,
+which is why `crossbar.service`'s `ReadWritePaths` names the data directory and `.env` and
+nothing more. Why in place rather than a staged rename, and what that costs, is in §3.2.
 
 ### 2.4 The directory file — required, not optional
 
@@ -145,6 +187,11 @@ The server will not start without it. The three refusals, in the order you will 
 
 The file is the source of truth for people, contacts and groups and is re-applied to the
 database on every start; see §7 for what it does and does not require of a person.
+
+`scripts/install.sh` refuses to continue while the file is missing, and says which one to write —
+the first of the three refusals above, caught before a service is installed rather than after it
+fails to start. It reads the path out of `DIRECTORY_CONFIG_PATH` in `.env` when that is set, so a
+deployment that keeps the file somewhere else is checked in the right place.
 
 ### 2.5 Units
 
@@ -177,15 +224,24 @@ journalctl -u crossbar-turn -f
 `Wants=crossbar-public.service crossbar-private.service` is not live and neither shaping unit
 runs at all — the box looks configured and has no front door.
 
-**A second household at a different user or path has to edit the units first.** The paths are
-literal, not templated: `User=admin`, `Group=admin`,
-`WorkingDirectory=/home/admin/crossbar`, `EnvironmentFile=/home/admin/crossbar/.env`,
-`ExecStart=/usr/bin/node /home/admin/crossbar/src/server.js`, `ExecStart=/usr/bin/node
+**The paths in `deploy/` are production's literals.** They are not templates: `User=admin`,
+`Group=admin`, `WorkingDirectory=/home/admin/crossbar`,
+`EnvironmentFile=/home/admin/crossbar/.env`, `ExecStart=/usr/bin/node
+/home/admin/crossbar/src/server.js`, `ExecStart=/usr/bin/node
 /home/admin/crossbar/src/backup.js`, and `ReadWritePaths=/home/admin/crossbar/data
-[/home/admin/crossbar/.env]` in the server and backup units; the same
-`EnvironmentFile` plus `/home/admin/crossbar/.env` in the two mode units' `ExecCondition`
-greps; and `/etc/crossbar/coturn.conf` in the relay unit. Nothing else about the software is
-site-specific.
+[/home/admin/crossbar/.env]` in the server and backup units; the same `EnvironmentFile` plus
+`/home/admin/crossbar/.env` in the two mode units' `ExecCondition` greps and in their
+grace-window `systemd-run` lines; and `/etc/crossbar/coturn.conf` in the relay unit.
+
+**A second household at a different user or path does not edit them.** `scripts/install.sh`
+substitutes those literals at install time — the prefix from `--prefix`/`CROSSBAR_HOME`, the
+account from `--user`/`CROSSBAR_USER`, and `/usr/bin/node` for the node binary it finds and checks
+is 22.5.0 or newer — and installs the result into `/etc/systemd/system`. So the file systemd reads
+is the file a person can read back from `/etc`, the copies here stay a working example of a default
+deployment rather than a form valid nowhere, and an upgrade re-renders them from the tree it
+installed (§5.3). Installing the files by hand for a non-default user or path means rewriting those
+same lines yourself; the installer's `--dry-run` prints the diff it would make, which is the
+quickest way to see them all.
 
 ### 2.6 First start, and the first checks
 
@@ -199,6 +255,10 @@ sudo systemctl status crossbar
 
 Expected shapes for all three are in §6; `doctor` is the one that answers "can a phone
 actually reach this", so run it before handing anybody an invitation.
+
+`scripts/install.sh` ends by printing exactly these commands, as the deployment's own account
+(`sudo -u admin node src/admin.js …`), with the server already started and `/api/health` already
+answering — so if the installer has just finished, start from `doctor`.
 
 ### 2.7 The first phone
 
@@ -256,7 +316,9 @@ environment substitution, so the file holds `${CROSSBAR_*}` references and
 the values from the same `.env` the server reads. The shared secret is therefore never
 committed and the rendered copy lives on a tmpfs.
 
-The install commands are with the other units (§2.5). Then set
+The install commands are with the other units (§2.5), and `scripts/install.sh` installs the relay
+unit and `/etc/crossbar/coturn.conf` by itself when `turnserver` is on `PATH` (it says which it
+did; `--with-relay` forces it). Then set
 `CROSSBAR_TURN_HOST=<CROSSBAR_PUBLIC_HOSTNAME>` and a `CROSSBAR_TURN_SHARED_SECRET`
 (`openssl rand -hex 32`) in `.env`, and restart the relay and the server so the ICE list the
 server hands out names the relay that is actually running. The relay refuses to start if the
@@ -271,6 +333,28 @@ expected mode and origin, `doctor` is all `OK`, the console answers at `/admin`,
 phone has enrolled and rung another one. Until the relay has been exercised by a real call
 that could not go direct, "the relay works" is untested — the doctor's TURN line says
 `reachability only, not an allocation` for exactly that reason.
+
+`scripts/install.sh` checks the second of those for you (`/api/health` answers, and with which
+version) and prints the rest as its next steps. **The first real install happens on the rehearsal
+host, by the integration owner**, and these are the parts of it nothing on a workstation could
+have run:
+
+1. `sudo scripts/install.sh --dry-run` first, and read it: the unit diff it prints is the whole
+   substitution, and nothing below should be a surprise.
+2. Then the real run. It should end with `health: {"status":"ok",…}` and the next steps. If it
+   refuses, it refuses before installing a unit — the messages name the file to write, and the
+   account or group that is missing.
+3. `systemctl status crossbar crossbar-backup.timer` — the service **active (running)**, the timer
+   **active (waiting)** with a next elapse. A timer that is not waiting is a backup that never runs.
+4. `systemctl list-timers crossbar-backup.timer`, then `sudo systemctl start crossbar-backup.service`
+   once and check `ls -lt data/backups/` — the wiring, which no test covers.
+5. `sudo systemd-analyze verify /etc/systemd/system/crossbar.service` (and the other four) against
+   the **rendered** files, which is also the check §2.5's literals were written against.
+6. A second `sudo scripts/install.sh` — it must change nothing and end healthy, which is the
+   idempotency claim, and
+7. `sudo scripts/uninstall.sh` without `--purge-data`, then `data/` and `.env` are still there and
+   a re-install picks them up. `--purge-data` is the destructive half and is worth doing last, on
+   the deployment nobody needs.
 
 ---
 
@@ -295,6 +379,10 @@ established here; §3.4 says how to check, and the CLI below is the path this ru
 written for.
 
 ### 3.2 The one command, and what it says
+
+Run it from the checkout: the CLI reads `.env` from the working directory (`./.env`), not from
+the directory of the script, so `cd /home/admin/crossbar` first — the same directory systemd's
+`WorkingDirectory=` names.
 
 `node src/admin.js mode` with no argument lists both blocks, marks the one in force, and
 answers whether the file loads as a process would read it:
@@ -348,15 +436,41 @@ What it refuses, and why:
   laptop with a dev server — and the mode's own block is where a deployment writes it; the
   refusal exists because a line outside the markers would silently win over the mode and one
   earlier version of this command deleted it instead.
+
+  **The development checkout in this repository refuses for exactly this reason**: its `.env`
+  is hand-written, has no marker lines yet, and carries `PUBLIC_ORIGIN=http://127.0.0.1:3010`
+  at the top level, so `node src/admin.js mode public` there exits 1 with the message above.
+  That is the rule working, not a regression; remove the line to use the CLI. A file with no
+  markers at all is not refused — the section is appended at the end, leaving your own
+  settings where you put them.
+- **Nothing is written by a refusal.** No change to `.env`, and not even an `env.previous`
+  appears: the mode is worked out before any file is touched.
 - **Damaged markers.** One `MODE_BEGIN`/`MODE_END` line without the other, or the pair the
   wrong way round: `The generated section is damaged: this file has one of its two marker
   lines without the other, or has them the wrong way round. Fix that, then switch.`
 
-The write itself is atomic: content is staged at `<DATA_DIR>/.env.writing` and the file it
-replaces is kept at `<DATA_DIR>/env.previous` before the staged file is renamed into place.
-Both are mode 0600. So after any switch, `env.previous` holds `.env` exactly as it was
-immediately before that write — the first thing to reach for if a switch was interrupted or a
-setting was saved by mistake. It is one generation, not a history.
+The write is **not** atomic, deliberately, and both halves of that were measured. Content goes to
+`.env` itself, keeping `<DATA_DIR>/env.previous` (mode 0600) — the file it replaced, copied before
+the first byte is written, so a copy that fails leaves `.env` exactly as it was. What is given up
+is stated plainly: a crash between the truncate and the last byte leaves a partial `.env`, where a
+staged rename would have left one of the two whole files. It is given up because the rename cannot
+run where the service runs, and because a rename hands `.env` the *staging* file's identity — two
+separate failures, and the design has to survive both:
+
+- **Sandboxed.** Measured on the production box, 2026-09-26, with a probe run under the unit's own
+  hardening (`User=admin`, `ProtectSystem=strict`, `ReadWritePaths=<data> <.env>`): the staged
+  rename failed **`EXDEV`** and the in-place write succeeded, leaving the file at mode 600 under its
+  own owner with `env.previous` holding the old content. The cause is the grant itself — each path
+  `ReadWritePaths` names becomes its own mount, so a rename from the data directory onto `.env`
+  crosses a filesystem. This is the console's path, and it is why fixing the ownership below would
+  not on its own have made the console able to move the box.
+- **Unsandboxed.** Measured on Debian, 2026-09-26: `sudo node src/admin.js mode private` left `.env`
+  owned by `root`, mode 600, correct in every way an operator could see, and the service
+  (`User=admin`) then failed to start with `EACCES … path: '/home/admin/crossbar/.env'` — a symptom
+  in a different process, at the next start, naming a file that looks fine.
+
+`env.previous` is one generation, not a history, and it is the first thing to reach for if a switch
+was interrupted or a setting was saved by mistake (§5.4).
 
 ### 3.3 What the restart applies
 
@@ -375,15 +489,48 @@ that condition is evaluated against the *manager's* environment, so `Environment
 reaches it and it fails in **both** modes. Both units being skipped quietly is worse than
 having none, because the box looks switched and is not.
 
-- **Public mode** runs `tailscale serve --https=443 off`, then `systemctl start caddy`, then
-  `systemctl try-restart crossbar-turn.service`. The tailnet stops *serving*; the node stays
-  joined, because `tailscale down` would take the address with it and coming back means a
-  re-approval. The relay is restarted because coturn's realm and `external-ip` are rendered
-  from `.env` when it starts: a switch that left it running would advertise the old realm,
-  which presents as calls that fail to relay rather than as a configuration error.
-  `try-restart` is used because a deployment without the relay installed must not fail.
-- **Private mode** runs `systemctl stop caddy`, then `tailscale serve --bg ${PORT:-3003}`.
-  `${PORT:-3003}` rather than `$PORT`, so a file without `PORT` does not expand to nothing.
+The units move Caddy with a command rather than a dependency, and that is deliberate. A
+`Conflicts=` or a `Wants=` is resolved while the start is still being planned, *before* any
+condition is read, so a `Conflicts=caddy.service` on the private unit stopped Caddy even on a
+start whose own condition then declined to make it a public one — a public outage decided by a
+check nobody read. A command in `ExecStart` runs only once the check has passed, which is the
+property the switch rests on. Both traps were measured with stand-in units rather than reasoned
+about.
+
+Each unit does three things, in order, and both run `Before=crossbar.service` — so the new door
+is open before the server itself starts:
+
+- **Public mode** opens the new door first — `systemctl start caddy` — and then schedules the
+  tailnet door's close for the end of the window:
+
+  ```
+  ExecStart=-/bin/sh -c '/usr/bin/systemd-run --collect --unit=crossbar-grace-public \
+    --on-active="${CROSSBAR_SWITCH_GRACE_SECONDS:-900}" \
+    /bin/sh -c "/usr/bin/grep -qx CROSSBAR_NETWORK_MODE=public /home/admin/crossbar/.env \
+      && exec /usr/bin/tailscale serve --https=443 off"'
+  ```
+
+  The tailnet stops *serving*; the node stays joined, because `tailscale down` would take the
+  address with it and coming back means a re-approval.
+- **Private mode** opens the tailnet door first — `tailscale serve --bg ${PORT:-3003}` — and then
+  schedules `systemctl stop caddy` the same way, as `crossbar-grace-private`.
+- **Both** then run `systemctl try-restart crossbar-turn.service`, best-effort. coturn's realm
+  and `external-ip` are rendered from `.env` only when it starts, so a relay left running across
+  a switch advertises the realm the box just left — which presents as calls that fail to relay
+  rather than as a configuration error, the expensive way to find out. `try-restart` acts only on
+  a unit that is already running, so a deployment with no relay is left alone.
+
+Two details of those command lines are load-bearing, and both look like mistakes worth "fixing":
+
+- **systemd does not expand `${NAME:-default}` in `Exec*=`** — only `${NAME}`, and the `:-`
+  operator only inside an `EnvironmentFile` being read. Written bare, the expression would reach
+  `systemd-run` as literal text, be refused, and the `-` prefix would swallow it into a switch
+  that never closes the old door. Hence the outer `/bin/sh -c`, whose shell does have the
+  operator — and hence the 900 appearing twice: the `Environment=` floor covers a file that says
+  nothing, and the shell's `:-900` covers a file that says nothing *by setting the value empty*
+  (`CROSSBAR_SWITCH_GRACE_SECONDS=`), which would otherwise expand to `--on-active=`.
+- **`--on-active=` takes a bare number as seconds.** Do not append `s`: `15min` would arrive as
+  `15mins` and be refused.
 
 Both mode units are `oneshot` **without** `RemainAfterExit=yes`, deliberately: a oneshot
 without it goes inactive after running, which is what makes the next restart run it again.
@@ -392,39 +539,65 @@ Adding `RemainAfterExit=yes` would silently stop every future switch from reshap
 Nothing is remembered between switches: the shape is derived from the file on every start, so
 a hand-started Caddy in private mode is stopped by the next start rather than left on.
 
-### 3.4 The grace window (specified; not in the units in this tree yet)
+### 3.4 The grace window
 
-A switch used to close the old door before opening the new one, which is destructive for every
-phone: the app only learns the server moved by reading `/api/health` after authenticating, and
-the old ingress is gone by then, so recovery meant re-enrolment with a hand-issued code.
+A switch opens the new door first and closes the old one **after** the window rather than at
+once. Closing first is destructive for every phone: the app learns that the server moved by
+reading `/api/health`, and the old door is the only address it can ask that on — so a door
+closed before the app has read the answer is a device that has to be re-enrolled with a
+hand-issued code. With the overlap, the app asks the address it already knows, finds an `origin`
+that differs from the one it stored, adopts the address and the mode, and keeps its device key
+(§3.5 and, on the app side, `Core/CallSession.swift`'s `followMovedServer`).
 
-The design that replaces it: **open the new door first, keep the old one for a grace period,
-then close it.**
+- **New way in first**: Caddy in public mode, `tailscale serve` in private mode.
+- **The close is a transient unit** — `crossbar-grace-public` / `crossbar-grace-private`, created
+  by `systemd-run --on-active=…` — so there is no extra unit file to keep in step, and `--collect`
+  unloads it once it has fired so nothing is left behind either.
+- **The window is one setting**: `CROSSBAR_SWITCH_GRACE_SECONDS` in `.env`, in seconds, **900
+  (fifteen minutes) by default**. Each mode unit carries `Environment=CROSSBAR_SWITCH_GRACE_SECONDS=900`
+  as a floor and `.env` wins over it. The variable is not in `.env.example`; add the line to
+  change the window.
+- **The close is guarded.** It re-reads `CROSSBAR_NETWORK_MODE` from `.env` with the same
+  whole-line grep when it fires, not when it was scheduled, so a switch back inside the window
+  keeps the door it just opened. The deferred unit **exits 1 when its guard declines** — that is
+  the guard working, and it appears as one failed `crossbar-grace-public.service` line in the
+  journal, not as a fault. A switch back inside the window needs no second timer: `systemd-run`
+  refuses a name that already exists, the shaper tolerates that (`-`), and the pending timer is
+  the one that does the right thing.
+- `tailscale serve --https=443 off` failing with `handler does not exist` is the state the
+  command asks for — nothing was serving — and is tolerated, as it was when it ran directly.
+- **After every boot** the shapers re-run (the server unit wants them), so the outgoing door can
+  stay as it was for up to the window rather than being closed during boot. A pending transient
+  timer does not survive a reboot; a fresh one is scheduled, so the old door still closes.
 
-- The new way in exists before the old one goes.
-- The close is scheduled as a transient unit — `systemd-run --on-active=<grace>` — so it needs
-  no new unit file and nothing is left behind.
-- **Default grace: 15 minutes**, set by one environment value the units share so it is not
-  folklore. The literal variable name is fixed by the mode work that lands this; it is not in
-  the units in this tree, and neither is the overlap. Until it lands, the units still close
-  first and a switch remains destructive to enrolled phones.
-- During the window both front doors answer. That is safe in both directions because the trust
-  posture follows the **mode**, not the door: in public mode the identity header is not
-  believed at all, so the tailnet door only admits devices holding keys; in private mode Caddy
-  strips the identity headers from outside, and a request with neither header nor device is
-  refused. **Both claims are to be measured on the scratch host** — they are the reason the
-  overlap is safe, and nothing in this tree proves them.
+**This is in the units now, and it has not been measured anywhere.** The units' own comments say
+the posture claims below are measured on the rehearsal host before a deploy;
+`scripts/rehearse-switch.sh` is that measurement — shorten the window with `GRACE=2` (its
+default), and it checks that the old door is still open during the window, that something is
+scheduled to close it, that it closes on its own, and that all of it survives being done in both
+directions. What it does **not** check is `origin` on `/api/health`, and the private-direction
+claim needs a request from outside the host, which a loopback rehearsal cannot make.
+
+During the window both front doors answer. That is safe in both directions because the trust
+posture follows the **mode**, not the door: in public mode the identity header is not believed at
+all, so the tailnet door only admits devices holding keys; in private mode Caddy strips the
+identity headers from outside, and a request with neither header nor device is refused. **Both
+claims are the ones still to be measured** — they are the reason the overlap is safe, and the
+units' comments say so themselves.
 
 If a switch was made from the console rather than the CLI, check the box's shape afterwards:
 
 ```bash
 systemctl is-active caddy
 tailscale serve status
+systemctl list-timers --all | grep crossbar-grace     # a close still pending?
 ```
 
 `caddy` active and tailnet serving off is public mode; `caddy` inactive and `tailscale serve`
-publishing the loopback port is private. If the shaping units did not run, `sudo systemctl
-restart crossbar` applies them.
+publishing the loopback port is private — but inside the window both doors answer on purpose, so
+the third command is what tells you whether the switch has finished. If nothing is pending and
+the shape is wrong, the shaping units did not run: `sudo systemctl restart crossbar` applies
+them.
 
 ### 3.5 How to tell what mode is in force
 
@@ -457,7 +630,14 @@ curl -fsS https://<NETWORK_MODE_PUBLIC_HOSTNAME>/api/health
 ```
 
 And the box's shape, which is not the same as either: `systemctl is-active caddy` and
-`tailscale serve status` (§3.4).
+`tailscale serve status` (§3.4). Inside the grace window **both doors answer on purpose**, so
+those two alone cannot tell you a switch has finished. Look for the close that is still pending:
+
+```bash
+systemctl list-timers --all | grep crossbar-grace
+systemctl status crossbar-grace-public.timer      # or crossbar-grace-private.timer
+journalctl -u 'crossbar-grace-*' -n 20            # closes that have fired, and their exit status
+```
 
 ### 3.6 What is unsafe mid-switch
 
@@ -465,12 +645,26 @@ And the box's shape, which is not the same as either: `systemctl is-active caddy
   restart, the file says public and the process is still private. `mode` reads the file;
   `status` and `/api/health` read the process. They must disagree in that window — that is the
   command working as designed, not a fault.
-- **A second switch inside the grace window.** By construction, the first switch's scheduled
-  close still fires. Switch private → public at T (public opens, private closes at T+15) and
-  then public → private at T+5 (private opens, public closes at T+20), and at T+15 the first
-  schedule closes the private door the second switch just opened. Wait the window out — or
-  check `systemctl list-timers --all | grep run-` for the pending transient unit — before
-  switching back.
+- **A second switch inside the grace window.** This is *handled* rather than forbidden: the
+  deferred close re-reads the mode when it fires, so switching back inside the window leaves the
+  door the second switch opened alone, and the journal shows one failed `crossbar-grace-*.service`
+  line where the guard declined. What is worth knowing is that the first switch's timer is still
+  pending until it fires, `systemd-run` will refuse to create a second one under the same name
+  (`-`, on purpose), and a switch back therefore closes nothing extra — the pending timer is
+  already the right one.
+- **Expecting the box to look switched immediately.** After a switch the outgoing door stays open
+  for up to `CROSSBAR_SWITCH_GRACE_SECONDS`, and after every boot too, because the shapers run on
+  every start. In public mode that means the tailnet is still serving, and in private mode that
+  Caddy is still up, until the timer fires. That is the overlap, not a stuck unit — and it is the
+  window in which an already-enrolled phone finds the new address.
+- **Administering a public deployment.** The CLI carries an *operator path* for exactly this: it
+  sends `X-Crossbar-Operator`, an HMAC of a fixed string keyed by `CROSSBAR_SESSION_SECRET`, which
+  the server believes only from loopback and only when the value matches in constant time. So
+  `node src/admin.js ring --from <login> --to <person>` works in both modes, and the token is
+  derived rather than stored, which rotates it with the session secret. What it cannot fix is a
+  *browser*: the public ingress strips the header (`Caddyfile`, with the identity headers), and a
+  browser cannot compute the token anyway, so the console still needs a device key — administer
+  through the CLI, or over the tailnet.
 - **Hand-editing the generated section, or restarting mid-edit.** The next switch overwrites
   it; a generated name left outside it makes the next switch refuse; and a hand edit skips the
   verification the CLI does. Edit the mode's own block (`NETWORK_MODE_*`) instead.
@@ -670,13 +864,33 @@ and every device key — to keep them somewhere at least as private as the box.
 
 ## 5. Runbook: upgrading and rolling back
 
-### 5.1 What does not exist yet
+### 5.1 The commands that do this
 
-**There is no installer, no `upgrade` command and no `uninstall` command.** A later phase adds
-them; this section describes what an operator does today, by hand, and says which parts are
-therefore error-prone. What does exist is a version to compare (§5.2) and an automatic
-snapshot before a database migration (§5.4), which together make the honest procedure below
-recoverable.
+Four scripts, each with `--dry-run`, which prints every command it would run — including the unit
+rendering of §2.5 — and executes none:
+
+| Command | What it is |
+| --- | --- |
+| `scripts/release.sh [--out DIR]` | builds `crossbar-server-<version>.tar.gz` and the `.sha256` beside it, from a clean tree |
+| `scripts/install.sh [--prefix DIR] [--user NAME] [--source DIR] [--with-relay]` | §2.2–§2.6 as one command (§2.2) |
+| `scripts/upgrade.sh --from <tarball>` | stop, snapshot, unpack, install, start, verify, roll back (§5.3) |
+| `scripts/uninstall.sh [--prefix DIR] [--user NAME] [--purge-data]` | stop and remove the units; `--purge-data` for the data directory and `.env` (§5.6) |
+
+They are also `npm run release`, `npm run deploy`, `npm run upgrade` and `npm run uninstall`;
+extra arguments go after `--`, as in `npm run deploy -- --dry-run`. The three that act on a
+deployment take their defaults from `CROSSBAR_HOME` (`/home/admin/crossbar`) and `CROSSBAR_USER`
+(`admin`); `release.sh` builds where you tell it to and knows nothing about a host.
+
+What they deliberately do not do: nothing here knows how a tarball reaches a host — no remote, no
+`git push`, no SSH — so the transport (a bundle, `rsync`, `scp`, a USB stick) is still the
+operator's; nothing configures Caddy, DNS, port forwards, the firewall or the relay (§2.8, §2.9,
+§8); nothing carries backups off the box (§4.7); and nothing commits anything. `release.sh`
+refuses a tree with uncommitted changes, because an artefact that cannot be reproduced from a
+commit cannot be returned to; `--allow-dirty` builds one anyway, which is for a rehearsal.
+
+The scripts were written and their `--dry-run` read on macOS, which has no systemd: **the first
+real install, upgrade and uninstall happen on the rehearsal host, by the integration owner**, and
+§2.10 lists what to check there.
 
 ### 5.2 Where the version is reported
 
@@ -689,7 +903,46 @@ curl -fsS https://<public host>/api/health
 question the CLI cannot answer, because the CLI may be a different checkout from the one the
 service runs. That is the check after an upgrade: same command, different version.
 
+The same `package.json` names the tarball (`crossbar-server-0.1.0.tar.gz`, §5.1), so there are
+three places this one string appears: the artefact's name, the version `npm` sees, and what the
+running process answers. `scripts/upgrade.sh` reads it from the tarball's own `package.json` and
+refuses to call the upgrade healthy unless `/api/health` reports exactly that — which is how a
+restart that never took the new tree shows up as a failure rather than as a quiet no-op.
+
 ### 5.3 Upgrading
+
+Two commands, on two machines. On the machine with the repository, from a clean tree:
+
+```bash
+scripts/release.sh --out /tmp/release        # crossbar-server-0.1.0.tar.gz + .sha256
+```
+
+and on the deployment host, as root:
+
+```bash
+sudo scripts/upgrade.sh --from /tmp/release/crossbar-server-0.1.0.tar.gz --dry-run   # read it first
+sudo scripts/upgrade.sh --from /tmp/release/crossbar-server-0.1.0.tar.gz
+```
+
+What the upgrade does, in order, and why each step is where it is: it stops `crossbar` (a snapshot
+of a database somebody is writing is not a snapshot of anything); takes one with `src/backup.js`
+from the tree still in place, and **starts the old service again and stops** if that fails, because
+an upgrade with no way back is not one to run; unpacks the tarball beside the running tree and runs
+`npm ci --omit=dev` there, so a bad dependency or a truncated artefact is found while the
+deployment is still the one that works; swaps the two trees while carrying `data/` and `.env`
+across — they are this host's, and the tarball carries neither; reinstalls the units from the new
+tree, rendered for this host's paths; starts, and asks `/api/health` for its version. A version
+other than the one in the tarball, or no answer within 30 seconds, is a **rollback**: the previous
+tree comes back, the database is restored from the snapshot, the previous units are reinstalled,
+and the service is started again — §5.5 is the same order by hand.
+
+After a healthy upgrade the tree that was replaced is kept at `/home/admin/crossbar.previous`, with
+no `data/` or `.env` in it (one copy of those is the deployment; a second would be a second thing
+to lose). It is what a later manual rollback moves back, and it is one generation deep, like
+`env.previous`.
+
+The same thing by hand, which is also what to fall back on when the transport is the problem or a
+step has to be watched:
 
 ```bash
 cd /home/admin/crossbar
@@ -711,12 +964,12 @@ journalctl -u crossbar -n 50 --no-pager
 
 There is no remote configured in the checkout this was written in, and the software cannot
 see how the code arrives: whatever transport the box uses (a remote you set up, a bundle as
-the earlier migration used, `rsync`) is the operator's. Nothing in the server needs a network
-connection to upgrade — the two dependencies are installed from npm, and `node:sqlite` is
-Node's own.
+the earlier migration used, `rsync`, or the tarball of §5.1) is the operator's. The only network
+the upgrade itself needs is `npm ci` reaching the registry (or a populated npm cache); there is no
+build step and `node:sqlite` is Node's own.
 
-**If `deploy/*.service` changed, the code update does not install it.** Units live in
-`/etc/systemd/system`, so re-install and reload:
+**If `deploy/*.service` changed, the code update does not install it** — `scripts/upgrade.sh` does;
+a by-hand upgrade has to. Units live in `/etc/systemd/system`, so re-install and reload:
 
 ```bash
 sudo install -m 644 deploy/crossbar.service deploy/crossbar-public.service \
@@ -727,7 +980,9 @@ sudo systemctl restart crossbar
 ```
 
 Keep the previous copies of any unit you replace, so a rollback of the units is a copy back
-rather than a rewrite.
+rather than a rewrite. For a non-default user or path, `scripts/install.sh --dry-run` prints the
+rendered result of these lines — the substitution §2.5 describes — which is easier than rewriting
+them by hand.
 
 ### 5.4 The pre-migration snapshot
 
@@ -756,6 +1011,14 @@ copy is one that may be neither. So after a failed upgrade, the first place to l
 database, and §4.4's second procedure with that file is the way back.
 
 ### 5.5 Rolling back
+
+`scripts/upgrade.sh` performs the order below by itself, the moment the new build does not answer
+`/api/health` with its own version — the previous tree, the snapshot, and the units that go with
+them, then a start and a health check of their own. This section is what it is doing, and what to
+use when the failure shows up later: a migration that only misbehaves under real traffic, a relay
+that stops relaying, a phone that stops ringing. The previous tree is kept at
+`/home/admin/crossbar.previous` (§5.3), and `/home/admin/crossbar.failed-<stamp>` holds the tree
+that failed, for the journal and the diff.
 
 Roll back in this order, and stop as soon as the server is healthy again:
 
@@ -791,11 +1054,27 @@ run is a plan, not a procedure.
 
 ### 5.6 Removing a deployment
 
-There is no uninstall command. Today it is the install in reverse — `sudo systemctl disable
---now crossbar crossbar-backup.timer crossbar-turn` (and the two shaping units are reached
-through `crossbar`), remove the unit files from `/etc/systemd/system`, `daemon-reload`, and
-then the checkout and `data/` are ordinary files you delete yourself. **Before deleting them,
-take the two things in §4.1 off the machine**, because that is the only place they exist.
+```bash
+sudo scripts/uninstall.sh --dry-run          # the units it would remove, and nothing else
+sudo scripts/uninstall.sh
+```
+
+It stops and disables the units, removes them from `/etc/systemd/system`, removes the relay's
+rendered template at `/etc/crossbar/coturn.conf` and an emptied `/etc/crossbar`, and runs
+`daemon-reload`. **It leaves the checkout, `.env` and `data/` where they are** — the database,
+the directory file and the backups, the two things in this deployment that cannot be
+reconstructed — and says so at the end, so removing the units is a thing you can undo by
+installing them again. `--purge-data` also deletes `data/` and `.env`, names both before it does,
+and refuses unless the prefix looks like a Crossbar checkout first.
+
+**Before either of those, take the two things in §4.1 off the machine**, because that is the only
+place they exist. The account is left in place too; `userdel -r` deletes its home directory, which
+is where the checkout is, so it is the last step and not the first.
+
+By hand it is the same sequence: `sudo systemctl disable --now crossbar crossbar-backup.timer
+crossbar-turn` (the two shaping units have no `[Install]` and are reached through `crossbar`),
+remove the unit files, `daemon-reload`, and then the checkout and `data/` are ordinary files you
+delete yourself.
 
 ---
 
@@ -869,28 +1148,32 @@ file as it was before that change is kept beside it, at `data/directory.json.bef
 ## 7. The directory, and logins
 
 A person is found by their tailnet login wherever a proxy names the caller, so a person without
-one has no identity: they cannot reach the service, and the console lists them without one.
-That is a state to fix rather than a reason to refuse to run — a deployment must never be
-switched into a mode it cannot start in — so the server starts with a directory whose people
-have no login, and the file is read and shown as it is. Only `directory.validate()` applies the
-rule, and it applies it to what may be *written*: adding or changing a person from the console
-asks for a login where a login is identity. `read()` and the store do not enforce it, which is
-what lets a directory be looked at, and so repaired.
+one has no identity: they cannot be reached by it, and the console lists them without one. That
+is a state to fix rather than a reason to refuse to run — a deployment must never be switched
+into a mode it cannot start in — so the server starts with a directory whose people have no
+login, and the file is read and shown as it is. The rule is about what may be *written*: in
+private mode the console asks for a login when a person is added or changed, which is the same
+switch that decides whether a proxy header is believed, because that header *is* the login
+(`requireLogins = config.trustTailscaleHeaders`).
 
-**An open item, measured 2026-09-24.** In private mode the console refuses **every** directory
-edit while any person in the file lacks a login, with
+**What was an open item on 2026-09-24 is fixed.** The console used to refuse **every** directory
+edit while any person in the file lacked a login —
 
 ```
 DIRECTORY_INVALID: faisal has no login, and a person is found by theirs here.
 ```
 
-so the console cannot be the place where the missing logins are added, even though it is the
-intended one — the one edit that would fix the directory is blocked by the same rule. The fix
-offered, and not made, is to let it save with a warning instead. Until then the file is edited
-by hand (§4.5 says where the previous version is kept). Two people in that deployment have
-neither a login nor a device, so in private mode they can neither call nor be called; naming
-somebody in the file is not the same as reaching them, and the console shows those two facts
-separately.
+— which meant the console could not be the place where the missing logins were added: the one
+edit that would fix the directory was blocked by the same rule. A directory write no longer
+enforces it (`directoryFile.write(..., { requireLogins: false })`), because a directory the
+server can run is not one it should refuse; the missing logins are reported instead, as
+sentences on the people response (`GET /api/admin/people` → `warnings`, each reading
+`<id> has no login, so nothing finds them by their tailnet identity. They can still use this
+server from a device that has enrolled.`) and shown by the console on the directory card.
+
+Two people in that deployment have neither a login nor a device, so in private mode they can
+neither call nor be called; naming somebody in the file is not the same as reaching them, and
+the console shows those two facts separately.
 
 A person taken out of the file keeps their row, because calls, participants and devices all
 point at it, so `node src/admin.js users` can list somebody who is no longer in the directory
@@ -1009,10 +1292,23 @@ A home address is not a fixed one, and both halves of this deployment name it.
 
 The templates are read from `/etc`, not from the checkout: `crossbar-turn.service` runs as
 `turnserver`, and a home directory is mode 0700, so it cannot open anything under
-`/home/admin` at all. Install these files, then hand Caddy and coturn the same environment file
-the server reads (§2.8, §2.9).
+`/home/admin` at all. Install these files — `scripts/install.sh` does, rendered for this host's
+paths (§2.5) — then hand Caddy and coturn the same environment file the server reads (§2.8,
+§2.9).
 
-The unit files and this document are the deployment surface. The rest of the software — the
-config surface, the API, the directory — is described from the code in the server repository's
-`src/`, and the console at `/admin` is the same operations as `node src/admin.js` for whoever
-would rather use a browser.
+The other half of the deployment surface is `scripts/`, which stays in the checkout rather than
+going to `/etc`:
+
+| File | What it is |
+| --- | --- |
+| `install.sh` | §2.2–§2.6 as one command (§2.2) |
+| `release.sh` | the versioned tarball and its checksum (§5.1) |
+| `upgrade.sh` | stop, snapshot, unpack, install, verify, roll back (§5.3, §5.5) |
+| `uninstall.sh` | stop and remove the units; `--purge-data` for the data (§5.6) |
+| `rehearse-switch.sh` | the mode-switch rehearsal, which must not be run on a live deployment (§3.4) |
+| `lib/deploy.sh` | what the four share: the unit rendering, the health check, the transcript |
+
+The unit files, this document and those scripts are the deployment surface. The rest of the
+software — the config surface, the API, the directory — is described from the code in the server
+repository's `src/`, and the console at `/admin` is the same operations as `node src/admin.js` for
+whoever would rather use a browser.
