@@ -39,6 +39,18 @@ step-by-step for installing a second household.
 >   the verdict (`/api/health` over loopback, the version field, and the failure direction) were
 >   exercised against a stub. **No install, upgrade or uninstall has been run on a Linux host**:
 >   that is the rehearsal host, and §2.10 and §5.1 list what to check there;
+> - the installer's **onboarding phase** — the setup wizard and the front door it installs
+>   (§2.2.1, `scripts/lib/deploy.sh`). `bash -n` is clean on both files; `--dry-run` was read on
+>   macOS against a scratch prefix and prints the whole phase (the wizard command, the directory
+>   file it writes, and the front door plan for the mode the answers file names) while creating
+>   nothing. The phase's own functions were then driven against two scratch prefixes with a real
+>   Node 22: with `--answers` they wrote a complete tree — the private block in `.env`, a
+>   generated 64-hex session secret, `DATA_DIR`/`DIRECTORY_CONFIG_PATH` rendered for the scratch
+>   prefix, and `data/directory.json` with one administrator — a second run kept the session
+>   secret and rewrote the same directory file, and with no answers and no terminal the phase
+>   refused, named `--answers`, and wrote no directory file. **What that does not cover is the
+>   real thing**: no Linux host, so `npm ci`, the units, `/api/health` and the Caddy install and
+>   `caddy validate` were never run — §2.10 is the list;
 > - ~~the full server test suite on the merged tree~~ — 177 tests, 177 pass, 0 fail, 0 skipped,
 >   the operator path's five and the `doctor` checks' five included.
 >
@@ -113,19 +125,84 @@ steps in the same order, with the refusals written down where they cannot be for
 sudo scripts/install.sh --dry-run                          # every command, nothing run
 sudo scripts/install.sh                                    # in place, as admin, at /home/admin/crossbar
 sudo scripts/install.sh --prefix /home/other --user other   # a second household elsewhere
+sudo scripts/install.sh --answers /root/answers.json        # unattended: the wizard is not asked anything (§2.2.1)
+sudo scripts/install.sh --no-setup                          # today's behaviour: write .env and the directory file by hand first
 ```
 
-It renders the unit files' hardcoded paths for this host (§2.5), stops before installing anything
-if there is no directory file yet (§2.4), creates the data directory, installs dependencies as the
-account that owns the tree, enables the service **and the backup timer**, and finishes by waiting
-for `/api/health` — so "installed" means answering rather than "the files are in `/etc`". It also
-refuses on a host without systemd rather than reporting success with no service; on macOS, where
-this was written, that refusal is the whole of a real run.
+It renders the unit files' hardcoded paths for this host (§2.5), runs the setup wizard to write
+the mode blocks, the session secret and the directory file (§2.2.1), creates the data directory,
+installs dependencies as the account that owns the tree, enables the service **and the backup
+timer**, and finishes by waiting for `/api/health` — so "installed" means answering rather than
+"the files are in `/etc`". It also refuses on a host without systemd rather than reporting
+success with no service; on macOS, where this was written, that refusal is the whole of a real
+run.
 
 Everything below is what it is doing, and what to do by hand if you would rather — or if a step
 fails and you want to see it.
 
+### 2.2.1 The setup wizard — what the installer now asks
+
+`scripts/install.sh` no longer stops over a missing directory file. Between copying the code and
+running `npm ci` it runs the deployment's own wizard, `node src/admin.js setup`, in `$PREFIX` and
+as the deployment's own account — the account that owns the two files it writes. The wizard needs
+nothing but Node's standard library and the tree that is already there (`src/setup.js` loads
+`src/diagnostics` lazily, and reports the probe as unrunnable), which is why it can run before
+`node_modules` exists.
+
+What it asks, and where each answer lands:
+
+| it asks | it writes |
+| --- | --- |
+| which modes this deployment is reached in (`--mode private`, `public` or `both`) | one block per mode, `NETWORK_MODE_<MODE>_*` in `.env` |
+| the hostname and origin of each mode, and the public bind address | the same block (§2.3) |
+| who is in the directory — `id, display name, login, admin` per person | the directory file (§2.4) |
+| the relay host and secret, APNs, Web Push — each optional, each skippable | the names in `.env` |
+| nothing about the session secret | it generates one, or keeps the one the file holds |
+
+A value the deployment already holds is offered as the default, so a second run over a configured
+deployment changes only what it was told to; secrets are kept unless `--new-secrets` is passed.
+Nothing is written until the whole `.env` it composes is complete and the directory is valid, so a
+refusal costs nothing.
+
+```bash
+sudo scripts/install.sh --answers /root/answers.json   # every answer from one JSON file
+sudo scripts/install.sh --browser                      # the wizard's browser front end instead of the terminal
+```
+
+`--answers` is passed straight to the wizard, whose `--answers <file>` takes the same keys it does
+(`node src/admin.js setup --help`). It has to be readable by the deployment's account, because
+that is who the wizard runs as; a file only root can read is refused before anything runs. Every
+question is also answerable by flag, and the installer passes none of those through — put them in
+the file.
+
+**With no `--answers`, no `--browser` and no terminal on stdin, the installer refuses.** It names
+what to pass and writes nothing: a wizard that cannot answer its own questions must stop rather
+than write a `.env` it cannot complete, and the same refusal is what `--no-ask` is for at the
+wizard level.
+
+Then the front door, for exactly the modes the wizard set up:
+
+- **public** — the installer installs Caddy (`apt install caddy`, §2.8), writes the
+  `EnvironmentFile=` drop-in that gives it this `.env`, installs `deploy/Caddyfile` as
+  `/etc/caddy/Caddyfile`, and runs `caddy validate` for the public block's hostname and bind
+  address. It does **not** start Caddy: public mode's shaper unit does, on every start while
+  public mode is in force (§2.5). A step that fails stops the install with the reason — a public
+  deployment with no door is the one thing worse than one that refused.
+- **private** — nothing is installed. `tailscale serve` is run by the private shaper unit, and the
+  login behind it is a browser flow a person does; the installer says so and moves on.
+
+`--no-setup` turns the phase off and installs exactly what this script did before there was a
+wizard: `.env` is a template you edit by hand (§2.3), the directory file has to exist already
+(§2.4), and nothing touches Caddy.
+
 ### 2.3 `.env`
+
+**The setup wizard writes this file.** `scripts/install.sh` runs it (§2.2.1), and it fills a block
+for each mode it was told about, generates `CROSSBAR_SESSION_SECRET` if the file holds none, and
+leaves the rest of the template as it is; `node src/admin.js setup` in the deployment runs the same
+wizard by hand, which is the way to change one mode on a box that is already up. The commands
+below are the by-hand path — what `--no-setup` leaves you to do, and the reference for what each
+line means.
 
 ```bash
 cp .env.example .env
@@ -155,6 +232,13 @@ Fill in, at minimum:
   `.env.example`; add the line only to change the window. See §3.4.
 - `CROSSBAR_ADMIN_PASSWORD_HASH` via `node src/admin.js password`, not by hand.
 
+On the installer's path `DATA_DIR`, `DIRECTORY_CONFIG_PATH` and `WEB_ROOT` are already rendered
+for this host: `.env.example` carries production's literals (`/home/admin/crossbar/…`), the
+installer rewrites those three lines for `--prefix` before the wizard runs, and a value you have
+edited is left alone. By hand, at a prefix other than `/home/admin/crossbar`, they are yours to
+set — and the wizard reads `DIRECTORY_CONFIG_PATH` out of the file to decide where the directory
+file goes, so getting them wrong writes it outside the deployment.
+
 Do **not** fill in the generated section (between the `>>> the configuration in force >>>`
 markers): that is written by the switch. Do not leave a copy of one of its names
 (`PUBLIC_ORIGIN`, `CROSSBAR_PUBLIC_HOSTNAME`, `CROSSBAR_NETWORK_MODE`,
@@ -174,6 +258,12 @@ nothing more. Why in place rather than a staged rename, and what that costs, is 
 
 ### 2.4 The directory file — required, not optional
 
+**The setup wizard writes this file too.** `scripts/install.sh` runs it (§2.2.1) and it writes the
+people it was given — the `people` key of an `--answers` file or the terminal's
+`id, display name, login, admin` lines — through the same validator the server uses, at the path
+`.env`'s `DIRECTORY_CONFIG_PATH` names. `node src/admin.js setup` in the deployment runs the same
+wizard by hand. The block below is the by-hand path, what `--no-setup` leaves you to do.
+
 ```bash
 cp data/directory.example.json data/directory.json
 chmod 600 data/directory.json
@@ -190,10 +280,11 @@ The server will not start without it. The three refusals, in the order you will 
 The file is the source of truth for people, contacts and groups and is re-applied to the
 database on every start; see §7 for what it does and does not require of a person.
 
-`scripts/install.sh` refuses to continue while the file is missing, and says which one to write —
-the first of the three refusals above, caught before a service is installed rather than after it
-fails to start. It reads the path out of `DIRECTORY_CONFIG_PATH` in `.env` when that is set, so a
-deployment that keeps the file somewhere else is checked in the right place.
+`scripts/install.sh --no-setup` refuses to continue while the file is missing, and says which one
+to write — the first of the three refusals above, caught before a service is installed rather than
+after it fails to start. It reads the path out of `DIRECTORY_CONFIG_PATH` in `.env` when that is
+set, so a deployment that keeps the file somewhere else is checked in the right place. Without
+`--no-setup` the wizard writes the file instead, and the install continues.
 
 ### 2.5 Units
 
@@ -245,6 +336,14 @@ installed (§5.3). Installing the files by hand for a non-default user or path m
 same lines yourself; the installer's `--dry-run` prints the diff it would make, which is the
 quickest way to see them all.
 
+**The prefix must not be under `/tmp`.** `crossbar.service` is `PrivateTmp=true`, so the service
+gets its own `/tmp` and `ReadWritePaths=/tmp/…/.env` names a path that does not exist inside the
+unit's namespace. Measured on the rehearsal host, 2026-09-26: installing at `/tmp/xb-scratch`
+completed through the units and the restart, and then the service refused to start with
+`Failed to set up mount namespacing: /run/systemd/unit-root/tmp/xb-scratch/.env: No such file or
+directory` (status 226/NAMESPACE), so the installer's own `/api/health` check was what caught it —
+the same check that makes "installed" mean "answering". Use a real directory (`/home/<account>/…`).
+
 ### 2.6 First start, and the first checks
 
 ```bash
@@ -281,6 +380,17 @@ optional.
 
 ### 2.8 Public mode: Caddy, DNS, ports
 
+**The installer does the mechanical half of this for a public deployment** (§2.2.1): it installs
+Caddy, writes the `EnvironmentFile=` drop-in below, installs `deploy/Caddyfile` as
+`/etc/caddy/Caddyfile`, and runs `caddy validate` for the public block's hostname and bind address.
+It does not start Caddy itself — public mode's shaper unit does, on the install's own
+`systemctl restart crossbar` and on every later start while public mode is in force (§2.5) — so a
+deployment installed as public has Caddy up when the install finishes, and one installed as private
+(a `both` deployment, say) has it installed and validated but stopped until the switch to public.
+What is left is the part software cannot do: the DNS record, the port forwards and the firewall
+(§8.1, §8.2). A public install that did not ask for the wizard (`--no-setup`), or one whose Caddy
+came from somewhere else, is the by-hand path below.
+
 Caddy comes from the project's own package repository (`apt install caddy`). It needs
 `CROSSBAR_PUBLIC_HOSTNAME` and `CROSSBAR_BIND_ADDRESS` in its own environment, and the right
 way to give it them is the same file the server reads rather than a second copy of the value:
@@ -293,6 +403,11 @@ sudo systemctl edit caddy
 [Service]
 EnvironmentFile=/home/admin/crossbar/.env
 ```
+
+(`systemctl edit` writes `/etc/systemd/system/caddy.service.d/override.conf`; the installer writes
+the same directive to `…/caddy.service.d/crossbar-env.conf` instead, so an upgrade of Caddy — which
+replaces its own unit — does not take the drop-in with it. `systemctl cat caddy` reads the unit and
+every drop-in together, which is where to look for what is in force.)
 
 Then `sudo systemctl restart caddy`. Nothing else from `.env` is used by Caddy, and `PORT`
 only matters if the server does not listen on 3003.
@@ -342,19 +457,28 @@ host, by the integration owner**, and these are the parts of it nothing on a wor
 have run:
 
 1. `sudo scripts/install.sh --dry-run` first, and read it: the unit diff it prints is the whole
-   substitution, and nothing below should be a surprise.
-2. Then the real run. It should end with `health: {"status":"ok",…}` and the next steps. If it
-   refuses, it refuses before installing a unit — the messages name the file to write, and the
-   account or group that is missing.
-3. `systemctl status crossbar crossbar-backup.timer` — the service **active (running)**, the timer
+   substitution, and nothing below should be a surprise. In the onboarding phase it also prints
+   the wizard's command and the front door it would install, and the wizard writes nothing.
+2. Then the real run. It should show the wizard's summary and its check block, and end with
+   `health: {"status":"ok",…}` and the next steps. If it refuses, it refuses before installing a
+   unit — with `--answers` or a terminal the directory file is written, so a refusal there is the
+   wizard naming an answer it is missing; with `--no-setup` the messages name the file to write,
+   and either way the account or group that is missing is named.
+3. Caddy, for a public deployment: `caddy validate --config /etc/caddy/Caddyfile` exits 0 and
+   `systemctl cat caddy` shows the `crossbar-env.conf` drop-in with `EnvironmentFile=` pointing at
+   this `.env`. With the install finished, `systemctl status caddy` is active when public mode is
+   in force — the shaper unit started it on the restart — and not running when private mode is,
+   which is the door the tailnet provides instead. `sudo tailscale up` is the one step here that
+   is a person's, and nothing on a workstation can do it.
+4. `systemctl status crossbar crossbar-backup.timer` — the service **active (running)**, the timer
    **active (waiting)** with a next elapse. A timer that is not waiting is a backup that never runs.
-4. `systemctl list-timers crossbar-backup.timer`, then `sudo systemctl start crossbar-backup.service`
+5. `systemctl list-timers crossbar-backup.timer`, then `sudo systemctl start crossbar-backup.service`
    once and check `ls -lt data/backups/` — the wiring, which no test covers.
-5. `sudo systemd-analyze verify /etc/systemd/system/crossbar.service` (and the other four) against
+6. `sudo systemd-analyze verify /etc/systemd/system/crossbar.service` (and the other four) against
    the **rendered** files, which is also the check §2.5's literals were written against.
-6. A second `sudo scripts/install.sh` — it must change nothing and end healthy, which is the
-   idempotency claim, and
-7. `sudo scripts/uninstall.sh` without `--purge-data`, then `data/` and `.env` are still there and
+7. A second `sudo scripts/install.sh` — it must change nothing, keep the session secret, and end
+   healthy, which is the idempotency claim; and
+8. `sudo scripts/uninstall.sh` without `--purge-data`, then `data/` and `.env` are still there and
    a re-install picks them up. `--purge-data` is the destructive half and is worth doing last, on
    the deployment nobody needs.
 
@@ -897,7 +1021,7 @@ rendering of §2.5 — and executes none:
 | Command | What it is |
 | --- | --- |
 | `scripts/release.sh [--out DIR]` | builds `crossbar-server-<version>.tar.gz` and the `.sha256` beside it, from a clean tree |
-| `scripts/install.sh [--prefix DIR] [--user NAME] [--source DIR] [--with-relay]` | §2.2–§2.6 as one command (§2.2) |
+| `scripts/install.sh [--prefix DIR] [--user NAME] [--source DIR] [--with-relay] [--answers FILE] [--browser] [--no-setup]` | §2.2–§2.6 as one command (§2.2), with the setup wizard (§2.2.1) |
 | `scripts/upgrade.sh --from <tarball>` | stop, snapshot, unpack, install, start, verify, roll back (§5.3) |
 | `scripts/uninstall.sh [--prefix DIR] [--user NAME] [--purge-data]` | stop and remove the units; `--purge-data` for the data directory and `.env` (§5.6) |
 
@@ -1326,12 +1450,12 @@ going to `/etc`:
 
 | File | What it is |
 | --- | --- |
-| `install.sh` | §2.2–§2.6 as one command (§2.2) |
+| `install.sh` | §2.2–§2.6 as one command, the setup wizard and front door included (§2.2, §2.2.1) |
 | `release.sh` | the versioned tarball and its checksum (§5.1) |
 | `upgrade.sh` | stop, snapshot, unpack, install, verify, roll back (§5.3, §5.5) |
 | `uninstall.sh` | stop and remove the units; `--purge-data` for the data (§5.6) |
 | `rehearse-switch.sh` | the mode-switch rehearsal, which must not be run on a live deployment (§3.4) |
-| `lib/deploy.sh` | what the four share: the unit rendering, the health check, the transcript |
+| `lib/deploy.sh` | what the four share: the unit rendering, the health check, the transcript, and the onboarding phase (§2.2.1) |
 
 The unit files, this document and those scripts are the deployment surface. The rest of the
 software — the config surface, the API, the directory — is described from the code in the server

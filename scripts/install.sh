@@ -6,11 +6,14 @@
 #
 #   1. the account (§2.1), the deployment directory, and the code — the checkout it lives in, or
 #      `--source` copied to `--prefix`;
-#   2. the data directory, and the `.env` the server reads (seeded from `.env.example` and left
-#      for a person to fill in);
-#   3. **the directory file**, which it refuses to continue without — the server will not start
-#      without one, and an install that finishes "successfully" over a missing directory file is
-#      a service that crash-loops for a reason the operator has to go and find;
+#   2. the data directory, and the `.env` the server reads (seeded from `.env.example`, with the
+#      template's production paths rendered for this host);
+#   3. **onboarding** — `node src/admin.js setup` (§2.2.1, §2.3–§2.4), run in `$PREFIX` as the
+#      deployment's own account: it writes the mode blocks, the secrets and the **directory
+#      file** in one pass, and then the front door the chosen modes need — Caddy for a public
+#      block, a report that Tailscale's own login belongs to the person for a private one
+#      (§2.8). `--no-setup` turns it off and reproduces what this script did before: the
+#      directory file has to exist already, and it says exactly what to write when it does not;
 #   4. `npm ci --omit=dev` in the deployment's own account;
 #   5. the units, rendered for this host's paths and installed, `daemon-reload`, the service
 #      enabled and started, and the backup **timer** enabled — the backup service has no
@@ -24,17 +27,23 @@
 # the first reboot.
 #
 # Usage:
-#   sudo scripts/install.sh [--prefix DIR] [--user NAME] [--source DIR] [--with-relay] [--dry-run]
+#   sudo scripts/install.sh [--prefix DIR] [--user NAME] [--source DIR] [--with-relay]
+#                           [--answers FILE] [--browser] [--no-setup] [--dry-run]
 #
 #   --prefix DIR   where the deployment runs        (env CROSSBAR_HOME, default /home/admin/crossbar)
 #   --user NAME    the account that runs it         (env CROSSBAR_USER, default admin)
 #   --source DIR   the tree to install from         (default: the checkout this script is in)
+#   --answers FILE the wizard's answers, as `node src/admin.js setup --answers` takes them, for an
+#                  install that is not watched
+#   --browser      the wizard's browser front end (`--browser`) instead of the terminal questions
+#   --no-setup     do not run the wizard: the directory file has to be there already
 #   --with-relay   install the coturn relay unit even if it is not obvious this host relays
 #   --dry-run      print every command and change nothing
 #
 # Idempotent: every step either already holds or is re-applied, so a second run is how a unit that
-# was edited by hand gets put back, and how a host that failed at §3 above is finished after the
-# file is written.
+# was edited by hand gets put back, and how a host that failed at the missing directory file is
+# finished after the file is written. The wizard is part of that: it offers what the file already
+# holds as the default, keeps the secrets that are in it, and changes only what it was told to.
 
 set -euo pipefail
 
@@ -47,6 +56,9 @@ PREFIX="${CROSSBAR_HOME:-/home/admin/crossbar}"
 CROSSBAR_USER="${CROSSBAR_USER:-admin}"
 SOURCE="$(cd "$SCRIPT_DIR/.." && pwd)"
 WITH_RELAY=''
+ANSWERS=''
+BROWSER=''
+NO_SETUP=''
 
 usage() {
     usage_from "$0"
@@ -57,12 +69,24 @@ while [ "$#" -gt 0 ]; do
         --prefix) [ "$#" -ge 2 ] || die '--prefix needs a directory'; PREFIX="$2"; shift 2 ;;
         --user)   [ "$#" -ge 2 ] || die '--user needs an account name'; CROSSBAR_USER="$2"; shift 2 ;;
         --source) [ "$#" -ge 2 ] || die '--source needs a directory'; [ -d "$2" ] || die "--source $2 is not a directory"; SOURCE="$(cd "$2" && pwd)"; shift 2 ;;
+        # Absolute, because the wizard resolves `--answers` against its own working directory —
+        # which is `$PREFIX` — so a relative path the operator typed here would be looked for in
+        # the deployment instead of where they typed it.
+        --answers) [ "$#" -ge 2 ] || die '--answers needs a file'; [ -f "$2" ] || die "--answers $2 is not a file"; ANSWERS="$(cd "$(dirname "$2")" && pwd)/$(basename "$2")"; shift 2 ;;
+        --browser) BROWSER=1; shift ;;
+        --no-setup) NO_SETUP=1; shift ;;
         --with-relay) WITH_RELAY=1; shift ;;
         --dry-run) DRY_RUN=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) die "unknown argument: $1 (try --help)" ;;
     esac
 done
+
+# `--answers` and `--browser` are answers to the wizard's questions, and this flag says there is no
+# wizard: together they are a typo that would otherwise install nothing and say nothing about why.
+if [ -n "$NO_SETUP" ] && { [ -n "$ANSWERS" ] || [ -n "$BROWSER" ]; }; then
+    die '--no-setup turns the setup wizard off, so --answers and --browser have nothing to run: pass one or the other'
+fi
 
 # The two values that end up inside a unit file, refused unless they are shaped like what they are
 # (§`require_path` in the library). Checked before anything runs, so a typo costs nothing.
@@ -83,7 +107,8 @@ say "account: $CROSSBAR_USER"
 say "node:    $NODE_BIN  ($NODE_VERSION)"
 if [ "$DRY_RUN" = '1' ]; then
     say 'dry run: every command below is printed and none is executed, and nothing is refused for'
-    say '         being missing — a real run stops at the directory file and at a missing systemd.'
+    say '         being missing — a real run stops at a missing systemd, and at the directory file'
+    say '         only when --no-setup was passed.'
 else
     # The host's own capability first, then the privilege: on a machine without systemd the
     # operator cannot fix it by trying again with sudo, and being told "run as root" there sends
@@ -161,9 +186,22 @@ else
         die "there is no $PREFIX/.env and no $SOURCE/.env.example to start one from: copy the template into place yourself (deploy/README.md §2.3), then run this again"
     fi
     run install -o "$CROSSBAR_USER" -g "$CROSSBAR_USER" -m 0600 "$SOURCE/.env.example" "$PREFIX/.env"
-    say 'seeded .env from .env.example. It is a template: HOST/PORT, DATA_DIR, DIRECTORY_CONFIG_PATH,'
-    say 'CROSSBAR_SESSION_SECRET and one block per mode have to be filled in before this is useful'
-    say '(deploy/README.md §2.3).'
+    if [ -n "$NO_SETUP" ]; then
+        say 'seeded .env from .env.example. It is a template: HOST/PORT, DATA_DIR, DIRECTORY_CONFIG_PATH,'
+        say 'CROSSBAR_SESSION_SECRET and one block per mode have to be filled in before this is useful'
+        say '(deploy/README.md §2.3).'
+    else
+        say 'seeded .env from .env.example. The setup wizard below fills in both mode blocks, the session'
+        say 'secret and the directory file, and the paths this host needs (deploy/README.md §2.3).'
+    fi
+fi
+
+# Only the wizard path renders the template's production paths: it is the wizard that reads
+# `DATA_DIR` and `DIRECTORY_CONFIG_PATH` out of this file and writes the directory file to where
+# they point, and a second household at another prefix would otherwise get it written under
+# `/home/admin/crossbar`. `--no-setup` edits and installs over the file by hand, as it did before.
+if [ -z "$NO_SETUP" ]; then
+    render_env_paths
 fi
 
 # The two paths the server will read, from the file the server will read. `deployment_port` and
@@ -200,11 +238,19 @@ if [ "$DRY_RUN" != '1' ]; then
     done
 fi
 
-# ── 4. The directory file: refuse, loudly, and say exactly what to write ────────
-# The refusal lives in a function so that a dry run prints the message a real run would give,
-# word for word, rather than a summary of it. That matters on a workstation, which is where
-# somebody plans an install before they have the host: the fix is a file they have to write, and
-# the plan should be where they read what goes in it.
+# ── 4. Onboarding: the wizard, the directory file, and the front door ──────────
+# The server refuses to start without a directory file, so this phase is where that file comes
+# from: `node src/admin.js setup` (deploy/README.md §2.2.1) is the wizard, it needs nothing but
+# the standard library and the tree copied above, and it writes the mode blocks, the session
+# secret and the directory file in one pass — nothing written until the whole `.env` it composes
+# is complete. It runs before `node_modules` exists, which is why it is here and not after
+# `npm ci`.
+#
+# `--no-setup` turns it off and reproduces what this install did before there was a wizard: the
+# directory file has to be there already, and the refusal below says exactly what to write. That
+# refusal lives in a function so a dry run prints the message a real run would give, word for
+# word, rather than a summary of it: somebody planning an install on a workstation should read
+# what goes in the file, not a description of a check.
 refuse_missing_directory_file() {
     cat >&2 <<EOF
 
@@ -230,21 +276,41 @@ refuse_missing_directory_file() {
    other two refusals (no people, no administrator who is not suspended), are in
    deploy/README.md §2.4.
 
+   Or leave it to the wizard, which writes this file from the people you name: run this without
+   \`--no-setup\`, with \`--answers <file>\` or at a terminal.
+
    Nothing was installed: no unit was written and no service was enabled. What is already at
    $PREFIX (the account, the data directory, \`.env\`) is left as it is and is safe to keep.
 EOF
 }
 
-step 'the directory file'
-if [ -f "$DIRECTORY_PATH" ]; then
-    say "a directory file is in place: $DIRECTORY_PATH"
-elif [ "$DRY_RUN" = '1' ]; then
-    say 'a real run stops here, with this (and installs no unit):'
-    refuse_missing_directory_file
-    say ''
+if [ -n "$NO_SETUP" ]; then
+    step 'the directory file'
+    if [ -f "$DIRECTORY_PATH" ]; then
+        say "a directory file is in place: $DIRECTORY_PATH"
+    elif [ "$DRY_RUN" = '1' ]; then
+        say 'a real run stops here, with this (and installs no unit):'
+        refuse_missing_directory_file
+        say ''
+    else
+        refuse_missing_directory_file
+        exit 1
+    fi
 else
-    refuse_missing_directory_file
-    exit 1
+    step 'onboarding'
+    onboard_deployment "$ANSWERS" "$BROWSER"
+    if [ "$DRY_RUN" = '1' ]; then
+        say "a real run writes the directory file at $DIRECTORY_PATH before it installs a unit"
+    else
+        if [ ! -f "$DIRECTORY_PATH" ]; then
+            # The wizard answers for its own outputs (`writeDeployment` refuses rather than
+            # half-write), so this is the two paths disagreeing rather than a missing write: `.env`
+            # was rendered for this host above, and the wizard read it. Worth stopping over — it is
+            # the file the server will not start without.
+            die "the wizard finished but there is no directory file at $DIRECTORY_PATH: the path .env names and the path the wizard wrote are not the same. Nothing else was installed."
+        fi
+        say "the directory file is in place: $DIRECTORY_PATH"
+    fi
 fi
 
 # ── 5. Dependencies ─────────────────────────────────────────────────────────────
@@ -335,7 +401,9 @@ say '  journalctl -u crossbar -f                            # what it is saying'
 say '  systemctl list-timers crossbar-backup.timer          # the daily backup, and when it next runs'
 say '  systemctl status crossbar crossbar-backup.timer'
 say ''
-say 'Public mode also needs Caddy: the drop-in that gives it this .env, the Caddyfile, DNS, the'
-say 'port forwards and the firewall — all of it in deploy/README.md §2.8, and the host facts the'
-say 'software cannot see in §8. The relay is §2.9.'
+say 'A public deployment'"'"'s Caddy, its Caddyfile and the drop-in that hands it this .env were'
+say 'installed and validated in the onboarding phase. What is left is what software cannot see:'
+say 'the DNS record, the port forwards, the firewall, and the address the router forwards to —'
+say 'deploy/README.md §2.8, with the host facts in §8. A private deployment needs `tailscale up`,'
+say 'which is a browser login a person does. The relay is §2.9.'
 exit 0

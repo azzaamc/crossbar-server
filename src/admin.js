@@ -16,7 +16,6 @@ const { loadConfig, applyMode, modeBlock, modeConfigured, writtenMode, MODES, se
 const { operatorToken, OPERATOR_HEADER } = require('./identity');
 const { Store } = require('./db');
 const auth = require('./auth');
-const { diagnose, summariseResults } = require('./diagnostics');
 
 const USAGE = `Crossbar administration
 
@@ -35,7 +34,60 @@ const USAGE = `Crossbar administration
   password                               Set the console's password, prompted
   ring --from <id> --to <id>              Ring a device, to test that it does
   doctor                                 Reachability and first-install checks
+  setup                                  Ask what a fresh deployment needs, write it, and check it
+  setup --answers <file> --skip-checks   Every answer from a file, for a second household
+  setup --browser                        The same wizard as a temporary page, with a one-time code
+  setup --help                           Every question, and the flag that answers it
 `;
+
+const SETUP_USAGE = `node src/admin.js setup — ask what a fresh deployment needs, write it, and check it
+
+  Every question is answerable by flag, and every answer by a file. Without a terminal every
+  answer has to come from one of the two: nothing is guessed for a value that changes what this
+  deployment does, and what is missing is named rather than defaulted.
+
+    --mode <private|public|both>      which configurations this deployment is reached in
+    --in-force <private|public>       which of them the file is put in
+                                      (default: the one it already says, else private)
+    --private-hostname <name>         the tailnet name this deployment is reached at
+    --private-origin <url>            the origin invitations carry (default https://<hostname>)
+    --public-hostname <name>          the name Caddy serves
+    --public-origin <url>             the origin invitations carry (default https://<hostname>)
+    --public-bind-address <address>   the address Caddy binds — never a wildcard
+    --people <json|@file>             the directory: [{ "id": …, "name": …, "login": …, "admin": … }]
+    --directory <file>                or a directory file to use as the people
+    --turn-host <host>                the relay, if this deployment runs one; blank for none
+    --turn-secret <secret>            its shared secret (generated when a host is given)
+    --vapid-public-key <key>          Web Push, for browser clients
+    --vapid-private-key <key>
+    --vapid-subject <mailto:|url>
+    --apns-key-id <id>                APNs, for ringing a phone whose screen is off
+    --apns-team-id <id>
+    --apns-key-path <file>
+    --apns-topic <bundle id>
+    --session-secret <secret>         signs sessions (generated when the file holds none)
+    --new-secrets                     generate new secrets even though the file holds some
+    --password                        run \`node src/admin.js password\` afterwards
+    --answers <file>                  all of the above as one JSON object
+    --no-ask                          never prompt; refuse naming what is missing
+    --skip-checks                     do not probe DNS or STUN afterwards
+
+  --browser serves the same questions as a form on a temporary page, and hands what is typed
+  to the same engine this command runs — so the two cannot answer differently. It prints a URL
+  and a one-time code; every request without the code is refused, the code is single-use and
+  expires, and the page exits when setup finishes, on Ctrl-C, or when the code does. Nothing is
+  written until the answers are complete, and a failed write puts back what it replaced.
+
+    --bind <address>                  the address the page listens on (default 127.0.0.1)
+    --force                           start even though this deployment is already set up
+
+  A wider bind is the one case the code is not merely extra: this connection is not encrypted,
+  so use it on a network you already trust, and nowhere else. A deployment whose mode block is
+  already complete is refused without --force, because the page rewrites what it finds.
+
+  Answers from a flag win over the same answer in the file. A value the deployment already
+  holds is the default offered, so a second run over a configured deployment changes nothing
+  it was not told to change; a mode not being set up is left exactly as it is.`;
 
 function parseArgs(argv) {
     const [command, ...rest] = argv;
@@ -261,6 +313,59 @@ async function main(argv) {
     // question is about, and it is also one `loadConfig` refuses.
     if (command === 'mode' && options.configured !== undefined) {
         return modeConfiguredExitCode(options.configured, positional[0]);
+    }
+
+    // Handled before `loadConfig`, deliberately. The file this is asked to repair is one
+    // `loadConfig` refuses — a public block whose hostname line is still empty is precisely the
+    // state setup exists for — so it reads the names it needs out of the file itself. It is also
+    // the one command that runs before `npm ci`: `src/setup.js` needs nothing but the standard
+    // library, which is why nothing here requires it until it is asked for.
+    if (command === 'setup') {
+        if (options.help === true) { console.log(SETUP_USAGE); return 0; }
+        if (positional.length) {
+            console.error(`setup takes no bare arguments, and ${positional.join(' ')} is not one it reads.`
+                + ' Every answer is a flag, or a key in the file passed to --answers.');
+            return 1;
+        }
+        const { runSetup, SetupRefusal, answersFromOptions, makeAsker } = require('./setup');
+        // A terminal is asked only when there is one and it was not refused, so a script piping
+        // answers in never blocks on a prompt it cannot see. The browser page is the asker when it
+        // is used, so nothing here opens a readline interface that would compete with it.
+        const asker = process.stdin.isTTY && options['no-ask'] !== true && options.browser !== true
+            ? makeAsker() : null;
+        try {
+            if (options.browser === true) {
+                // `--browser`, `--bind` and `--force` are this command's own flags rather than
+                // answers, so they are taken out before the rest is read as answers: what is left
+                // is exactly what `--answers` and the answer flags would have given the engine.
+                const { browser, bind, force, ...given } = options;
+                const { serveSetupPage } = require('./setup-page');
+                const page = await serveSetupPage({
+                    dir: process.cwd(),
+                    answers: answersFromOptions(given),
+                    bind: typeof bind === 'string' ? bind : null,
+                    force: force === true,
+                    check: options['skip-checks'] !== true,
+                });
+                const outcome = await page.done;
+                if (outcome.status === 'set-up') return 0;
+                if (outcome.status === 'interrupted') return 130;
+                return 1;
+            }
+            await runSetup({
+                dir: process.cwd(),
+                answers: answersFromOptions(options),
+                ask: asker ? asker.ask : null,
+                check: options['skip-checks'] !== true,
+            });
+            return 0;
+        } catch (error) {
+            if (!(error instanceof SetupRefusal)) throw error;
+            console.error(error.message);
+            return 1;
+        } finally {
+            if (asker) asker.close();
+        }
     }
 
     const config = loadConfig();
@@ -535,6 +640,12 @@ async function main(argv) {
             }
 
             case 'doctor': {
+                // Required here rather than at the top of the file, because `diagnostics` is the
+                // only module this CLI reaches that needs `node_modules` (through `ws`) — and
+                // `setup` runs on a fresh host *before* `npm ci`, so a top-level require would
+                // stop that command with `Cannot find module 'ws'` on exactly the host it exists
+                // for. Nothing else in this file uses the module.
+                const { diagnose, summariseResults } = require('./diagnostics');
                 // The store is a check like any other here, and on a first install it is the
                 // one that fails first: there is no directory file yet. It is reported on its
                 // own line with the sentence that says which path and what to do, rather than

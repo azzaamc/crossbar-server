@@ -16,6 +16,10 @@
 #     against the literal paths the files in `deploy/` are written with.
 #   * `run`, which prints a step before it happens, dry run or not. A dry run's transcript *is*
 #     the deliverable; a real run's transcript is what the operator has when it went wrong.
+#   * The onboarding phase — the setup wizard and the front door it can install. Only
+#     `install.sh` calls it today, and it is here for the two properties the rest of this file
+#     exists for: every command it would run is printed by `--dry-run`, and it can be driven
+#     against a scratch prefix on a machine with no systemd.
 #
 # Written against bash 3.2 on purpose: the tarball is built on a Mac and installed on Debian, and
 # both machines have to be able to read these scripts. No arrays, no `${var,,}`, no `local -n`.
@@ -334,4 +338,206 @@ install_units() { # install_units <unit-dir> <unit>...
     done
     rm -rf "$tmp"
     run systemctl daemon-reload
+}
+
+# ── Onboarding: the setup wizard, and the front door it can install ─────────────
+# `install.sh` runs this between copying the code and `npm ci`. The wizard is `src/setup.js`
+# through `node src/admin.js setup`, and it loads nothing but the standard library and the tree
+# that is already in `$PREFIX` (`src/setup.js` requires `src/diagnostics` lazily, and says so
+# when the probe is not installed yet). That is why it can run before `node_modules` exists, and
+# why the directory file it writes is in place before a unit is installed rather than being the
+# thing the install refuses over.
+
+# The three settings `.env.example` carries as production's literals, rewritten for this host
+# exactly as the unit files are. The wizard reads the deployment's paths out of `.env`
+# (`readState` in `src/setup.js`), so a second household at another prefix would otherwise have
+# its directory file written to `/home/admin/crossbar/data/directory.json` — outside the
+# deployment it is installing, and a path nothing else on that host reads.
+#
+# Anchored to the whole line, so a value an operator has already edited is left alone, and only
+# the wizard path calls it: `--no-setup` installs over the file a person edits, as it did before.
+render_env_paths() { # render_env_paths
+    if [ ! -f "$PREFIX/.env" ]; then
+        # A dry run has copied nothing and seeded nothing, so there is no file to render. The
+        # `install` above printed the one that would put it there.
+        would_run "render DATA_DIR, DIRECTORY_CONFIG_PATH and WEB_ROOT in $PREFIX/.env for $PREFIX"
+        return 0
+    fi
+    local tmp
+    tmp="$(mktemp)"
+    # `|` as the delimiter because the substitution is a path and every path has `/` in it; the
+    # literal is `UNIT_PREFIX`, the same one `render_unit` rewrites.
+    if ! sed -e "s|^DATA_DIR=$UNIT_PREFIX/data\$|DATA_DIR=$PREFIX/data|" \
+             -e "s|^DIRECTORY_CONFIG_PATH=$UNIT_PREFIX/data/directory.json\$|DIRECTORY_CONFIG_PATH=$PREFIX/data/directory.json|" \
+             -e "s|^WEB_ROOT=$UNIT_PREFIX/public\$|WEB_ROOT=$PREFIX/public|" \
+             "$PREFIX/.env" > "$tmp"; then
+        rm -f "$tmp"
+        die "could not read $PREFIX/.env to render its paths for this host. Nothing was changed."
+    fi
+    # `cp` onto the file rather than `install`: the seeder above already gave it the deployment's
+    # account as owner and 0600, and `cp` onto an existing file keeps both. An `install -o … -g …`
+    # here would restate the same two facts and be the only place in these scripts that needs an
+    # account with a group of its own name on the machine reading a `--dry-run`-adjacent path.
+    if ! cmp -s "$PREFIX/.env" "$tmp"; then
+        run cp "$tmp" "$PREFIX/.env"
+    fi
+    rm -f "$tmp"
+}
+
+# Whether the wizard can be given answers at all, before anything is written, so the refusal
+# costs nothing. `--answers` is the unattended path and `--browser` is the wizard's own front
+# end; otherwise a person has to be at a terminal, which is the one thing the wizard cannot
+# supply for itself. With none of the three this refuses rather than starting a wizard that
+# would write a `.env` it cannot complete — the half-install every refusal in `install.sh`
+# exists to prevent. `--no-ask` is the wizard's own form of this refusal, passed below whenever
+# stdin is not a terminal.
+require_setup_answers() { # require_setup_answers <answers-file-or-''> <browser-or-''>
+    if [ -n "$1" ] || [ -n "$2" ]; then
+        # The wizard runs as the deployment's account, so an answers file root can read and that
+        # account cannot — `/root/answers.json` mode 0600, which is how secrets are kept — would
+        # reach the wizard as "No answers file at …". Said here with that reason, before the run.
+        if [ -n "$1" ] && [ "$DRY_RUN" != '1' ] && [ "$(id -un 2>/dev/null || true)" != "$CROSSBAR_USER" ]; then
+            if ! runuser -u "$CROSSBAR_USER" -- test -r "$1" 2>/dev/null; then
+                die "$1 is not readable by $CROSSBAR_USER, and the wizard runs as that account, which is what owns the files it writes. Give it read access (its answers include secrets, so 0640 and a shared group, or 0600 owned by $CROSSBAR_USER), or run \`node src/admin.js setup\` by hand as that account. Nothing was installed."
+            fi
+        fi
+        return 0
+    fi
+    if [ ! -t 0 ]; then
+        die "there is no --answers file, no --browser front end and no terminal on stdin, so the setup wizard has nothing to answer it with and the directory file the server needs would not be written. Pass --answers <file> (\`node src/admin.js setup --help\` lists every key), run this from a terminal, or pass --no-setup and write the directory file by hand (deploy/README.md §2.4). Nothing was installed."
+    fi
+}
+
+# The wizard, run in `$PREFIX` and as the deployment's own account: it reads the deployment it
+# is working on from the process's working directory (`runSetup({ dir: process.cwd() })`), and
+# the `.env` and directory file it writes belong to that account, not to root.
+#
+# `--no-ask` is passed whenever stdin is not a terminal so the intent is in the printed command
+# rather than only in the wizard's own guard; a run that still cannot answer refuses with the
+# names it is missing, which the failure below carries up.
+run_setup_wizard() { # run_setup_wizard <answers-file-or-''> <browser-or-''>
+    local answers="$1" browser="$2"
+    require_setup_answers "$answers" "$browser"
+    set -- src/admin.js setup
+    if [ -n "$answers" ]; then set -- "$@" --answers "$answers"; fi
+    if [ -n "$browser" ]; then set -- "$@" --browser; fi
+    if [ ! -t 0 ]; then set -- "$@" --no-ask; fi
+    if [ "$DRY_RUN" = '1' ]; then
+        would_run "cd $PREFIX && $NODE_BIN $*"
+        return 0
+    fi
+    # A subshell for the change of directory: everything after it — the probes, the writers —
+    # resolves against the deployment, and the installer's own working directory is not changed
+    # under the rest of the script.
+    if ! ( cd "$PREFIX" && run_as_user "$NODE_BIN" "$@" ); then
+        die "the setup wizard did not finish, so the directory file it writes is not in place and nothing else was installed. Its own message above says what it was missing; --answers <file> answers all of it in one go, and deploy/README.md §2.3–§2.4 is the by-hand path. What is already under $PREFIX is left as it is."
+    fi
+}
+
+# The mode named in an answers file, for the dry run's benefit only: the real run reads what the
+# wizard wrote. Empty when there is no file, when it does not parse, or when it names no mode —
+# and the plan below then says what would follow either.
+answers_mode() { # answers_mode <file-or-''>
+    if [ -z "$1" ]; then return 0; fi
+    "$NODE_BIN" -e 'try { const held = JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8")); process.stdout.write(typeof held.mode === "string" ? held.mode : ""); } catch (error) { /* the wizard says what is wrong with the file, not this */ }' "$1" 2>/dev/null || true
+}
+
+# The public door: Caddy, the drop-in that hands it the same `.env` the server reads, the
+# Caddyfile, and a validation of the result. Only for a deployment whose public block the wizard
+# filled in, and only as root — this is `apt` and `/etc`.
+#
+# Nothing here starts Caddy. `crossbar-public.service` does, on every `systemctl restart
+# crossbar` while public mode is in force, and it is the unit that owns the door in both
+# directions (`crossbar-private.service` stops it after the grace window). A start here would be
+# a second answer to "which mode is this box in", and the answer that disagrees.
+install_public_front_door() { # install_public_front_door
+    local dropin='/etc/systemd/system/caddy.service.d/crossbar-env.conf' tmp hostname bind
+    if command -v caddy >/dev/null 2>&1; then
+        say 'caddy is already installed'
+    elif ! run apt-get install -y caddy; then
+        die "apt could not install Caddy, and public mode is reached through it. Install it by hand (deploy/README.md §2.8 — its own package repository), then run this again: this step is re-applied, and nothing else about the deployment needs redoing."
+    fi
+
+    # A drop-in rather than an edit of the package's unit: an upgrade of Caddy replaces its unit
+    # and would take an edit with it, and this is a file the installer can state and read back.
+    tmp="$(mktemp)"
+    {
+        printf '[Service]\n'
+        printf '# Crossbar: the values Caddy reads come from the same file the server reads, so there is\n'
+        printf '# one copy of each. Written by scripts/install.sh; deploy/README.md §2.8 is the by-hand form.\n'
+        printf 'EnvironmentFile=%s/.env\n' "$PREFIX"
+    } > "$tmp"
+    run install -D -m 0644 "$tmp" "$dropin"
+    rm -f "$tmp"
+
+    if [ "$DRY_RUN" != '1' ] && [ ! -f "$PREFIX/deploy/Caddyfile" ]; then
+        die "there is no $PREFIX/deploy/Caddyfile to install: the tree at $PREFIX is not one this installer copied. deploy/README.md §2.8 is the by-hand version."
+    fi
+    run install -D -m 0644 "$PREFIX/deploy/Caddyfile" /etc/caddy/Caddyfile
+    # Before the validation, because `caddy validate` is a separate process reading the file
+    # systemd would give the service, and the drop-in is only live after a reload.
+    run systemctl daemon-reload
+
+    # The Caddyfile expands the public hostname and the address to bind. The generated section of
+    # `.env` carries them only for the mode *in force*, so a `both` deployment being installed as
+    # private has an empty `CROSSBAR_BIND_ADDRESS` there even though its public block names one:
+    # validated against the public block's own values, which is what Caddy is handed whenever the
+    # public door is the one open.
+    hostname="$(env_value NETWORK_MODE_PUBLIC_HOSTNAME)"
+    bind="$(env_value CROSSBAR_BIND_ADDRESS)"
+    if [ -z "$bind" ]; then bind="$(env_value NETWORK_MODE_PUBLIC_BIND_ADDRESS)"; fi
+    if [ -z "$hostname" ]; then hostname='<the public hostname the wizard writes>'; fi
+    if [ -z "$bind" ]; then bind='<the public bind address the wizard writes>'; fi
+    if ! run env CROSSBAR_PUBLIC_HOSTNAME="$hostname" CROSSBAR_BIND_ADDRESS="$bind" \
+            PORT="$(deployment_port)" caddy validate --config /etc/caddy/Caddyfile; then
+        die "Caddy is installed but its Caddyfile does not validate for $hostname, so public mode's shaper unit would start a proxy that cannot render it. Fix /etc/caddy/Caddyfile (deploy/README.md §2.8), or run with --no-setup and install the front door by hand."
+    fi
+    say "Caddy is installed, its Caddyfile validates for $hostname, and the drop-in gives it $PREFIX/.env."
+    say "Public mode's shaper unit starts it when the units are installed and the service restarted"
+    say "below; a deployment installed as private has Caddy ready and stopped until the switch. DNS,"
+    say "the port forwards and the firewall are §8."
+}
+
+# The private door is Tailscale's, and its login is an interactive browser flow that belongs to
+# the person: this install can do nothing about it and must not pretend otherwise. Said here
+# rather than left to the next-steps list, because a private deployment whose box is not logged
+# in has no door at all and nothing on the box can open one.
+report_private_front_door() { # report_private_front_door
+    say 'Private mode is reached through `tailscale serve`, and Tailscale'\''s own login is an'
+    say 'interactive browser flow that belongs to the person, not to this install:'
+    say '    sudo tailscale up            # prints the login URL; this box joins the tailnet as whoever approves it'
+    say '    tailscale status             # says who this box is, before anybody is invited'
+    say 'The private shaper unit runs `tailscale serve --bg <port>` on every start, so the route'
+    say 'itself needs nothing here once the box is logged in (deploy/README.md §2.8, §8.1).'
+}
+
+# The front door for the modes the wizard set up. Which those are is read from the file it just
+# wrote — a chosen mode's block names its hostname (`ADDRESS_QUESTIONS` in `src/setup.js` fills
+# one for every mode it is asked to set up) — so there is one answer to "what was chosen" and no
+# second copy to drift. A dry run has no file yet: the answers file names the mode when one was
+# given, and where it does not, the plan says what would follow either.
+install_front_door() { # install_front_door <answers-file-or-''>
+    local public='' private='' mode=''
+    if [ "$DRY_RUN" = '1' ]; then
+        mode="$(answers_mode "$1")"
+        case "$mode" in
+            private) private=1 ;;
+            public) public=1 ;;
+            *) public=1; private=1 ;;
+        esac
+        say "the front door, for the modes the wizard sets up${mode:+ ($mode)}:"
+    else
+        if [ -n "$(env_value NETWORK_MODE_PUBLIC_HOSTNAME)" ]; then public=1; fi
+        if [ -n "$(env_value NETWORK_MODE_PRIVATE_HOSTNAME)" ]; then private=1; fi
+    fi
+    if [ -n "$public" ]; then install_public_front_door; fi
+    if [ -n "$private" ]; then report_private_front_door; fi
+}
+
+# The phase. `--answers` and `--browser` are the installer's passthroughs to the wizard; the
+# front door follows what the wizard wrote rather than what was asked for, so a mode that was
+# not set up installs nothing for it.
+onboard_deployment() { # onboard_deployment <answers-file-or-''> <browser-or-''>
+    run_setup_wizard "$1" "$2"
+    install_front_door "$1"
 }
