@@ -480,7 +480,8 @@ To ring a phone whose screen is off, APNs must be configured (`CROSSBAR_APNS_KEY
 `_TEAM_ID`, `_KEY_PATH`, `_TOPIC` in `.env`); without it the console and `status` say
 `not configured — a phone with its screen off cannot be rung`, and a locked phone simply never
 rings while everything else keeps working. Web Push is the browser's equivalent and is
-optional.
+optional. An APNs key is the Apple **team**'s, not a server's: deployments serving the same app
+share one key id, team id and topic, and each names the `.p8` file wherever it was put.
 
 ### 2.8 Public mode: Caddy, DNS, ports
 

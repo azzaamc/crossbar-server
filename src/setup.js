@@ -791,8 +791,12 @@ async function collectAnswers({ answers, state, asker, terminal, report, generat
     }
 
     // 5. The optional material. Every one of these is skippable, and a deployment that skips one
-    //    says so in the report rather than failing later. The note is said once, and only when
-    //    somebody is there to answer it: a run of nothing but flags is answering, not being asked.
+    //    says so in the report rather than failing later. Each question says so itself as well —
+    //    that a blank answer skips it, and what is lost by doing so — because the note above is
+    //    read once and the question is what a person answers; the owner stopped at the APNs one to
+    //    ask why a key was needed at all when another deployment already held one. The note is said
+    //    once, and only when somebody is there to answer it: a run of nothing but flags is
+    //    answering, not being asked.
     if (asker || terminal) report.note(OPTIONAL_NOTE, 'Optional material');
     const turnHost = await line({
         key: 'turnHost',
@@ -804,22 +808,25 @@ async function collectAnswers({ answers, state, asker, terminal, report, generat
     const pushAnswered = ['apnsKeyId', 'apnsTeamId', 'apnsKeyPath', 'apnsTopic'].some((key) => supplied(key) !== null);
     const apnsKeyId = await line({
         key: 'apnsKeyId',
-        message: 'To ring an iPhone whose screen is off, an Apple push key is needed: its key id from'
-            + ' your Apple developer account (for example: ABC123DE45). Blank to skip — a locked'
-            + ' iPhone will not ring',
+        message: 'Push is optional: blank skips it — a phone whose screen is off cannot be rung.'
+            + ' An APNs key belongs to the Apple team, not to this server, so a deployment serving'
+            + ' the same app can use the key another one already uses: carry across the key id from'
+            + ' your Apple developer account (for example: ABC123DE45), the team id (for example:'
+            + ' TEAM123456) and the topic, the app\'s bundle id (for example: com.example.crossbar).'
+            + ' The .p8 itself is wherever it was put',
         held: state.apns.keyId,
     });
     const apns = { keyId: apnsKeyId, teamId: state.apns.teamId, keyPath: state.apns.keyPath, topic: state.apns.topic };
     if (apnsKeyId || pushAnswered) {
-        apns.teamId = await line({ key: 'apnsTeamId', message: 'APNs: your Apple developer team id (for example: TEAM123456)', held: state.apns.teamId });
-        apns.keyPath = await line({ key: 'apnsKeyPath', message: 'APNs: the .p8 key file on this server (for example: /etc/crossbar/apns.p8)', held: state.apns.keyPath });
+        apns.teamId = await line({ key: 'apnsTeamId', message: 'APNs: the team id the key belongs to (for example: TEAM123456)', held: state.apns.teamId });
+        apns.keyPath = await line({ key: 'apnsKeyPath', message: 'APNs: where the .p8 key file was put on this server (for example: /etc/crossbar/apns.p8)', held: state.apns.keyPath });
         apns.topic = await line({ key: 'apnsTopic', message: 'APNs: the app\'s bundle id (for example: com.example.crossbar)', held: state.apns.topic });
     }
     const webPushAnswered = ['vapidPublicKey', 'vapidPrivateKey', 'vapidSubject'].some((key) => supplied(key) !== null);
     const vapidPublicKey = await line({
         key: 'vapidPublicKey',
-        message: 'To wake a browser tab that is closed, Web Push is needed: its VAPID public key.'
-            + ' Blank to skip — a closed browser cannot be woken',
+        message: 'Web Push is optional: blank skips it — a closed browser cannot be woken. To wake'
+            + ' one, Web Push needs its VAPID public key',
         held: state.vapid.publicKey,
     });
     const vapid = { publicKey: vapidPublicKey, privateKey: state.vapid.privateKey, subject: state.vapid.subject };

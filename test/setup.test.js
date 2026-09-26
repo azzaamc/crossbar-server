@@ -304,6 +304,42 @@ test('the answers file and the answers typed at a prompt produce the same files'
     assert.equal(directoryOf(fromPrompt), directoryOf(fromFile));
 });
 
+test('the optional questions say they can be skipped, and that an Apple key is the team\'s', async (t) => {
+    // The owner stopped at the APNs question to ask why a key was needed when another deployment
+    // already had one. The note above the step had not answered that, and the question's wording is
+    // the only thing a person reads — so what these questions say is the thing under test.
+    const dir = deployment(t);
+    const asked = [];
+    const script = ['', '', '']; // the relay, APNs, then Web Push: each skipped with a blank line
+    const ask = async (prompt) => {
+        asked.push(prompt);
+        return script.shift() ?? '';
+    };
+    await runSetup({ dir, answers: { ...BOTH, people: PEOPLE }, ask, log: () => {}, check: false });
+    assert.equal(script.length, 0, 'every optional question was asked');
+
+    const apns = asked.find((prompt) => /Push is optional/.test(prompt));
+    assert.ok(apns, `the APNs question was asked: ${asked.join(' | ')}`);
+    assert.match(apns, /blank skips it/);
+    assert.match(apns, /a phone whose screen is off cannot be rung/);
+    // The team credential, and the three values another deployment of the same app shares — which
+    // is the answer the owner had to ask for.
+    assert.match(apns, /belongs to the Apple team, not to this server/);
+    assert.match(apns, /key id/);
+    assert.match(apns, /team id/);
+    assert.match(apns, /topic/);
+
+    const webpush = asked.find((prompt) => /Web Push/.test(prompt));
+    assert.ok(webpush, `the Web Push question was asked: ${asked.join(' | ')}`);
+    assert.match(webpush, /Web Push is optional/);
+    assert.match(webpush, /blank skips it/);
+    assert.match(webpush, /a closed browser cannot be woken/);
+
+    // And the blank lines at each are what skipped them: the file holds none of the four names.
+    assert.deepEqual(readState(dir).apns, { keyId: '', teamId: '', keyPath: '', topic: '' });
+    assert.deepEqual(readState(dir).vapid, { publicKey: '', privateKey: '', subject: '' });
+});
+
 test('a generated secret is 32 bytes of hex, and a second run generates a different one', (t) => {
     const first = deployment(t);
     const second = deployment(t);
