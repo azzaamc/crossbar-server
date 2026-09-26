@@ -7,7 +7,7 @@
 // — so the two interoperate, and media is peer-to-peer exactly as it is natively.
 //
 // The page is loaded two ways and has to behave in both: opened directly, which is
-// how a call is tested without a second phone, and inside the household PWA's call
+// how a call is tested without a second phone, and inside the directory PWA's call
 // frame, where navigating to /newcall is the signal that the call is over.
 
 const params = new URLSearchParams(location.search);
@@ -245,9 +245,9 @@ async function handleAddPeer(payload) {
     const peerId = payload?.peer_id;
     if (!peerId || state.peers.has(peerId)) return;
 
-    const { tile, video } = addTile(peerId, payload.peer_name || 'Family', false);
+    const { tile, video } = addTile(peerId, payload.peer_name || 'Someone', false);
     const pc = new RTCPeerConnection({ iceServers: payload.iceServers || [] });
-    const peer = { pc, name: payload.peer_name || 'Family', tile, videoEl: video, videoOff: false };
+    const peer = { pc, name: payload.peer_name || 'Someone', tile, videoEl: video, videoOff: false };
     state.peers.set(peerId, peer);
     state.pendingIce.set(peerId, []);
 
@@ -541,7 +541,7 @@ async function start() {
         await acquireMedia();
 
         const session = await api('/api/session');
-        state.myName = session.user?.displayName || session.identity?.name || 'Family';
+        state.myName = session.user?.displayName || session.identity?.name || 'You';
         note(`who: ${state.myName}`);
 
         const joined = await api(`/api/calls/${encodeURIComponent(callId)}/join`, { method: 'POST' });

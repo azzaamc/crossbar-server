@@ -4,4 +4,10 @@ data/*.sqlite-wal
 data/*.sqlite-shm
 .env
 *.log
-data/family.json
+
+# The data directory is where secrets live: the database, the directory file with its logins,
+# the copy of `.env` a write keeps in case it has to undo itself, and now the backups — a full
+# copy of the database and the directory. The polarity is everything ignored unless it is a
+# shape to copy, so a thing added here tomorrow is ignored without anybody remembering to.
+data/*
+!data/*.example.json

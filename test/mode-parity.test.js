@@ -1,6 +1,6 @@
 'use strict';
 
-// Both modes are the same server, and this is what holds that: the same household, the same
+// Both modes are the same server, and this is what holds that: the same directory, the same
 // device, the same requests, answered the same way. The one deliberate difference — what a
 // request is allowed to prove about who sent it — is asserted rather than assumed.
 
@@ -96,7 +96,7 @@ test('the same device is answered the same way in either mode', async (t) => {
         };
     }
 
-    // What a household member can see and do does not change with the mode. The mode is a
+    // What a directory member can see and do does not change with the mode. The mode is a
     // difference in what is trusted, never in what the app is.
     assert.deepEqual(seen.public, seen.private);
 });

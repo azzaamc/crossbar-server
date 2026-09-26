@@ -15,7 +15,7 @@ const { createLogger } = require('../src/log');
 
 const DEV_USERS = ['abdullah@dev', 'dad@dev', 'mum@dev'];
 
-const FAMILY = {
+const DIRECTORY = {
     users: [
         { id: 'abdullah', tailscaleLogin: 'abdullah@dev', displayName: 'Abdullah', avatar: '', admin: true },
         { id: 'dad', tailscaleLogin: 'dad@dev', displayName: 'Dad', avatar: '' },
@@ -29,20 +29,20 @@ const FAMILY = {
         { ownerId: 'mum', contactId: 'abdullah', sortOrder: 1 },
         { ownerId: 'mum', contactId: 'dad', sortOrder: 2 },
     ],
-    groups: [{ id: 'family', displayName: 'Family', memberIds: ['abdullah', 'dad', 'mum'] }],
+    groups: [{ id: 'everyone', displayName: 'Everyone', memberIds: ['abdullah', 'dad', 'mum'] }],
 };
 
 function silentLogger() {
     return createLogger({ level: 'error', stream: { write() {} } });
 }
 
-function baseConfig(dataDir, familyConfigPath, overrides = {}) {
+function baseConfig(dataDir, directoryConfigPath, overrides = {}) {
     return {
         host: '127.0.0.1',
         port: 0,
         publicOrigin: 'http://127.0.0.1',
         dataDir,
-        familyConfigPath,
+        directoryConfigPath,
         webRoot: path.join(__dirname, '..', 'public'),
         trustTailscaleHeaders: true,
         autoEnrolIdentities: true,
@@ -79,9 +79,9 @@ function baseConfig(dataDir, familyConfigPath, overrides = {}) {
 
 async function startTestServer(overrides = {}) {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'crossbar-test-'));
-    const familyConfigPath = path.join(dir, 'family.json');
-    fs.writeFileSync(familyConfigPath, JSON.stringify(FAMILY, null, 2));
-    const config = baseConfig(dir, familyConfigPath, overrides);
+    const directoryConfigPath = path.join(dir, 'directory.json');
+    fs.writeFileSync(directoryConfigPath, JSON.stringify(DIRECTORY, null, 2));
+    const config = baseConfig(dir, directoryConfigPath, overrides);
     const server = createCrossbarServer({ config, log: silentLogger() });
     const address = await server.listen();
     return { server, dir, config, port: address.port, base: `http://127.0.0.1:${address.port}` };
@@ -259,4 +259,4 @@ async function accept(base, who, callId) {
     return data;
 }
 
-module.exports = { startTestServer, api, TestPeer, createCall, accept, FAMILY, DEV_USERS };
+module.exports = { startTestServer, api, TestPeer, createCall, accept, DIRECTORY, DEV_USERS };

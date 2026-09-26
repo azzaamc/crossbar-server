@@ -64,7 +64,7 @@ test('a person whose stream is replaced is never reported as having gone offline
     stopOld();
 
     const said = about(received, 'mum');
-    assert.ok(said.length >= 1, 'her replacement is reported to the household');
+    assert.ok(said.length >= 1, 'her replacement is reported to the directory');
     assert.ok(
         said.every((event) => event.online === true),
         `she was online throughout, and must never be announced as offline: ${JSON.stringify(said)}`,

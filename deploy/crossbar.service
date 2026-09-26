@@ -3,6 +3,18 @@ Description=Crossbar server (calls, presence and signalling)
 After=network-online.target
 Wants=network-online.target
 
+# The box is put into the mode's shape before the server opens anything.
+#
+# Both are wanted and each carries a condition naming the mode in the file, so exactly one
+# of them runs: the public one brings Caddy up and stops the tailnet serving, the private
+# one stops Caddy and serves the loopback port on the tailnet. That is what makes a mode
+# switch one action rather than three — the switch rewrites `.env` and leaves, and the
+# restart it triggers is what applies the rest.
+#
+# A condition that fails is not a failure, so a mode that has no work to do here costs
+# nothing and cannot stop the server.
+Wants=crossbar-public.service crossbar-private.service
+
 [Service]
 Type=simple
 User=admin
@@ -21,7 +33,18 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=/home/admin/crossbar/data
+# The data directory, and the one file the console rewrites.
+#
+# Everything the service does not name here is read-only to it, and the console changes a
+# setting -- and switches mode -- by rewriting `.env` in place. Without the second path every
+# one of those changes fails with EROFS and can report nothing better than "Crossbar could
+# not complete that request", while the CLI, which runs from a shell and is not hardened,
+# works perfectly. That difference is the whole bug.
+#
+# The file rather than the directory, so the service still cannot touch its own code: the
+# worst a compromised service can now do is choose the settings of the next start, which is
+# what the console is for.
+ReadWritePaths=/home/admin/crossbar/data /home/admin/crossbar/.env
 RestrictSUIDSGID=true
 
 [Install]

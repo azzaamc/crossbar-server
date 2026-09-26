@@ -10,11 +10,11 @@
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { MODES, KNOBS, modeBlock, applyMode, applyKnobs, verifyEnvFile } = require('./config');
+const { MODES, KNOBS, modeBlock, applyMode, applyKnobs, verifyEnvFile, writeEnvFile } = require('./config');
 const { resolveIdentity, isLoopback } = require('./identity');
 const { DEVICE_ID_PATTERN } = require('./db');
 const auth = require('./auth');
-const householdFile = require('./household');
+const directoryFile = require('./directory');
 const { iceConfigFor } = require('./ice');
 
 const MIME = {
@@ -68,7 +68,7 @@ const AUTH_MESSAGE = {
     CHALLENGE_INVALID: 'That challenge is not valid.',
     CHALLENGE_EXPIRED: 'That challenge has expired.',
     SIGNATURE_INVALID: 'That signature does not match this device.',
-    USER_UNKNOWN: 'That person is not in this household.',
+    USER_UNKNOWN: 'That person is not in this directory.',
     OPERATOR_DISABLED: 'This server has no console password set.',
     PASSWORD_INVALID: 'That password is not the one for this server.',
     RATE_LIMITED: 'Too many attempts. Try again shortly.',
@@ -220,7 +220,7 @@ function createRequestHandler({ config, store, bus, push, apns, lifecycle, log, 
             return null;
         }
         if (!user) {
-            sendError(res, 403, 'IDENTITY_NOT_ENROLLED', 'This identity is not a member of this household.');
+            sendError(res, 403, 'IDENTITY_NOT_ENROLLED', 'This identity is not a member of this directory.');
             return null;
         }
         // Where a device key is required, being reachable is not enough. This is the
@@ -267,7 +267,7 @@ function createRequestHandler({ config, store, bus, push, apns, lifecycle, log, 
     }
 
     /**
-     * The call client belongs to this server; everything else is the household PWA,
+     * The call client belongs to this server; everything else is the directory PWA,
      * which stays where it is while the native path moves over.
      */
     function serveStatic(req, res, url) {
@@ -279,7 +279,7 @@ function createRequestHandler({ config, store, bus, push, apns, lifecycle, log, 
         const isCallClient = url.pathname === '/call' || url.pathname.startsWith('/call/')
             || url.pathname === '/newcall';
         // The operator console is this server's own too: served from here so it is the
-        // same origin as the API it calls, and so it exists even where no household PWA
+        // same origin as the API it calls, and so it exists even where no directory PWA
         // is deployed beside it.
         const isConsole = url.pathname === '/admin' || url.pathname.startsWith('/admin/');
         const root = isConsole ? path.join(clientRoot, 'admin')
@@ -323,7 +323,12 @@ function createRequestHandler({ config, store, bus, push, apns, lifecycle, log, 
         // "is this server up" before anything else works. It says which mode this is
         // and nothing an unwelcome visitor could use.
         if (req.method === 'GET' && pathname === '/api/health') {
-            return sendJson(res, 200, { status: 'ok', mode: config.networkMode });
+            // The version is here because it is the one question nothing else answers: the
+            // CLI can be a shell's checkout and the file can be anything, so the running
+            // process is the only thing that knows what it is.
+            return sendJson(res, 200, {
+                status: 'ok', mode: config.networkMode, version: require('../package.json').version,
+            });
         }
 
         // ── Device identity ─────────────────────────────────────────────────────
@@ -552,8 +557,8 @@ function createRequestHandler({ config, store, bus, push, apns, lifecycle, log, 
 
         // ── Administration ──────────────────────────────────────────────────────
         //
-        // Admitting a phone and taking one away is something a household has to be able
-        // to do, and the person who does it is the one the household file marks as an
+        // Admitting a phone and taking one away is something a directory has to be able
+        // to do, and the person who does it is the one the directory file marks as an
         // administrator. There is no second kind of account and no admin UI: the CLI
         // drives these same routes, and the same identity rules apply to both.
         if (pathname.startsWith('/api/admin/')) {
@@ -584,44 +589,57 @@ function createRequestHandler({ config, store, bus, push, apns, lifecycle, log, 
                 };
             }
 
-            // ── The household ───────────────────────────────────────────────────
+            // ── The directory ───────────────────────────────────────────────────
             //
-            // Who is in this household is written in a file, and the database's people are
+            // Who is in this directory is written in a file, and the database's people are
             // derived from it on every start — so these edit the file and re-sync, rather
-            // than writing rows that the next start would overwrite. What a household may
+            // than writing rows that the next start would overwrite. What a directory may
             // be is checked before anything is written, and the file is replaced in one
             // move with the version before it kept beside.
             // Whether a login is how somebody is found here, which is also whether the
-            // household file may leave one out. It is the same switch that decides whether
-            // a proxy header is believed, because that header *is* the login.
+            // console asks for one when a person is added or changed. It is the same switch
+            // that decides whether a proxy header is believed, because that header *is* the
+            // login.
+            //
+            // A rule about editing, not about loading or listing: a directory already on
+            // disk without a login is read and shown as it is, because refusing to read it
+            // would be refusing to let anybody see, and so fix, what is missing.
             const requireLogins = config.trustTailscaleHeaders;
 
-            const currentHousehold = () => householdFile.read(config.familyConfigPath, { requireLogins });
+            const currentDirectory = () => directoryFile.read(config.directoryConfigPath);
 
-            /** Writes the household file, then makes the database agree with it. */
-            function saveHousehold(next) {
-                householdFile.write(config.familyConfigPath, next, { requireLogins });
-                store.syncFamilyConfig(config.familyConfigPath);
+            /** Writes the directory file, then makes the database agree with it. */
+            function saveDirectory(next) {
+                // Written without the login rule, which is reported instead — see
+                // `directoryFile.missingLogins`, and the console, which shows it. A caller that
+                // wants the strict reading can still ask for it; nothing that writes a directory
+                // does, because a directory the server can run is not one it should refuse.
+                directoryFile.write(config.directoryConfigPath, next, { requireLogins: false });
+                store.syncDirectory(config.directoryConfigPath);
             }
 
-            // Who is in the household, as the file says — with what the database knows about
+            // Who is in the directory, as the file says — with what the database knows about
             // them. The two can disagree, by design, for somebody who has been taken out of
             // the file: their row stays so their history does, and this is where that is
             // visible rather than confusing.
             if (req.method === 'GET' && pathname === '/api/admin/people') {
                 const known = new Map(store.listUsers().map((user) => [user.id, user]));
-                const household = currentHousehold();
+                const directory = currentDirectory();
                 return sendJson(res, 200, {
                     // Whether a login is how somebody is found here, so the console can ask
                     // for one where it is identity and leave the field optional where it is
                     // only a record of who somebody is elsewhere.
                     requireLogins,
+                    // Who the login rule is about, for a console that no longer refuses the
+                    // write over it: read on every load, so the answer is about the file as it
+                    // is now rather than as it was when somebody last saved.
+                    warnings: directoryFile.missingLogins(directory),
                     // Who can reach whom, as the file says. The app's entire list of people
-                    // is this and nothing else, so a household that has everybody in it and
+                    // is this and nothing else, so a directory that has everybody in it and
                     // no pairs in it reads as an empty app — a state an operator has to be
                     // able to see rather than deduce.
-                    contacts: household.contacts || [],
-                    people: household.users.map((user) => ({
+                    contacts: directory.contacts || [],
+                    people: directory.users.map((user) => ({
                         id: user.id,
                         displayName: user.displayName,
                         login: user.tailscaleLogin || '',
@@ -632,7 +650,7 @@ function createRequestHandler({ config, store, bus, push, apns, lifecycle, log, 
                         lastAuthenticated: known.get(user.id)?.lastAuthenticated ?? null,
                         // Whether they have ever signed in. Until they have, nobody sees
                         // them whatever the contacts say — which is the difference between
-                        // a household that is wired up and one that only looks broken.
+                        // a directory that is wired up and one that only looks broken.
                         arrived: Boolean(known.get(user.id)?.firstSeen),
                     })),
                 });
@@ -642,11 +660,11 @@ function createRequestHandler({ config, store, bus, push, apns, lifecycle, log, 
                 const body = await readJsonOrRefuse(req, res);
                 if (!body) return;
                 try {
-                    saveHousehold(householdFile.withPerson(currentHousehold(), body));
+                    saveDirectory(directoryFile.withPerson(currentDirectory(), body));
                 } catch (error) {
-                    return sendError(res, 400, 'HOUSEHOLD_INVALID', error.message);
+                    return sendError(res, 400, 'DIRECTORY_INVALID', error.message);
                 }
-                log.info('household_person_added', { personId: body.id, by: actor });
+                log.info('directory_person_added', { personId: body.id, by: actor });
                 return sendJson(res, 201, { users: store.listUsers() });
             }
 
@@ -655,11 +673,11 @@ function createRequestHandler({ config, store, bus, push, apns, lifecycle, log, 
                 const body = await readJsonOrRefuse(req, res);
                 if (!body) return;
                 try {
-                    saveHousehold(householdFile.withChanges(currentHousehold(), personMatch[1], body));
+                    saveDirectory(directoryFile.withChanges(currentDirectory(), personMatch[1], body));
                 } catch (error) {
-                    return sendError(res, 400, 'HOUSEHOLD_INVALID', error.message);
+                    return sendError(res, 400, 'DIRECTORY_INVALID', error.message);
                 }
-                log.info('household_person_changed', { personId: personMatch[1], by: actor });
+                log.info('directory_person_changed', { personId: personMatch[1], by: actor });
                 return sendJson(res, 200, { users: store.listUsers() });
             }
 
@@ -667,19 +685,19 @@ function createRequestHandler({ config, store, bus, push, apns, lifecycle, log, 
             if (req.method === 'POST' && removalMatch) {
                 const id = removalMatch[1];
                 try {
-                    saveHousehold(householdFile.withoutPerson(currentHousehold(), id));
+                    saveDirectory(directoryFile.withoutPerson(currentDirectory(), id));
                 } catch (error) {
-                    return sendError(res, 400, 'HOUSEHOLD_INVALID', error.message);
+                    return sendError(res, 400, 'DIRECTORY_INVALID', error.message);
                 }
                 // Their row stays, disabled. Calls, participants and devices all point at it,
-                // and a household's history is not something to erase to tidy a list.
+                // and a directory's history is not something to erase to tidy a list.
                 store.setUserEnabled(id, false);
                 // Their devices go with them: a key left behind is a key that still opens the
-                // door, and the person it belonged to is no longer in the household.
+                // door, and the person it belonged to is no longer in the directory.
                 const now = new Date().toISOString();
                 const devices = store.allDevices(id);
                 for (const device of devices) store.revokeDevice(device.id, now);
-                log.info('household_person_removed', { personId: id, devices: devices.length, by: actor });
+                log.info('directory_person_removed', { personId: id, devices: devices.length, by: actor });
                 return sendJson(res, 200, { users: store.listUsers(), revokedDevices: devices.length });
             }
 
@@ -687,7 +705,7 @@ function createRequestHandler({ config, store, bus, push, apns, lifecycle, log, 
             //
             // The app's list of people is the contacts and nothing else, and a call is
             // refused unless every invitee is one — so this is what makes somebody
-            // reachable, as opposed to merely present in the household. Both directions are
+            // reachable, as opposed to merely present in the directory. Both directions are
             // written, because that is what reaching somebody is: the file can hold a
             // one-way pair and the server reads one, but a list where you appear to
             // somebody who does not appear to you is not a control anybody asked for.
@@ -702,34 +720,34 @@ function createRequestHandler({ config, store, bus, push, apns, lifecycle, log, 
                 const pair = await contactPair(req, res);
                 if (!pair) return;
                 try {
-                    saveHousehold(householdFile.withContact(currentHousehold(), pair.ownerId, pair.contactId));
+                    saveDirectory(directoryFile.withContact(currentDirectory(), pair.ownerId, pair.contactId));
                 } catch (error) {
-                    return sendError(res, 400, 'HOUSEHOLD_INVALID', error.message);
+                    return sendError(res, 400, 'DIRECTORY_INVALID', error.message);
                 }
-                log.info('household_contact_added', { ...pair, by: actor });
-                return sendJson(res, 200, { contacts: currentHousehold().contacts || [] });
+                log.info('directory_contact_added', { ...pair, by: actor });
+                return sendJson(res, 200, { contacts: currentDirectory().contacts || [] });
             }
 
             if (req.method === 'POST' && pathname === '/api/admin/contacts/remove') {
                 const pair = await contactPair(req, res);
                 if (!pair) return;
                 try {
-                    saveHousehold(householdFile.withoutContact(currentHousehold(), pair.ownerId, pair.contactId));
+                    saveDirectory(directoryFile.withoutContact(currentDirectory(), pair.ownerId, pair.contactId));
                 } catch (error) {
-                    return sendError(res, 400, 'HOUSEHOLD_INVALID', error.message);
+                    return sendError(res, 400, 'DIRECTORY_INVALID', error.message);
                 }
-                log.info('household_contact_removed', { ...pair, by: actor });
-                return sendJson(res, 200, { contacts: currentHousehold().contacts || [] });
+                log.info('directory_contact_removed', { ...pair, by: actor });
+                return sendJson(res, 200, { contacts: currentDirectory().contacts || [] });
             }
 
             if (req.method === 'POST' && pathname === '/api/admin/contacts/everyone') {
                 try {
-                    saveHousehold(householdFile.withEveryoneConnected(currentHousehold()));
+                    saveDirectory(directoryFile.withEveryoneConnected(currentDirectory()));
                 } catch (error) {
-                    return sendError(res, 400, 'HOUSEHOLD_INVALID', error.message);
+                    return sendError(res, 400, 'DIRECTORY_INVALID', error.message);
                 }
-                log.info('household_contacts_opened', { people: currentHousehold().users.length, by: actor });
-                return sendJson(res, 200, { contacts: currentHousehold().contacts || [] });
+                log.info('directory_contacts_opened', { people: currentDirectory().users.length, by: actor });
+                return sendJson(res, 200, { contacts: currentDirectory().contacts || [] });
             }
 
             // ── Settings, and the mode ──────────────────────────────────────────
@@ -741,6 +759,11 @@ function createRequestHandler({ config, store, bus, push, apns, lifecycle, log, 
             // that fails — a setting that stops the server starting is worse than any
             // setting is good. A change that holds is followed by a restart, because the
             // configuration is read once and that is the only moment it is consistent.
+            //
+            // The change and the putting-back both go through `writeEnvFile`, so a write
+            // interrupted by a crash or a power cut leaves the old file or the new one: a
+            // truncated `.env` is a server that will not start, and neither front door's
+            // `ExecCondition` can read a file that is not there.
             const envPath = config.envFile;
             const envContent = () => fs.readFileSync(envPath, 'utf8');
 
@@ -755,13 +778,13 @@ function createRequestHandler({ config, store, bus, push, apns, lifecycle, log, 
                 }
                 if (after === before) return { ok: true, changed: false };
 
-                fs.writeFileSync(envPath, after);
+                writeEnvFile(envPath, after);
                 // Verified in the directory of the file just written, not of the process: on a
                 // deployment they are the same, and anywhere else the answer must still be
                 // about this file rather than whatever the working directory happens to hold.
                 const check = verifyEnvFile(path.dirname(envPath));
                 if (!check.ok) {
-                    fs.writeFileSync(envPath, before);
+                    writeEnvFile(envPath, before);
                     return { ok: false, changed: false, message: check.message };
                 }
                 log.info(event, detail);
@@ -900,10 +923,10 @@ function createRequestHandler({ config, store, bus, push, apns, lifecycle, log, 
                             ttlSeconds: config.turn.ttlSeconds,
                         }
                         : null,
-                    // The household's people, not the rows: somebody taken out of the file
+                    // The directory's people, not the rows: somebody taken out of the file
                     // keeps their row for the history's sake, and counting rows here would
                     // make this card disagree with the People table beneath it.
-                    users: householdFile.read(config.familyConfigPath, { requireLogins }).users.length,
+                    users: directoryFile.read(config.directoryConfigPath).users.length,
                     devices: store.allDevices().length,
                     openEnrollments: store.enrollments(now).filter((item) => item.state === 'open').length,
                 });
@@ -1198,7 +1221,7 @@ function createRequestHandler({ config, store, bus, push, apns, lifecycle, log, 
     function refusalMessage(reason) {
         switch (reason) {
             case 'RATE_LIMITED': return 'Please wait before trying again.';
-            case 'INVALID_INVITEES': return 'Choose one or more family contacts.';
+            case 'INVALID_INVITEES': return 'Choose one or more contacts.';
             case 'CONTACT_NOT_ALLOWED': return 'One or more invitees are not configured contacts.';
             case 'INVALID_RESPONSE': return 'Response must be accepted or declined.';
             case 'CALL_NOT_FOUND': return 'Call was not found.';

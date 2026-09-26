@@ -2,7 +2,7 @@
 
 // Operator commands.
 //
-// There is no admin web UI on purpose. The household is small, whoever runs this has a
+// There is no admin web UI on purpose. The directory is small, whoever runs this has a
 // shell, and a second network surface to secure is a second surface to get wrong. These
 // commands open the same database the server uses — SQLite in WAL mode, so both can work
 // at once — and the HTTP admin routes exist for the same operations when a browser is
@@ -12,14 +12,14 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
-const { loadConfig, applyMode, modeBlock, MODES, setEnvLine, verifyEnvFile } = require('./config');
+const { loadConfig, applyMode, modeBlock, MODES, setEnvLine, verifyEnvFile, writeEnvFile } = require('./config');
 const { Store } = require('./db');
 const auth = require('./auth');
 const { diagnose } = require('./diagnostics');
 
 const USAGE = `Crossbar administration
 
-  users                                  List the people in the household file
+  users                                  List the people in the directory file
   devices [--user <id>]                  List devices, optionally for one person
   enroll --user <id> [--ttl <seconds>]   Create a one-time invitation for a device
   enrollments                            List invitations and their state
@@ -31,6 +31,7 @@ const USAGE = `Crossbar administration
   mode                                   Both configurations, and which is in force
   mode private|public                    Switch this deployment to that one
   password                               Set the console's password, prompted
+  ring --from <id> --to <id>              Ring a device, to test that it does
   doctor                                 Reachability checks
 `;
 
@@ -76,11 +77,15 @@ function printPeople(store) {
 function printDevices(store, userId = null) {
     const rows = store.allDevices(userId);
     if (!rows.length) return console.log('No devices are registered.');
-    console.log(`${pad('DEVICE', 26)}${pad('OWNER', 20)}${pad('LABEL', 18)}${pad('PLATFORM', 10)}${pad('STATE', 9)}${pad('KEY', 5)}LAST SEEN`);
+    console.log(`${pad('DEVICE', 26)}${pad('OWNER', 20)}${pad('LABEL', 18)}${pad('PLATFORM', 10)}${pad('STATE', 9)}${pad('KEY', 5)}${pad('RING', 6)}LAST SEEN`);
     for (const row of rows) {
         console.log(
             pad(row.id, 26) + pad(row.userName || row.userId, 20) + pad(row.label || '-', 18)
             + pad(row.platform || '-', 10) + pad(row.status, 9) + pad(row.hasKey ? 'yes' : '-', 5)
+            // Whether this phone can be rung while it is asleep. `NO` is the state that reads
+            // as a broken deployment from the other end of a call, and it is not visible
+            // anywhere else in this output.
+            + pad(row.hasVoipToken ? 'yes' : 'NO', 6)
             + (row.lastSeenAt || 'never'),
         );
     }
@@ -147,9 +152,7 @@ async function main(argv) {
     }
 
     const config = loadConfig();
-    const store = new Store(config.dataDir, config.familyConfigPath, {
-        requireLogins: config.trustTailscaleHeaders,
-    });
+    const store = new Store(config.dataDir, config.directoryConfigPath);
     const now = new Date().toISOString();
 
     try {
@@ -257,7 +260,7 @@ async function main(argv) {
                     console.error('They did not match.');
                     return 1;
                 }
-                fs.writeFileSync(file, setEnvLine(fs.readFileSync(file, 'utf8'),
+                writeEnvFile(file, setEnvLine(fs.readFileSync(file, 'utf8'),
                     'CROSSBAR_ADMIN_PASSWORD_HASH', auth.hashPassword(password)));
                 console.log('Set, as a hash — the password itself is nowhere on this machine.');
                 console.log('It takes effect on the next start:');
@@ -303,11 +306,14 @@ async function main(argv) {
                 // Written before it is checked, because the only honest test is what the
                 // file says to a process starting from it — and put back if it does not
                 // hold up. A switch that leaves a deployment unable to start is worse
-                // than no switch at all.
-                fs.writeFileSync(file, applyMode(content, wanted));
+                // than no switch at all. Both writes stage inside the data directory and
+                // keep the file they replace: a crash during a switch must leave one
+                // whole `.env`, not half of one, because both front doors' `ExecCondition`
+                // greps read the file this command is rewriting.
+                writeEnvFile(file, applyMode(content, wanted));
                 const check = verifyEnvFile(process.cwd(), wanted);
                 if (!check.ok) {
-                    fs.writeFileSync(file, content);
+                    writeEnvFile(file, content);
                     console.error(`Cannot switch to ${wanted}: ${check.message}`);
                     console.error(`Fill in its block in .env — NETWORK_MODE_${wanted.toUpperCase()}_HOSTNAME`
                         + ` and NETWORK_MODE_${wanted.toUpperCase()}_ORIGIN — and try again.`);
@@ -321,14 +327,56 @@ async function main(argv) {
 
             case 'status': {
                 const openEnrollments = store.enrollments(now).filter((item) => item.state === 'open');
+                console.log(`Version           ${require('../package.json').version}`);
                 console.log(`Mode              ${config.networkMode}`);
                 console.log(`Origin            ${config.publicOrigin}`);
                 console.log(`Listener          ${config.host}:${config.port}`);
                 console.log(`Device auth       ${config.sessionSecret ? (config.requireDeviceAuth ? 'required' : 'available') : 'not configured'}`);
                 console.log(`TURN              ${config.turn?.host ? `${config.turn.host}:${config.turn.port} relays ${config.turn.minPort}-${config.turn.maxPort}` : 'not configured'}`);
+                console.log(`APNs              ${config.apnsKeyId && config.apnsTopic
+                    ? `configured (${config.apnsTopic})`
+                    : 'not configured — a phone with its screen off cannot be rung'}`);
                 console.log(`People            ${store.listUsers().length}`);
                 console.log(`Devices           ${store.allDevices().length}`);
                 console.log(`Open invitations  ${openEnrollments.length}${openEnrollments.length ? ` (${openEnrollments.map((item) => item.id).join(', ')})` : ''}`);
+                return 0;
+            }
+
+            case 'ring': {
+                // A test call, placed *through* the running server rather than beside it.
+                //
+                // The live process is the one holding the sockets and the push credentials, so a
+                // call made anywhere else would ring nothing: this asks it over the loopback it
+                // already treats as its proxy, as the person `--from` names. That person needs a
+                // login, because a login is how a request is believed here — which is why a
+                // directory keeps one test person with one.
+                const from = String(options.from || '');
+                const to = String(options.to || positional[0] || '');
+                if (!from || !to) {
+                    console.error('ring needs --from <id> and --to <id>.');
+                    console.error('  e.g. ring --from ringtest --to abdullah');
+                    return 1;
+                }
+                const login = store.listUsers().find((user) => user.id === from)?.login;
+                if (!store.userById(from)) {
+                    console.error(`No person with the id ${from}.`);
+                    return 1;
+                }
+                if (!login) {
+                    console.error(`${from} has no login, so a request cannot be believed as them.`);
+                    return 1;
+                }
+                const response = await fetch(`http://${config.host}:${config.port}/api/calls`, {
+                    method: 'POST',
+                    headers: { 'content-type': 'application/json', 'Tailscale-User-Login': login },
+                    body: JSON.stringify({ inviteeIds: [to], video: true }),
+                });
+                const body = await response.text();
+                if (!response.ok) {
+                    console.error(`The server refused it: ${body.slice(0, 240)}`);
+                    return 1;
+                }
+                console.log(`Ringing ${to} as ${from}. It rings for ${config.callRingSeconds} seconds, then counts as missed.`);
                 return 0;
             }
 

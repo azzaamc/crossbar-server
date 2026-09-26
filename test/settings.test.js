@@ -6,8 +6,11 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
 
-const { KNOBS, applyKnobs, validateKnob, knobFor } = require('../src/config');
+const { KNOBS, applyKnobs, validateKnob, knobFor, writeEnvFile } = require('../src/config');
 
 const SAMPLE = [
     '# A deployment.',
@@ -45,7 +48,7 @@ test('a boolean is written the way the file spells it', () => {
 test('nothing that could lock somebody out is on the list', () => {
     const forbidden = ['HOST', 'PORT', 'PUBLIC_ORIGIN', 'CROSSBAR_PUBLIC_HOSTNAME', 'CROSSBAR_BIND_ADDRESS',
         'CROSSBAR_SESSION_SECRET', 'CROSSBAR_ADMIN_PASSWORD_HASH', 'CROSSBAR_TURN_SHARED_SECRET',
-        'DATA_DIR', 'FAMILY_CONFIG_PATH', 'NODE_ENV', 'CROSSBAR_REQUIRE_DEVICE_AUTH', 'TRUST_TAILSCALE_HEADERS'];
+        'DATA_DIR', 'DIRECTORY_CONFIG_PATH', 'NODE_ENV', 'CROSSBAR_REQUIRE_DEVICE_AUTH', 'TRUST_TAILSCALE_HEADERS'];
     for (const key of forbidden) {
         assert.equal(knobFor(key), null, `${key} must not be writable from the console`);
         assert.throws(() => applyKnobs(SAMPLE, { [key]: 'anything' }), /may change/, key);
@@ -62,4 +65,56 @@ test('every knob is described well enough to be rendered, and accepts its own bo
             assert.throws(() => validateKnob(knob, String(knob.max + 1)), `${knob.key} accepts past its maximum`);
         }
     }
+});
+
+// ── The write both the console and the CLI go through ────────────────────────
+//
+// `.env` is read at start-up by the server and, by `ExecCondition` greps, by both front doors'
+// units: a reader only ever sees one whole file, or neither door is configured. So the write
+// stages inside the data directory — which the service may write and the code directory it may
+// not — keeps what it replaced, and moves the staged file rather than copying it into place.
+
+/** `writeEnvFile` resolves the data directory the way `loadConfig` does: from the environment. */
+function withDataDir(dataDir, body) {
+    const before = process.env.DATA_DIR;
+    process.env.DATA_DIR = dataDir;
+    try {
+        return body();
+    } finally {
+        if (before === undefined) delete process.env.DATA_DIR;
+        else process.env.DATA_DIR = before;
+    }
+}
+
+test('a staged write keeps the file it replaced, and leaves no half-written file behind', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'crossbar-env-'));
+    const dataDir = path.join(dir, 'data');
+    const envPath = path.join(dir, '.env');
+    fs.writeFileSync(envPath, 'MAX_PARTICIPANTS=4\n');
+
+    // The data directory is not created first on purpose: a switch is a reasonable thing to
+    // run on a machine that has never started the server, and it has to work there.
+    withDataDir(dataDir, () => writeEnvFile(envPath, 'MAX_PARTICIPANTS=6\n'));
+
+    assert.equal(fs.readFileSync(envPath, 'utf8'), 'MAX_PARTICIPANTS=6\n');
+    assert.equal(fs.readFileSync(path.join(dataDir, 'env.previous'), 'utf8'), 'MAX_PARTICIPANTS=4\n');
+    assert.equal(fs.existsSync(path.join(dataDir, '.env.writing')), false, 'moved, not left behind');
+    // `.env` holds the session secret and the console's hash, and the kept copy holds the same.
+    assert.equal(fs.statSync(envPath).mode & 0o777, 0o600);
+    assert.equal(fs.statSync(path.join(dataDir, 'env.previous')).mode & 0o777, 0o600);
+});
+
+test('a write that cannot complete is reported, and the file that was there is still there', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'crossbar-env-'));
+    const envPath = path.join(dir, '.env');
+    fs.writeFileSync(envPath, 'MAX_PARTICIPANTS=4\n');
+    // A data directory that cannot exist, because the path is a file. Nothing may be written,
+    // and the failure has to reach the caller: it is the only thing that knows whether the
+    // change it asked for still holds, and swallowing this would leave it believing it did.
+    const blocked = path.join(dir, 'blocked');
+    fs.writeFileSync(blocked, 'not a directory\n');
+
+    assert.throws(() => withDataDir(path.join(blocked, 'data'),
+        () => writeEnvFile(envPath, 'MAX_PARTICIPANTS=6\n')), /ENOTDIR/);
+    assert.equal(fs.readFileSync(envPath, 'utf8'), 'MAX_PARTICIPANTS=4\n');
 });

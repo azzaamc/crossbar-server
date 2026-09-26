@@ -46,7 +46,7 @@ function cookieValue(header, name) {
  * `development` exists so the server can be exercised on a laptop where no Tailscale
  * proxy is present. It is refused unless the listener is loopback *and* the operator
  * turned it on explicitly, and a login is only accepted if it already names a
- * configured family member.
+ * person already in the directory.
  */
 function resolveIdentity(req, config) {
     if (!isLoopback(req.socket?.remoteAddress)) return null;
@@ -69,8 +69,8 @@ function resolveIdentity(req, config) {
         const login = fromHeader || fromCookie;
         if (login && (config.devIdentities.length === 0 || config.devIdentities.includes(login))) {
             // No name is supplied, so the display name comes from the login — which
-            // is what a laptop has to work with, and keeps the configured household
-            // names in the family file authoritative.
+            // is what a laptop has to work with, and keeps the configured directory
+            // names in the directory file authoritative.
             return { login, name: '', profilePic: '', source: 'development' };
         }
     }

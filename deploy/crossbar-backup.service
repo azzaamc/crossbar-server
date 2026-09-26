@@ -1,0 +1,40 @@
+[Unit]
+Description=Crossbar backup (database and directory file)
+# Nothing here is scheduled by this unit; `crossbar-backup.timer` is what starts it, which is why
+# there is no [Install] section: enabling this unit would run a backup once at boot, and a
+# backup that depends on nothing but the filesystem has no business waiting for a boot to
+# finish either.
+#
+# It does not need the server to be up, or down. The database is read through SQLite in WAL
+# mode, so `VACUUM INTO` sees a consistent database while the service holds it open -- a backup
+# that only ran against a stopped server would not be there on the morning the server is what
+# will not start.
+
+[Service]
+Type=oneshot
+User=admin
+Group=admin
+WorkingDirectory=/home/admin/crossbar
+Environment=NODE_ENV=production
+Environment=NODE_NO_WARNINGS=ExperimentalWarning
+EnvironmentFile=/home/admin/crossbar/.env
+ExecStart=/usr/bin/node /home/admin/crossbar/src/backup.js
+
+# The backup reads the live database and writes under `data/`, and that is all it writes -- the
+# `.env` allowance `crossbar.service` needs is deliberately absent, because nothing in a backup
+# rewrites the configuration.
+#
+# The comment in `crossbar.service` says why `ReadWritePaths` is here at all: everything not
+# named is read-only to the service, so a missing path is not a hardening failure but an
+# operation that fails with EROFS.
+ReadWritePaths=/home/admin/crossbar/data
+
+# The same hardening shape as `crossbar.service`. The copy holds every login in the house, and
+# UMask is the second half of what `backup.js` does with mode 0600: between them, the umask a
+# deployment happens to have set cannot leave a copy readable by anyone else on the box.
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+RestrictSUIDSGID=true

@@ -11,7 +11,7 @@ const machine = require('./calls');
 
 const ID_PATTERN = /^[a-z0-9][a-z0-9_-]{0,63}$/i;
 
-/** Sliding-window limiter, per process. Adequate for a household, and honest about it. */
+/** Sliding-window limiter, per process. Adequate for a directory, and honest about it. */
 function createLimiter() {
     const buckets = new Map();
     return {

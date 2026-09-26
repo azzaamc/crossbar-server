@@ -1,12 +1,13 @@
 'use strict';
 
-// The household file, read and written.
+// The directory file, read and written.
 //
-// It is the source of truth for who is in this household: the database's people are synced
+// It is the source of truth for who is in this directory: the database's people are synced
 // from it on every start, so editing a person means editing this file, not the rows it
-// produces. Kept apart from the server so the rules about what a household may be — at least
-// one person, at least one administrator, one login each — live in one place, are checked
-// before anything is written, and can be tested without a server.
+// produces. Kept apart from the server so the rules about what a directory may be — at least
+// one person, at least one administrator, one login each where a login is how somebody is
+// found — live in one place, are checked before anything is written, and can be tested
+// without a server.
 
 const fs = require('node:fs');
 const path = require('node:path');
@@ -18,21 +19,23 @@ const clean = (value, limit = NAME_LIMIT) => String(value ?? '').trim().slice(0,
 const loginOf = (user) => clean(user.tailscaleLogin, 200).toLowerCase();
 
 /**
- * What a household file has to be, whoever wrote it.
+ * What a directory file has to be, whoever wrote it.
  *
  * `requireLogins` is the one rule that depends on how a deployment is reached rather than
- * on what a household is: where a tailnet proxy names the caller, a login is how somebody
+ * on what a directory is: where a tailnet proxy names the caller, a login is how somebody
  * is found and everybody needs one. Where a device proves itself with a key, a login is a
- * record of who somebody is elsewhere, and a household whose people have no tailnet has
+ * record of who somebody is elsewhere, and a directory whose people have no tailnet has
  * none to write down. It defaults to the strict reading so that a caller who has not
  * thought about it gets the rule that cannot leave somebody unreachable.
  *
- * Throws rather than returning, because every caller is about to write this file and a file
- * that cannot be loaded is a server that cannot start.
+ * Throws rather than returning, because every caller is about to write this file, and being
+ * told before the write is what lets an operator correct it. The rule is about what may be
+ * *written*, not about what may be loaded: a file already on disk without a login is read
+ * and served as it is, or there would be no console to open and put one in.
  */
-function validate(household, { requireLogins = true } = {}) {
-    const users = Array.isArray(household?.users) ? household.users : [];
-    if (!users.length) throw new Error('A household needs at least one person.');
+function validate(directory, { requireLogins = true } = {}) {
+    const users = Array.isArray(directory?.users) ? directory.users : [];
+    if (!users.length) throw new Error('A directory needs at least one person.');
 
     const ids = new Set();
     const logins = new Set();
@@ -57,52 +60,71 @@ function validate(household, { requireLogins = true } = {}) {
     // A contact is a pair of people in this file, so both ends have to be here. A
     // reference to somebody who is not is a row the database cannot hold, and it used to
     // fail at the next start rather than at the edit that made it.
-    for (const contact of Array.isArray(household?.contacts) ? household.contacts : []) {
+    for (const contact of Array.isArray(directory?.contacts) ? directory.contacts : []) {
         const owner = clean(contact?.ownerId).toLowerCase();
         const other = clean(contact?.contactId).toLowerCase();
         if (!ids.has(owner) || !ids.has(other)) {
-            throw new Error(`A contact names somebody who is not in the household: ${owner} → ${other}.`);
+            throw new Error(`A contact names somebody who is not in the directory: ${owner} → ${other}.`);
         }
         if (owner === other) throw new Error(`${owner} cannot be their own contact.`);
     }
 
-    // A household nobody can administer is a state not worth being able to reach.
+    // A directory nobody can administer is a state not worth being able to reach.
     if (!users.some((user) => user.admin && user.enabled !== false)) {
-        throw new Error('A household needs an administrator who is not suspended.');
+        throw new Error('A directory needs an administrator who is not suspended.');
     }
-    return household;
+    return directory;
 }
 
-function read(filePath, options) {
-    if (!fs.existsSync(filePath)) throw new Error(`No household file at ${filePath}.`);
-    return validate(JSON.parse(fs.readFileSync(filePath, 'utf8')), options);
+function read(filePath) {
+    if (!fs.existsSync(filePath)) throw new Error(`No directory file at ${filePath}.`);
+    // Read without the login rule, whatever mode this is. It is the one rule that a directory
+    // the server is otherwise perfectly able to run can fail, and reading is how the console
+    // shows what needs fixing — so enforcing it here would leave an operator unable to see,
+    // and so to repair, the very file that needs them.
+    return validate(JSON.parse(fs.readFileSync(filePath, 'utf8')), { requireLogins: false });
 }
 
 /**
  * Writes the file the way a thing that can lose power should be written: to a neighbour
  * first, then moved into place, with the previous version kept beside it. A half-written
- * household is a server that will not start.
+ * directory is a server that will not start.
  */
-function write(filePath, household, options) {
-    validate(household, options);
-    const body = `${JSON.stringify(household, null, 2)}\n`;
+function write(filePath, directory, options) {
+    validate(directory, options);
+    const body = `${JSON.stringify(directory, null, 2)}\n`;
     const staging = `${filePath}.writing`;
     fs.writeFileSync(staging, body, { mode: 0o600 });
     if (fs.existsSync(filePath)) fs.copyFileSync(filePath, `${filePath}.previous`);
     fs.renameSync(staging, filePath);
-    return household;
+    return directory;
 }
 
-/** The file with one person added, checked but not written. */
-function withPerson(household, person) {
+/**
+ * The file with one person added, checked but not written.
+ *
+ * Everybody reaches everybody here, so somebody who arrives is connected in both directions to
+ * everyone already in the directory. It is the default rather than a chore: a graph an operator
+ * has to keep complete by hand is a graph that silently stops being complete, and the console
+ * has no table of ticks with which to notice.
+ */
+function withPerson(directory, person) {
     const id = clean(person.id).toLowerCase();
-    if (household.users.some((user) => user.id.toLowerCase() === id)) {
+    if (directory.users.some((user) => user.id.toLowerCase() === id)) {
         throw new Error(`There is already someone with the id ${id}.`);
     }
     const login = loginOf(person);
+    const alreadyHere = directory.users.map((user) => user.id.toLowerCase());
     return {
-        ...household,
-        users: [...household.users, {
+        ...directory,
+        contacts: [
+            ...(directory.contacts || []),
+            ...alreadyHere.flatMap((other) => ([
+                { ownerId: id, contactId: other, sortOrder: 0 },
+                { ownerId: other, contactId: id, sortOrder: 0 },
+            ])),
+        ],
+        users: [...directory.users, {
             id,
             // Left out rather than written empty: somebody with no tailnet has no login,
             // and an empty string in the file reads as one that was meant to be filled in.
@@ -115,14 +137,14 @@ function withPerson(household, person) {
 }
 
 /** The file with one person's fields changed, checked but not written. */
-function withChanges(household, id, changes) {
+function withChanges(directory, id, changes) {
     const wanted = clean(id).toLowerCase();
-    if (!household.users.some((user) => user.id.toLowerCase() === wanted)) {
+    if (!directory.users.some((user) => user.id.toLowerCase() === wanted)) {
         throw new Error(`There is nobody with the id ${clean(id)}.`);
     }
     return {
-        ...household,
-        users: household.users.map((user) => {
+        ...directory,
+        users: directory.users.map((user) => {
             if (user.id.toLowerCase() !== wanted) return user;
             const next = { ...user };
             if (changes.displayName !== undefined) next.displayName = clean(changes.displayName);
@@ -144,20 +166,20 @@ function withChanges(household, id, changes) {
 }
 
 /** The file with one person taken out, checked but not written. */
-function withoutPerson(household, id) {
+function withoutPerson(directory, id) {
     const wanted = clean(id).toLowerCase();
-    const users = household.users.filter((user) => user.id.toLowerCase() !== wanted);
-    if (users.length === household.users.length) throw new Error(`There is nobody with the id ${clean(id)}.`);
+    const users = directory.users.filter((user) => user.id.toLowerCase() !== wanted);
+    if (users.length === directory.users.length) throw new Error(`There is nobody with the id ${clean(id)}.`);
     return {
-        ...household,
+        ...directory,
         users,
         // Their contacts and any group they were in go with them, or the next sync fails
         // on a reference to somebody who is no longer there.
-        contacts: (household.contacts || []).filter((contact) => (
+        contacts: (directory.contacts || []).filter((contact) => (
             String(contact.ownerId || '').toLowerCase() !== wanted
             && String(contact.contactId || '').toLowerCase() !== wanted
         )),
-        groups: (household.groups || []).map((group) => ({
+        groups: (directory.groups || []).map((group) => ({
             ...group,
             memberIds: (group.memberIds || []).filter((member) => String(member).toLowerCase() !== wanted),
         })),
@@ -173,17 +195,17 @@ function withoutPerson(household, id) {
  * console does makes one — a list where you appear to somebody who does not appear to you
  * is not a control anybody asked for.
  */
-function withContact(household, ownerId, contactId) {
+function withContact(directory, ownerId, contactId) {
     const owner = clean(ownerId).toLowerCase();
     const other = clean(contactId).toLowerCase();
     for (const id of [owner, other]) {
-        if (!household.users.some((user) => user.id.toLowerCase() === id)) {
+        if (!directory.users.some((user) => user.id.toLowerCase() === id)) {
             throw new Error(`There is nobody with the id ${id}.`);
         }
     }
     if (owner === other) throw new Error(`${owner} cannot reach themselves.`);
 
-    const contacts = [...(household.contacts || [])];
+    const contacts = [...(directory.contacts || [])];
     const held = new Set(contacts.map((item) => `${clean(item.ownerId).toLowerCase()}→${clean(item.contactId).toLowerCase()}`));
     const order = contacts.reduce((most, item) => Math.max(most, Number(item.sortOrder) || 0), 0);
     const put = (from, to) => {
@@ -191,11 +213,11 @@ function withContact(household, ownerId, contactId) {
     };
     put(owner, other);
     put(other, owner);
-    return { ...household, contacts };
+    return { ...directory, contacts };
 }
 
 /** The file with two people no longer able to reach each other, in either direction. */
-function withoutContact(household, ownerId, contactId) {
+function withoutContact(directory, ownerId, contactId) {
     const owner = clean(ownerId).toLowerCase();
     const other = clean(contactId).toLowerCase();
     const isThePair = (item) => {
@@ -203,31 +225,51 @@ function withoutContact(household, ownerId, contactId) {
         const to = clean(item.contactId).toLowerCase();
         return (from === owner && to === other) || (from === other && to === owner);
     };
-    return { ...household, contacts: (household.contacts || []).filter((item) => !isThePair(item)) };
+    return { ...directory, contacts: (directory.contacts || []).filter((item) => !isThePair(item)) };
 }
 
 /**
  * The file with everybody able to reach everybody.
  *
- * The state a household with one group of people wants, and the one an operator would
+ * The state a directory with one group of people wants, and the one an operator would
  * otherwise assemble a pair at a time. It replaces the contacts rather than adding to
  * them, because that is what "everybody" means — an exclusion somebody asked for is not
  * something this should quietly leave in place.
  */
-function withEveryoneConnected(household) {
-    const ids = household.users.map((user) => user.id.toLowerCase());
+function withEveryoneConnected(directory) {
+    const ids = directory.users.map((user) => user.id.toLowerCase());
     const contacts = [];
     for (const owner of ids) {
         for (const other of ids) {
             if (owner !== other) contacts.push({ ownerId: owner, contactId: other, sortOrder: 0 });
         }
     }
-    return { ...household, contacts };
+    return { ...directory, contacts };
 }
 
 /** A key set to undefined is a key that was never meant to be written. */
 function stripUndefined(user) {
     return Object.fromEntries(Object.entries(user).filter(([, value]) => value !== undefined));
+}
+
+/**
+ * Who cannot be found by a login, as sentences rather than as a refusal.
+ *
+ * This is the login rule said out loud. `validate` can still enforce it, and does for a caller
+ * that asks — but nothing writes a directory that way any more, because a device that has
+ * enrolled is a complete identity on its own: a person with no login can use this server, they
+ * can only be found by their own device rather than by the network saying who they are.
+ *
+ * Refusing the write was stricter than the server is. Measured 2026-09-26: an operator could
+ * not add the login the console was complaining was missing, because every edit was refused
+ * while any person had none. So the file is written, and this is what the console says about
+ * it afterwards.
+ */
+function missingLogins(directory) {
+    return (Array.isArray(directory?.users) ? directory.users : [])
+        .filter((user) => !loginOf(user))
+        .map((user) => `${clean(user.id)} has no login, so nothing finds them by their tailnet `
+            + 'identity. They can still use this server from a device that has enrolled.');
 }
 
 module.exports = {
@@ -240,6 +282,7 @@ module.exports = {
     withContact,
     withoutContact,
     withEveryoneConnected,
+    missingLogins,
     backupPath: (filePath) => `${filePath}.previous`,
-    path: (dir) => path.resolve(dir, 'family.json'),
+    path: (dir) => path.resolve(dir, 'directory.json'),
 };

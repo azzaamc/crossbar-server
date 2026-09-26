@@ -24,9 +24,7 @@ const EXPIRY_SWEEP_MS = 10000;
 function createCrossbarServer({ config = loadConfig(), log } = {}) {
     const logger = log || createLogger({ level: config.nodeEnv === 'production' ? 'info' : 'debug' });
 
-    const store = new Store(config.dataDir, config.familyConfigPath, {
-        requireLogins: config.trustTailscaleHeaders,
-    });
+    const store = new Store(config.dataDir, config.directoryConfigPath);
     const bus = createEventBus({ store, log: logger });
     const push = createPushNotifier({ config, log: logger });
     // Two transports, because a browser and a phone are woken by different things and fail

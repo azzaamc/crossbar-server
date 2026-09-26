@@ -66,7 +66,7 @@ http://{$CROSSBAR_PUBLIC_HOSTNAME} {
 	# is the development stand-in the server accepts when an operator has turned it on.
 	#
 	# This is a security requirement rather than tidiness: without it, anyone on the
-	# internet becomes any family member by sending one header, and every device-key check
+	# internet becomes anybody in the directory by sending one header, and every device-key check
 	# behind it is bypassed by a request that never had a key.
 	request_header -Tailscale-User-Login
 	request_header -Tailscale-User-Name

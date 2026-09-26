@@ -218,7 +218,7 @@ async function checkTurn(config) {
  * Every check this deployment can meaningfully run right now.
  *
  * A private deployment skips the public checks rather than failing them: a tailnet
- * household is not broken for lacking a hostname, and reporting it as one teaches an
+ * directory is not broken for lacking a hostname, and reporting it as one teaches an
  * operator to ignore the output.
  */
 async function diagnose({ config, store = null }) {

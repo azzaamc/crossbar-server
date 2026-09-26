@@ -74,7 +74,7 @@ test('its own files are served, and nothing above them', async (t) => {
 test('the page is public and every fact on it is not', async (t) => {
     const { server, base } = await startTestServer();
     t.after(() => server.close());
-    // Whoever asks gets the page; it carries no household data of its own.
+    // Whoever asks gets the page; it carries no directory data of its own.
     const page = await get(base, '/admin');
     assert.equal(page.status, 200);
     assert.doesNotMatch(page.body, /abdullah/i);
@@ -106,7 +106,7 @@ test('a password opens the console, and only the console', async (t) => {
     assert.equal(status.status, 200);
 
     // And it answers for the console's routes and nothing else: a browser holding it is not
-    // a household member, and must not be able to act as one.
+    // a directory member, and must not be able to act as one.
     const bootstrap = await fetch(`${base}/api/bootstrap`, { headers: { cookie } });
     assert.equal(bootstrap.status, 401);
 
@@ -166,7 +166,7 @@ test('a setting that would stop the server starting is refused, and put back', a
     assert.deepEqual(await unchanged.json(), { ok: true, changed: false, restarting: false });
 });
 
-test('the household can be changed from the console, and suspending is not removing', async (t) => {
+test('the directory can be changed from the console, and suspending is not removing', async (t) => {
     const { server, base } = await startTestServer(WITH_PASSWORD);
     t.after(() => server.close());
     const { cookie } = await signIn(base, PASSWORD);
@@ -187,24 +187,24 @@ test('the household can be changed from the console, and suspending is not remov
     assert.equal(added.status, 201, JSON.stringify(added.data));
     assert.ok(added.data.users.some((user) => user.id === 'sara'));
 
-    // Suspended: still a member of the household, no longer somebody who can be signed in as.
+    // Suspended: still a member of the directory, no longer somebody who can be signed in as.
     assert.equal((await asOperator('/api/admin/people/sara', { enabled: false })).status, 200);
     assert.equal(server.store.userById('sara'), null);
-    assert.ok(server.store.listUsers().some((user) => user.id === 'sara'), 'still in the household');
+    assert.ok(server.store.listUsers().some((user) => user.id === 'sara'), 'still in the directory');
 
     // Restored, and able to be recognised again.
     assert.equal((await asOperator('/api/admin/people/sara', { enabled: true })).status, 200);
     assert.ok(server.store.userById('sara'));
 
-    // A household may not lose its last administrator, whoever is asking.
+    // A directory may not lose its last administrator, whoever is asking.
     const lastAdmin = await asOperator('/api/admin/people/abdullah', { enabled: false });
     assert.equal(lastAdmin.status, 400);
-    assert.equal(lastAdmin.data.error.code, 'HOUSEHOLD_INVALID');
+    assert.equal(lastAdmin.data.error.code, 'DIRECTORY_INVALID');
 
     const removed = await asOperator('/api/admin/people/sara/remove');
     assert.equal(removed.status, 200);
 
-    // Gone from the household — the file no longer names her — and unable to be signed in
+    // Gone from the directory — the file no longer names her — and unable to be signed in
     // as. Still in the records, which is where the calls she was part of point.
     const people = await fetch(`${base}/api/admin/people`, { headers: { cookie: cookiePair(cookie) } });
     const listed = (await people.json()).people.map((person) => person.id);
@@ -212,7 +212,7 @@ test('the household can be changed from the console, and suspending is not remov
     assert.equal(server.store.userById('sara'), null);
     assert.equal(removed.data.revokedDevices, 0);
 
-    // And the count the console shows is the household's, not the rows': her row remains,
+    // And the count the console shows is the directory's, not the rows': her row remains,
     // which is the point, and counting it would make the server card disagree with the table.
     const status = await fetch(`${base}/api/admin/status`, { headers: { cookie: cookiePair(cookie) } });
     assert.equal((await status.json()).users, 3);
@@ -229,19 +229,25 @@ async function addPerson(base, cookie, person) {
     return { status: response.status, data: await response.json().catch(() => ({})) };
 }
 
-test('a person without a login is refused where a login is how people are found', async (t) => {
+test('a person without a login is saved with a warning where a login is how people are found', async (t) => {
     const { server, base } = await startTestServer(WITH_PASSWORD);
     t.after(() => server.close());
     const { cookie } = await signIn(base, PASSWORD);
 
-    const refused = await addPerson(base, cookie, { id: 'sara', displayName: 'Sara' });
-    assert.equal(refused.status, 400);
-    assert.equal(refused.data.error.code, 'HOUSEHOLD_INVALID');
-    assert.match(refused.data.error.message, /no login/);
+    // Saved, not refused. A device that has enrolled is a complete identity on its own, so a
+    // person with no login can still use this server — they are found by their own device rather
+    // than by the network saying who they are. Refusing the write was stricter than the server
+    // is, and it left an operator unable to add the very login it was complaining about.
+    const added = await addPerson(base, cookie, { id: 'sara', displayName: 'Sara' });
+    assert.equal(added.status, 201, JSON.stringify(added.data));
 
-    // And the console is told which reading applies, so it knows to ask for one.
+    // The console is still told to ask for a login, and is told who has none, so what used to be
+    // a refusal to save is now a directory that saves and says who cannot be found by name.
     const listed = await fetch(`${base}/api/admin/people`, { headers: { cookie: cookiePair(cookie) } });
-    assert.equal((await listed.json()).requireLogins, true);
+    const page = await listed.json();
+    assert.equal(page.requireLogins, true);
+    assert.ok(page.people.some((person) => person.id === 'sara'), 'the person is in the directory');
+    assert.match(page.warnings.join(' '), /sara has no login/);
 });
 
 test('a person without a login is taken where a login is only a record', async (t) => {
@@ -290,7 +296,7 @@ function deviceKey() {
 
 test('the console decides who can reach whom, and a call follows it', async (t) => {
     // A deployment that recognises nobody by where they are connecting from. This is the
-    // case the household file is the only source of contacts; where a proxy names the
+    // case the directory file is the only source of contacts; where a proxy names the
     // caller, arriving makes people mutually visible and masks how thin this is.
     const { server, base } = await startTestServer({
         ...WITH_PASSWORD,

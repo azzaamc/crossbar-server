@@ -118,9 +118,9 @@ test('an invitation admits one device, and then cannot be used again', async (t)
 /// The rule every list of people is filtered on.
 ///
 /// A public server refuses the network identity header, so a device enrolling is the only
-/// way anyone can be marked as having arrived — and for a while it was not: the household
+/// way anyone can be marked as having arrived — and for a while it was not: the directory
 /// read as empty on a server that had just accepted two phones.
-test('enrolling a device makes that person visible to the household', async (t) => {
+test('enrolling a device makes that person visible to the directory', async (t) => {
     const { server, base } = await startTestServer(AVAILABLE);
     t.after(() => server.close());
 
@@ -419,7 +419,7 @@ test('only an administrator may manage devices', async (t) => {
     const asAdmin = await api(base, 'abdullah@dev', '/api/admin/devices');
     assert.equal(asAdmin.status, 200);
 
-    // Manage means manage: a household member cannot revoke somebody else's phone.
+    // Manage means manage: a directory member cannot revoke somebody else's phone.
     const target = await enrolledDevice(base, 'mum');
     const denied = await api(base, 'dad@dev', `/api/admin/devices/${target.device.id}/revoke`, { method: 'POST' });
     assert.equal(denied.status, 403);
@@ -518,7 +518,13 @@ test('health answers without a session and says nothing worth having', async (t)
 
     const health = await api(base, null, '/api/health');
     assert.equal(health.status, 200);
-    assert.deepEqual(health.data, { status: 'ok', mode: 'private' });
+    assert.deepEqual(
+        { status: health.data.status, mode: health.data.mode },
+        { status: 'ok', mode: 'private' },
+    );
+    // Which build is answering. Nothing else the server says names it, and a machine that
+    // has been served two versions cannot be asked which one it is running.
+    assert.match(health.data.version, /^\d+\.\d+\.\d+$/);
 });
 
 // ── Adding another device ───────────────────────────────────────────────────────

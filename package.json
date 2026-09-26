@@ -1,7 +1,7 @@
 {
   "name": "crossbar-server",
   "version": "0.1.0",
-  "description": "The Crossbar server: identity, calls, and signalling for the family calling app.",
+  "description": "The Crossbar server: identity, calls, and signalling for the calling app.",
   "main": "src/server.js",
   "directories": {
     "test": "test"

@@ -247,10 +247,10 @@ function verifyPassword(password, stored) {
 /**
  * The operator's way in to the console.
  *
- * The console is an operator surface, not a client, and asking whoever runs this household
+ * The console is an operator surface, not a client, and asking whoever runs this directory
  * to enrol a device key before they could open it made the console the hardest page in the
  * product to reach. So it has a password of its own — one, shared by whoever administers
- * the household, stored only as a hash.
+ * the directory, stored only as a hash.
  *
  * Deliberately not an account: no username, no recovery, nothing to enumerate, and the same
  * answer whether the password is wrong or none has been set. What it produces is a session
@@ -378,7 +378,7 @@ function enroll({ store, config, now, token, publicKey, algorithm, deviceName, p
         });
         // Enrolling a device is someone arriving, and on a public server it is the only
         // arrival there is: the network identity header that used to mark a person present
-        // is refused there. Without this the household looks empty, which is how a
+        // is refused there. Without this the directory looks empty, which is how a
         // deployment with two phones in it came to show no contacts at all.
         if (registered) store.markSeen(user.id, now);
         return registered;

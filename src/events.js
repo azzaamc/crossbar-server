@@ -75,7 +75,7 @@ function createEventBus({ store, log, heartbeatMs = HEARTBEAT_MS }) {
         // Registered *before* anything is said about it.
         //
         // `isOnline` counts these entries, and this used to happen after the announcement
-        // below — so `presence` counted an empty set and told the household that somebody who
+        // below — so `presence` counted an empty set and told the directory that somebody who
         // had just connected was offline. Every connect said so. A phone that hears somebody
         // is offline has no reason to ask again, so the indicator stayed grey until something
         // else moved it, which is why refreshing appeared to flip it. Measured 2026-09-22,

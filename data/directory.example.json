@@ -28,6 +28,6 @@
     { "ownerId": "mum", "contactId": "dad", "sortOrder": 2 }
   ],
   "groups": [
-    { "id": "family", "displayName": "Family", "memberIds": ["abdullah", "dad", "mum"] }
+    { "id": "everyone", "displayName": "Everyone", "memberIds": ["abdullah", "dad", "mum"] }
   ]
 }

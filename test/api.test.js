@@ -53,7 +53,7 @@ test('a request with no trusted identity is refused', async (t) => {
     assert.equal(bootstrap.data.error.code, 'IDENTITY_MISSING');
 });
 
-test('a login the household file pins is the identity that person gets', async (t) => {
+test('a login the directory file pins is the identity that person gets', async (t) => {
     const { server, base } = await startTestServer();
     t.after(() => server.close());
 
@@ -77,7 +77,7 @@ test('with auto-enrolment off, an unknown login is refused rather than enrolled'
 
     const session = await api(base, 'stranger@dev', '/api/session');
     assert.equal(session.data.authenticated, true, 'the identity is trusted');
-    assert.equal(session.data.configured, false, 'but it is not a member of this household');
+    assert.equal(session.data.configured, false, 'but it is not a member of this directory');
 });
 
 test('with auto-enrolment on, a new tailnet login joins and becomes discoverable', async (t) => {
@@ -114,7 +114,7 @@ test('bootstrap carries the directory, the groups and the calls of the person as
         ['abdullah'],
         'only people who have signed in at least once are in the directory',
     );
-    assert.equal(bootstrap.data.groups[0].id, 'family');
+    assert.equal(bootstrap.data.groups[0].id, 'everyone');
     assert.equal(bootstrap.data.calls.length, 1);
     assert.equal(bootstrap.data.calls[0].myStatus, 'invited');
     assert.equal(bootstrap.data.calls[0].id, call.call.id);

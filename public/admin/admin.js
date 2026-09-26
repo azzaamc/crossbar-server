@@ -143,10 +143,19 @@ const slug = (text) => String(text || '').toLowerCase().trim()
     .slice(0, 32);
 
 function peopleView(people, refresh, requireLogins) {
+    // Above the names rather than beside the form. The point of the rule is who cannot be found,
+    // which is a fact about the directory, so it is shown whenever the directory is — including
+    // straight after an edit, since every edit reloads this list.
+    const warnings = (people.warnings || []).length
+        ? el('p', { class: 'muted' }, [
+            el('strong', { text: 'Not found by a login: ' }),
+            el('span', { text: people.warnings.join(' ') }),
+        ])
+        : null;
     const rows = people.map((person) => el('tr', { class: person.suspended ? 'inactive' : '' }, [
         el('td', { text: person.displayName }),
         el('td', { text: person.admin ? 'administrator' : '—' }),
-        el('td', { text: person.suspended ? 'suspended' : person.arrived ? 'in the household' : 'has not signed in' }),
+        el('td', { text: person.suspended ? 'suspended' : person.arrived ? 'in the directory' : 'has not signed in' }),
         el('td', { class: 'numeric', text: person.devices }),
         el('td', { text: person.login || '—' }),
         el('td', { text: when(person.lastAuthenticated) }),
@@ -168,7 +177,7 @@ function peopleView(people, refresh, requireLogins) {
                 class: 'danger',
                 text: 'Remove',
                 onClick: async () => {
-                    if (!confirm(`Take ${person.displayName} out of the household?\n\n`
+                    if (!confirm(`Take ${person.displayName} out of the directory?\n\n`
                         + 'Their devices stop working, and their calls stay in the records.')) return;
                     await call(`/api/admin/people/${encodeURIComponent(person.id)}/remove`, { method: 'POST' });
                     await refresh();
@@ -238,6 +247,7 @@ function peopleView(people, refresh, requireLogins) {
     ]);
 
     return section('People',
+        ...(warnings ? [warnings] : []),
         table(['Name', 'Role', 'State', 'Devices', 'Login', 'Last authenticated', ''], rows,
             { numeric: ['Devices'] }),
         addCard);
@@ -246,13 +256,14 @@ function peopleView(people, refresh, requireLogins) {
 /**
  * Who can reach whom.
  *
- * The app's entire list of people is this and nothing else, which is why a household with
- * everybody in it can still read as "no one is here yet": being in the household is not
- * the same as being reachable, and it is not the same as being able to ring anybody.
+ * Everybody reaches everybody, and there is nothing here to configure. A table of ticks was
+ * here once and it was the shape of the mistake: reaching somebody is something two people do
+ * together, so every tick had an opposite that had to stay in step with it, and an operator
+ * keeping that true by hand is an operator who will one day not.
  *
- * A matrix rather than a list of pairs, because a tick always has its opposite — reaching
- * somebody is something two people do together — and a grid is the only shape where that
- * shows itself without being explained.
+ * So this says what is true, and offers the one act that makes it true again if something has
+ * changed it. Somebody added to the directory already reaches everybody by the time they
+ * appear, which is what makes this a description rather than a control.
  */
 function contactsView(people, contacts, refresh) {
     if (people.length < 2) {
@@ -260,51 +271,44 @@ function contactsView(people, contacts, refresh) {
             el('p', { class: 'muted', text: 'Reaching somebody takes two people. Add another one first.' }));
     }
 
-    const reaches = new Set(contacts.map((item) => `${item.ownerId}→${item.contactId}`));
+    const reaches = new Set(contacts.map((item) => `${item.ownerId}\u2192${item.contactId}`));
+    const missing = [];
+    for (const owner of people) {
+        for (const other of people) {
+            if (owner.id !== other.id && !reaches.has(`${owner.id}\u2192${other.id}`)) {
+                missing.push(`${owner.displayName} cannot reach ${other.displayName}`);
+            }
+        }
+    }
 
-    // Each row has to be a `tr`: the table helper appends what it is given, and an array
-    // of cells is appended as a string rather than as a row.
-    const rows = people.map((owner) => el('tr', {}, [
-        el('td', {}, [
-            el('div', { text: owner.displayName }),
-            owner.arrived ? null : el('div', { class: 'muted', text: 'has not signed in yet' }),
-        ]),
-        ...people.map((other) => {
-            if (other.id === owner.id) return el('td', { class: 'muted', text: '—' });
-            return el('td', {}, [el('input', {
-                type: 'checkbox',
-                checked: reaches.has(`${owner.id}→${other.id}`),
-                'aria-label': `${owner.displayName} can reach ${other.displayName}`,
-                onClick: async (event) => {
-                    const wanted = event.currentTarget.checked;
-                    await call(wanted ? '/api/admin/contacts' : '/api/admin/contacts/remove', {
-                        method: 'POST',
-                        body: JSON.stringify({ ownerId: owner.id, contactId: other.id }),
-                    });
-                    await refresh();
-                },
-            })]);
-        }),
-    ]));
+    const note = el('p', {
+        class: 'muted',
+        text: 'Everybody here can reach everybody else, and somebody you add reaches them from '
+            + 'the moment they arrive. Somebody who has not signed in yet is shown to nobody '
+            + 'until they do \u2014 an invitation tells them how to arrive.',
+    });
 
-    const everyone = el('button', { type: 'button', class: 'primary', text: 'Everybody can reach everybody' });
-    everyone.addEventListener('click', async () => {
-        if (!confirm(`Let all ${people.length} people reach each other?\n\n`
-            + 'This replaces whatever is ticked now, including anybody you have left out.')) return;
+    if (!missing.length) {
+        return section('Who can reach whom', note,
+            el('p', { text: 'Everybody can reach everybody.' }));
+    }
+
+    // Only reachable at all through the API, which can still write a single pair. Said in
+    // full: a count is not a fact anybody can act on.
+    const shown = missing.slice(0, 6);
+    const open = el('button', { type: 'button', class: 'primary', text: 'Let everybody reach everybody' });
+    open.addEventListener('click', async () => {
         await call('/api/admin/contacts/everyone', { method: 'POST', body: '{}' });
         await refresh();
     });
 
-    return section('Who can reach whom',
+    return section('Who can reach whom', note,
         el('p', {
-            class: 'muted',
-            text: 'Ticking a box ticks its opposite: reaching somebody is something two people '
-                + 'do together, so a half-relationship cannot be made here by accident. Somebody '
-                + 'who has not signed in yet is shown to nobody until they do, whatever is '
-                + 'ticked — an invitation tells them how to arrive.',
+            text: `${shown.join('; ')}${missing.length > shown.length
+                ? `, and ${missing.length - shown.length} more`
+                : ''}.`,
         }),
-        table(['', ...people.map((person) => person.displayName)], rows),
-        el('div', { class: 'row' }, [everyone]));
+        el('div', { class: 'row' }, [open]));
 }
 
 function devicesView(devices, refresh) {
@@ -319,7 +323,11 @@ function devicesView(devices, refresh) {
             // whether it can be told anything, and it is the first thing to check when a
             // call does not arrive.
             el('td', {
-                text: [device.hasVoipToken ? 'ring' : null, device.hasPushToken ? 'alerts' : null]
+                // `none` rather than nothing. A phone that can be rung and one that cannot
+                // looked identical here — an empty cell — and a device enrolled during the
+                // launch that gave it its push token files none, which is a state an operator
+                // has to be able to see rather than deduce. Measured 2026-09-24.
+                text: [device.hasVoipToken ? 'ring' : null, device.hasPushToken ? 'alerts' : null].filter(Boolean).join(', ') || 'none'
                     .filter(Boolean).join(' + ') || '—',
             }),
             el('td', { text: when(device.lastSeenAt) }),
@@ -509,7 +517,7 @@ function showEnrolment(notice) {
 }
 
 /**
- * The way in for whoever runs this household.
+ * The way in for whoever runs this directory.
  *
  * The console is an operator surface, not a client, so it takes a password — kept on the
  * server only as a hash, and answered with a session cookie this page cannot read. The
@@ -564,7 +572,7 @@ function showLogin(message, withoutPassword) {
     main.replaceChildren(
         el('h2', { text: 'This console' }),
         el('p', {
-            text: 'Signing in here administers the household: who is in it, which devices are '
+            text: 'Signing in here administers the directory: who is in it, which devices are '
                 + 'enrolled, and how the server itself is configured. The password is checked '
                 + 'against a hash on the server and never travels anywhere else.',
         }),

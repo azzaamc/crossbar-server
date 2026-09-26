@@ -15,6 +15,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const { DatabaseSync } = require('node:sqlite');
+const backup = require('./backup');
 const machine = require('./calls');
 
 const SCHEMA = `
@@ -36,12 +37,12 @@ CREATE TABLE IF NOT EXISTS contacts (
   PRIMARY KEY (owner_user_id, contact_user_id),
   CHECK (owner_user_id <> contact_user_id)
 );
-CREATE TABLE IF NOT EXISTS family_groups (
+CREATE TABLE IF NOT EXISTS groups (
   id TEXT PRIMARY KEY,
   display_name TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS group_members (
-  group_id TEXT NOT NULL REFERENCES family_groups(id) ON DELETE CASCADE,
+  group_id TEXT NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
   user_id TEXT NOT NULL REFERENCES users(id),
   PRIMARY KEY (group_id, user_id)
 );
@@ -143,7 +144,7 @@ const MIGRATIONS = [
             addColumnIfMissing(db, 'devices', 'revoked_at', 'TEXT');
 
             // Who may admit a device or take one away. It is a property of a person in
-            // the household file, not a separate account: there is one kind of user
+            // the directory file, not a separate account: there is one kind of user
             // here, and some of them administer.
             addColumnIfMissing(db, 'users', 'admin', 'INTEGER NOT NULL DEFAULT 0');
 
@@ -214,10 +215,10 @@ const MIGRATIONS = [
     {
         version: 3,
         apply(db) {
-            // `relationship` labelled a person to the household — "Father", "Me" — and it
+            // `relationship` labelled a person to the directory — "Father", "Me" — and it
             // turned out to carry nothing: no screen needed it, and a label a person cannot
             // change about themselves is worse than no label at all. It is gone from the
-            // household file, the API and the app; this takes it off databases that already
+            // directory file, the API and the app; this takes it off databases that already
             // have it.
             dropColumnIfPresent(db, 'users', 'relationship');
         },
@@ -269,21 +270,84 @@ const MIGRATIONS = [
             addColumnIfMissing(db, 'devices', 'voip_environment', 'TEXT');
         },
     },
+    {
+        version: 6,
+        apply(db) {
+            // The table holding groups was once named after the product this started as.
+            // A database older than this rename still has the old name — and, because the
+            // schema creates the new one by name on every start, ends up holding both: the
+            // old table with the rows and the foreign key pointing at it, and a new empty
+            // one. The old table is the real one: it takes the name, and the empty one goes.
+            const tables = new Set(db.prepare(
+                "SELECT name FROM sqlite_master WHERE type = 'table'",
+            ).all().map((row) => row.name));
+            if (!tables.has('family_groups')) return;
+            if (tables.has('groups')) {
+                const rows = db.prepare('SELECT COUNT(*) AS n FROM groups').get().n;
+                if (rows) throw new Error(`groups holds ${rows} rows while family_groups also exists`);
+                db.exec('DROP TABLE groups');
+            }
+            db.exec('ALTER TABLE family_groups RENAME TO groups');
+        },
+    },
 ];
 
 class Store {
-    constructor(dataDir, familyConfigPath, { requireLogins = true } = {}) {
-        // Whether a login is how somebody is found here. True where a tailnet proxy names
-        // the caller, false where a device proves itself with a key: on such a deployment
-        // a login is a record of who somebody is elsewhere, and a household whose people
-        // have no tailnet at all has none to write down.
-        this.requireLogins = requireLogins;
+    constructor(dataDir, directoryConfigPath) {
+        // Loading a directory does not require a login from anybody, and that is deliberate.
+        //
+        // A directory is written down before its people's tailnet logins are known, and a
+        // deployment that can be switched into a mode it then cannot start in is one nobody
+        // can be asked to install. Where a login *is* how somebody is found, a person without
+        // one is simply never found by it: they have no identity, so they cannot reach the
+        // service, and the console shows them without one and asks for it the moment the
+        // directory is edited. Being unreachable is a state to fix, not a reason to refuse
+        // to run.
         fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 });
-        this.db = new DatabaseSync(path.join(dataDir, 'crossbar.sqlite'));
+        const databasePath = path.join(dataDir, 'crossbar.sqlite');
+        this.db = new DatabaseSync(databasePath);
         this.db.exec('PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;');
+        try {
+            this.snapshotBeforeMigration(dataDir, databasePath);
+        } catch (error) {
+            // A constructor that throws leaves nothing holding the connection, and this
+            // database is to be left exactly as it was found.
+            this.db.close();
+            throw error;
+        }
         this.db.exec(SCHEMA);
         this.migrate();
-        this.syncFamilyConfig(familyConfigPath);
+        this.syncDirectory(directoryConfigPath);
+    }
+
+    /**
+     * The database as it stands, kept before anything changes it.
+     *
+     * `MIGRATIONS` run here, forward-only, under `Restart=always`: a migration that fails on a
+     * real database takes the service down, systemd starts it again into the same failure, and
+     * without a copy from before that first attempt the only way back is yesterday's backup —
+     * or none. So the snapshot is taken first and a snapshot that cannot be written stops the
+     * start: refusing to run is a deployment that is down but intact, and migrating without a
+     * copy is one that may be neither.
+     *
+     * A database with no tables is one this constructor is about to create, and a copy of it
+     * protects nothing while sitting in `data/backups` looking exactly like one that does. Both
+     * this decision and the copy itself live in `backup.js`, so the pre-migration snapshot and
+     * the daily backup cannot drift apart about where they write or what they are called.
+     */
+    snapshotBeforeMigration(dataDir, databasePath) {
+        const highest = MIGRATIONS.reduce((max, migration) => Math.max(max, migration.version), 0);
+        const current = this.db.prepare('PRAGMA user_version').get().user_version || 0;
+        if (current >= highest) return null;
+        const tables = this.db.prepare(
+            "SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table'",
+        ).get().n;
+        if (!tables) return null;
+        try {
+            return backup.snapshotBeforeMigration({ dataDir, databasePath, version: highest });
+        } catch (error) {
+            throw new Error(`Refusing to migrate to v${highest} without a snapshot: ${error.message}`);
+        }
     }
 
     /** Applies whatever this database has not seen. Safe to run on every start. */
@@ -335,22 +399,22 @@ class Store {
     // ── Configuration ───────────────────────────────────────────────────────────
 
     /**
-     * Users, contacts and groups come from a file the household maintains, and are
+     * Users, contacts and groups come from a file the directory maintains, and are
      * re-applied on every start. A user's display name and avatar are only taken
      * from the file *before* they have ever signed in: after that, what the tailnet
      * says about them wins, because that is the name their devices show.
      */
-    syncFamilyConfig(filePath) {
-        if (!fs.existsSync(filePath)) throw new Error(`Family configuration not found: ${filePath}`);
+    syncDirectory(filePath) {
+        if (!fs.existsSync(filePath)) throw new Error(`No directory file at ${filePath}.`);
         const parsed = JSON.parse(fs.readFileSync(filePath, 'utf8'));
         const users = Array.isArray(parsed.users) ? parsed.users : [];
-        if (!users.length) throw new Error('Family configuration requires at least one user');
+        if (!users.length) throw new Error('A directory needs at least one person.');
 
         this.transaction(() => {
             // A login is how a tailnet identity finds its person, and only one row may
             // hold it. Moving one — correcting a mistyped login, or swapping two
             // people's — would otherwise collide with whoever holds it now, and the
-            // server would refuse to start over a household file that is perfectly
+            // server would refuse to start over a directory file that is perfectly
             // correct. So every login the file is about to claim is released first,
             // under a value no login can be.
             const release = this.db.prepare(`
@@ -360,9 +424,6 @@ class Store {
             for (const user of users) {
                 assertId(user.id, 'user id');
                 const login = String(user.tailscaleLogin || '').trim().toLowerCase();
-                if (!login && this.requireLogins) {
-                    throw new Error(`Missing tailscale login for ${user.id}`);
-                }
                 // Only a login that exists is released: the statement matches on equality,
                 // and an absent one has nothing to collide with.
                 if (login) release.run(login, user.id);
@@ -380,32 +441,29 @@ class Store {
             for (const user of users) {
                 assertId(user.id, 'user id');
                 const login = String(user.tailscaleLogin || '').trim().toLowerCase();
-                if (!login && this.requireLogins) {
-                    throw new Error(`Missing tailscale login for ${user.id}`);
-                }
                 upsert.run(
                     user.id,
                     // Absent, not empty: SQLite treats NULLs as distinct in a unique index,
-                    // which is what lets a household have more than one person without one.
+                    // which is what lets a directory have more than one person without one.
                     login || null,
                     cleanText(user.displayName, 80, 'display name'),
                     cleanOptional(user.avatar, 500),
                     user.admin ? 1 : 0,
-                    // Suspending is a statement about the household, kept in the file where the
-                    // household is written down: a suspended person keeps their identity, their
+                    // Suspending is a statement about the directory, kept in the file where the
+                    // directory is written down: a suspended person keeps their identity, their
                     // devices and their history, and stops being able to sign in.
                     user.enabled === false ? 0 : 1,
                 );
             }
 
-            this.db.exec('DELETE FROM contacts; DELETE FROM group_members; DELETE FROM family_groups;');
+            this.db.exec('DELETE FROM contacts; DELETE FROM group_members; DELETE FROM groups;');
             const insertContact = this.db.prepare(
                 'INSERT INTO contacts (owner_user_id, contact_user_id, sort_order) VALUES (?, ?, ?)',
             );
             for (const item of parsed.contacts || []) {
                 insertContact.run(item.ownerId, item.contactId, Number(item.sortOrder) || 0);
             }
-            const insertGroup = this.db.prepare('INSERT INTO family_groups (id, display_name) VALUES (?, ?)');
+            const insertGroup = this.db.prepare('INSERT INTO groups (id, display_name) VALUES (?, ?)');
             const insertMember = this.db.prepare('INSERT INTO group_members (group_id, user_id) VALUES (?, ?)');
             for (const group of parsed.groups || []) {
                 assertId(group.id, 'group id');
@@ -433,7 +491,7 @@ class Store {
         `).get(id) || null;
     }
 
-    /** Everyone the household file knows, for an operator. */
+    /** Everyone the directory file knows, for an operator. */
     listUsers() {
         return this.db.prepare(`
             SELECT u.id, u.display_name AS displayName, u.tailscale_login AS login,
@@ -448,7 +506,7 @@ class Store {
      *
      * Two ways to become a member:
      *
-     * * an entry in the household file pins a person's id, name and avatar before
+     * * an entry in the directory file pins a person's id, name and avatar before
      *   they have ever signed in — which is what gives them a stable identity in
      *   everyone else's directory;
      * * with `autoEnrol` (the default, and what the service this replaces did), a
@@ -458,7 +516,7 @@ class Store {
      * Auto-enrolment means the tailnet is the perimeter: anyone who can reach this
      * listener has already passed Tailscale's own admission, and the alternative —
      * requiring every device's login to be written into a file first — is how a
-     * household ends up with members who cannot call anybody because nobody
+     * directory ends up with members who cannot call anybody because nobody
      * updated the file. Set `AUTO_ENROL_IDENTITIES=false` to require the file.
      */
     observeIdentity(identity, now, { autoEnrol = true } = {}) {
@@ -515,7 +573,7 @@ class Store {
      * `first_seen_at` is what every contact, group and callable list is filtered on, and
      * until now the only thing that set it was `observeIdentity` — which reads a login out
      * of a header the local proxy injected. A public deployment refuses that header
-     * outright, so nobody could ever be marked present: the household read as empty and the
+     * outright, so nobody could ever be marked present: the directory read as empty and the
      * app connected to a server that knew no one. Enrolling a device is the strongest
      * evidence of arrival a server like this has, which is why that is what sets it.
      */
@@ -541,7 +599,7 @@ class Store {
     groupsFor(userId) {
         const groups = this.db.prepare(`
             SELECT g.id, g.display_name AS displayName
-            FROM family_groups g JOIN group_members mine ON mine.group_id = g.id
+            FROM groups g JOIN group_members mine ON mine.group_id = g.id
             WHERE mine.user_id = ? ORDER BY g.display_name
         `).all(userId);
         const members = this.db.prepare(`
@@ -758,9 +816,9 @@ class Store {
     /**
      * Whether somebody may be signed in as.
      *
-     * What leaving the household comes to on this side: the file stops naming them, and
+     * What leaving the directory comes to on this side: the file stops naming them, and
      * their row stays, because calls, participants, devices and authenticators all point at
-     * it and a household's history is not something to erase to tidy a list. `userById` and
+     * it and a directory's history is not something to erase to tidy a list. `userById` and
      * `userByLogin` refuse a row that is not enabled, so this is the whole of it.
      */
     setUserEnabled(id, enabled) {
@@ -1344,7 +1402,7 @@ function identityDisplayName(name, login) {
     const trusted = String(name || '').replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, 80);
     if (trusted) return trusted;
     const localPart = login.split('@')[0].replace(/[._-]+/g, ' ').trim();
-    if (!localPart) return 'Family member';
+    if (!localPart) return 'Directory member';
     return localPart.replace(/\b\p{L}/gu, (letter) => letter.toLocaleUpperCase()).slice(0, 80);
 }
 

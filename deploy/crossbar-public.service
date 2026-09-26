@@ -1,0 +1,81 @@
+# Crossbar in public mode: the public hostname is the way in, and the tailnet is not one.
+#
+# This runs before the server on every start, which is what makes a mode switch one action.
+# The switch rewrites the mode in `.env` and leaves; systemd restarts crossbar; crossbar
+# wants this unit and the private one, and the check below means exactly one of them does
+# anything. Nothing has to be remembered, and nothing outside the file has to be kept in
+# step with it.
+
+[Unit]
+Description=Crossbar in public mode (the public hostname in, the tailnet out)
+
+After=network-online.target
+Wants=network-online.target
+
+Before=crossbar.service
+
+[Service]
+Type=oneshot
+# `RemainAfterExit` is deliberately absent, and that absence is load-bearing. A oneshot
+# without it goes inactive the moment it has run, which is the whole mechanism of a switch:
+# the units are not active afterwards, so the next `systemctl restart crossbar` starts them
+# again and the shape is re-applied every time. `RemainAfterExit=yes` would leave this one
+# "active (exited)" after its first run; every later restart would find it already active,
+# skip it, and leave the box in the previous mode while reporting a clean restart. If you
+# are reading this because you are about to add it: don't.
+EnvironmentFile=/home/admin/crossbar/.env
+
+# Which mode this unit is for is answered by the same file the server reads, so there is one
+# answer to "which mode is this deployment in" and no second copy to drift.
+#
+# `grep` here rather than `ConditionEnvironment=`, which looks like the obvious tool and is
+# not: that condition is checked against the *manager's* environment (/proc/1/environ), so
+# `EnvironmentFile=` never reaches it and the check fails in both modes. Measured -- both
+# units were skipped, including the one whose mode was in force -- and a condition that
+# fails quietly is worse than no condition, because the box looks switched and is not.
+#
+# `-x` is a whole-line match, so a comment or a longer name that merely contains this one
+# cannot satisfy it.
+ExecCondition=/usr/bin/grep -qx CROSSBAR_NETWORK_MODE=public /home/admin/crossbar/.env
+
+# The tailnet stops serving first, so the two ways in are never open at the same moment --
+# and a switch interrupted halfway leaves the box reachable by one of them rather than by
+# neither.
+#
+# The node stays joined to the tailnet; only serving stops. `tailscale down` would take the
+# address with it, and coming back would then mean a re-join -- and a re-approval is the one
+# cost a switch should never be able to impose on a directory. An idle node serves nothing.
+#
+# `-` because a deployment that was not serving is already in the state this asks for, and
+# that is not a failure: the `error: failed to remove web serve: handler does not exist` it
+# leaves in the journal is that case being tolerated, not something going wrong.
+ExecStart=-/usr/bin/tailscale serve --https=443 off
+
+# Then the public route comes back.
+#
+# A command rather than `Wants=caddy.service`, and `crossbar-private.service` is written the
+# same way for the opposite direction. A dependency is resolved while the start is still
+# being planned, before conditions are read, so a `Conflicts=` on the private unit stopped
+# Caddy even on a start whose own condition then declined to make it -- a public outage
+# decided by a check nobody reads. A command here runs only if the check passed, which is
+# is the property the switch rests on. Measured, not assumed, with a stand-in unit.
+ExecStart=/usr/bin/systemctl start caddy
+
+# Then the relay, if this box runs one.
+#
+# coturn's whole view of who it is comes from `.env`, and only at its start: `ExecStartPre`
+# renders the template with `envsubst`, taking `realm` from `CROSSBAR_PUBLIC_HOSTNAME`
+# (`deploy/coturn.conf:27`) and `external-ip` from `CROSSBAR_TURN_EXTERNAL_IP`. The switch
+# rewrites `.env`, so a relay left running across one keeps advertising the mode the box
+# just left -- and coturn starts happily on a stale value, so it shows up as media that will
+# not relay rather than as a configuration error, which is the expensive way to find out.
+# Restarting it here is what makes the relay part of the same switch instead of a second
+# thing an operator has to remember, and the next reboot would not fix it either.
+#
+# `try-restart` rather than `restart`: it acts only on a unit that is already running, so a
+# deployment with no relay configured is left alone rather than being pulled in and started
+# by a mode switch. `-` because this is best-effort even so: a box where the unit does not
+# exist answers systemctl with an error rather than the no-op, and a shaper that has already
+# moved the front door must not report itself failed over the relay it was never asked to
+# have.
+ExecStart=-/usr/bin/systemctl try-restart crossbar-turn.service

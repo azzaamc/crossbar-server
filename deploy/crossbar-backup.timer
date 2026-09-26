@@ -1,0 +1,24 @@
+[Unit]
+Description=Daily Crossbar backup
+
+[Timer]
+# What a missed run costs, and why it is daily.
+#
+# The database is the only thing in this deployment that cannot be reconstructed: the units,
+# the Caddyfile and `.env` are in the repository or written by `node src/admin.js`, but the
+# record of who called whom exists nowhere else. The directory file is the only thing a person
+# typed. A restore is those two files, and how to do one is in `deploy/README.md`.
+#
+# Nothing here rotates the copies off the box, and that is deliberate rather than forgotten:
+# `backup.js` keeps the newest 14, which is two weeks of daily backups, and where they are
+# carried to next is a decision for whoever runs this deployment -- not a `scp` in a timer,
+# which would hold a key no one is reminded about.
+OnCalendar=daily
+# A box that was off at the scheduled moment -- a reboot, a power cut, the VPS being migrated --
+# runs the missed backup when it comes back. Without this, an outage long enough to be
+# inconvenient is also an outage that leaves the deployment with no backups at all, silently.
+Persistent=true
+Unit=crossbar-backup.service
+
+[Install]
+WantedBy=timers.target

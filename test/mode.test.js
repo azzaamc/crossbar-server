@@ -30,19 +30,66 @@ NETWORK_MODE_PUBLIC_BIND_ADDRESS=203.0.113.7
 
 CROSSBAR_SESSION_SECRET=a-secret-that-must-survive
 DATA_DIR=./data
-FAMILY_CONFIG_PATH=./data/family.json
+DIRECTORY_CONFIG_PATH=./data/directory.json
 `;
+
+const SECTION_BEGIN = '# >>> the configuration in force, written by `node src/admin.js mode` >>>';
+const SECTION_END = '# <<< end of the configuration in force <<<';
+
+// The same deployment, with the section a switch has already written: this is the shape a
+// real `.env` is in, and the one where "leaves the rest of the file alone" means something.
+const MARKED = `# A deployment that holds both configurations.
+HOST=127.0.0.1
+
+# The tailnet: a proxy injects the identity header.
+NETWORK_MODE_PRIVATE_HOSTNAME=qatar-vpn.taile123.ts.net
+NETWORK_MODE_PRIVATE_ORIGIN=https://qatar-vpn.taile123.ts.net
+
+# The open internet: a reverse proxy terminates TLS on the address below.
+NETWORK_MODE_PUBLIC_HOSTNAME=crossbar.example.com
+NETWORK_MODE_PUBLIC_ORIGIN=https://crossbar.example.com
+NETWORK_MODE_PUBLIC_BIND_ADDRESS=203.0.113.7
+
+${SECTION_BEGIN}
+CROSSBAR_NETWORK_MODE=private
+CROSSBAR_PUBLIC_HOSTNAME=qatar-vpn.taile123.ts.net
+PUBLIC_ORIGIN=https://qatar-vpn.taile123.ts.net
+CROSSBAR_BIND_ADDRESS=
+# Left empty on purpose: the mode decides both. The identity header is believed
+# only in private mode, and device keys are required only in public.
+TRUST_TAILSCALE_HEADERS=
+CROSSBAR_REQUIRE_DEVICE_AUTH=
+${SECTION_END}
+
+# The deployment's own settings, below the section on purpose: whether the switch keeps them,
+# and keeps them here, is the whole of what it promises.
+CROSSBAR_SESSION_SECRET=a-secret-that-must-survive
+DATA_DIR=./data
+DIRECTORY_CONFIG_PATH=./data/directory.json
+`;
+
+// A hand-written override above the section — the case D2 exists for. `loadDotEnv` keeps the
+// first value it sees, so this line would quietly beat the mode's own origin.
+const CONTRADICTED = MARKED.replace('HOST=127.0.0.1\n', 'HOST=127.0.0.1\nPUBLIC_ORIGIN=http://127.0.0.1:3010\n');
+
+/** What a switch has no business touching: the file with its generated section taken out. */
+function outsideSection(content) {
+    const lines = content.split('\n');
+    const begin = lines.findIndex((line) => line.trim() === SECTION_BEGIN);
+    const end = lines.findIndex((line) => line.trim() === SECTION_END);
+    return [...lines.slice(0, begin), ...lines.slice(end + 1)].join('\n');
+}
 
 /** A deployment directory holding only what the switch reads and writes. */
 function deployment(env) {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'crossbar-mode-'));
     fs.mkdirSync(path.join(dir, 'data'), { recursive: true });
-    const household = JSON.stringify({
+    const directory = JSON.stringify({
         users: [{ id: 'one', tailscaleLogin: 'one@dev', displayName: 'One', avatar: '' }],
         contacts: [],
         groups: [],
     });
-    fs.writeFileSync(path.join(dir, 'data', 'family.json'), household);
+    fs.writeFileSync(path.join(dir, 'data', 'directory.json'), directory);
     fs.writeFileSync(path.join(dir, '.env'), env);
     return dir;
 }
@@ -57,8 +104,25 @@ const admin = (dir, ...args) => spawnSync(process.execPath, [ADMIN, ...args], {
     encoding: 'utf8',
 });
 
-test('switching writes that mode, and leaves the rest of the file alone', () => {
+test('switching rewrites the section and leaves everything outside it byte-identical', () => {
+    const content = applyMode(MARKED, 'public');
+    assert.match(content, /^CROSSBAR_NETWORK_MODE=public$/m);
+    assert.match(content, /^PUBLIC_ORIGIN=https:\/\/crossbar\.example\.com$/m);
+    assert.match(content, /^CROSSBAR_BIND_ADDRESS=203\.0\.113\.7$/m);
+    // Rewritten, not added to: the private values the section carried are gone, so nothing
+    // inside it can still be read by whatever comes after a switch.
+    assert.equal(content.match(/^CROSSBAR_NETWORK_MODE=/gm).length, 1);
+    assert.equal(content.match(/^CROSSBAR_PUBLIC_HOSTNAME=/gm).length, 1);
+    assert.equal(content.match(/^PUBLIC_ORIGIN=/gm).length, 1);
+    // Everything else to the byte — comments, blank lines, the settings below the section —
+    // and in the same order: a switch owns the section, not the file.
+    assert.equal(outsideSection(content), outsideSection(MARKED));
+    assert.ok(content.indexOf('CROSSBAR_SESSION_SECRET') > content.indexOf(SECTION_END));
+});
+
+test('a file with no section yet gets one, and every line it had is left above it', () => {
     const content = applyMode(CONFIGURED, 'public');
+    assert.ok(content.startsWith(CONFIGURED), 'the section is appended, so nothing above it moves');
     assert.match(content, /^CROSSBAR_NETWORK_MODE=public$/m);
     assert.match(content, /^PUBLIC_ORIGIN=https:\/\/crossbar\.example\.com$/m);
     assert.match(content, /^CROSSBAR_BIND_ADDRESS=203\.0\.113\.7$/m);
@@ -67,13 +131,20 @@ test('switching writes that mode, and leaves the rest of the file alone', () => 
     assert.match(content, /^DATA_DIR=\.\/data$/m);
 });
 
-test('the name is the switch\'s wherever else it appears, so a stale line cannot win', () => {
+test('a generated name outside the section is refused, and the message says which line', () => {
+    // Refused rather than deleted: the plain names are the supported override for a run that
+    // is not a deployment, so the file has to be fixed by the person who wrote it.
     const stale = 'TRUST_TAILSCALE_HEADERS=true\nCROSSBAR_REQUIRE_DEVICE_AUTH=true\nDATA_DIR=./data\n';
-    const content = applyMode(stale, 'public');
-    assert.equal(content.match(/^TRUST_TAILSCALE_HEADERS=/gm).length, 1);
-    assert.match(content, /^TRUST_TAILSCALE_HEADERS=$/m);
-    assert.match(content, /^CROSSBAR_REQUIRE_DEVICE_AUTH=$/m);
-    assert.match(content, /^DATA_DIR=\.\/data$/m);
+    assert.throws(() => applyMode(stale, 'public'),
+        /TRUST_TAILSCALE_HEADERS is set outside the generated section, on line 1/);
+    // The line below the section is outside it too, and so is a name the switch has not
+    // reached yet: it is the position in the file that decides, not which marker is nearer.
+    const below = `${MARKED}\nCROSSBAR_PUBLIC_HOSTNAME=somewhere.else\n`;
+    assert.throws(() => applyMode(below, 'public'),
+        /CROSSBAR_PUBLIC_HOSTNAME is set outside the generated section, on line \d+/);
+    // One marker without the other leaves the switch unable to say which lines are its own,
+    // and guessing would be how a line of the operator's disappears.
+    assert.throws(() => applyMode(`${SECTION_BEGIN}\nDATA_DIR=./data\n`, 'private'), /damaged/);
 });
 
 test('switching to the mode already written changes nothing', () => {
@@ -114,4 +185,29 @@ test('with no argument it shows both, and which one is in force', () => {
     assert.match(result.stdout, /private/);
     assert.match(result.stdout, /crossbar\.example\.com/);
     assert.match(result.stdout, /in force/);
+});
+
+test('a switch that meets an override outside the section refuses, and the file is untouched', () => {
+    const dir = deployment(CONTRADICTED);
+    const before = envFile(dir);
+    const result = admin(dir, 'mode', 'public');
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /PUBLIC_ORIGIN is set outside the generated section, on line 3/);
+    assert.equal(envFile(dir), before, 'a refusal before the write leaves nothing to put back');
+});
+
+test('a switch stages the write inside the data directory and keeps the file it replaced', () => {
+    const dir = deployment(MARKED);
+    const before = envFile(dir);
+    const result = admin(dir, 'mode', 'public');
+    assert.equal(result.status, 0, result.stderr);
+    const dataDir = path.join(dir, 'data');
+    assert.equal(fs.readFileSync(path.join(dataDir, 'env.previous'), 'utf8'), before,
+        'the file as it was, so a switch that lands wrong can still be undone by hand');
+    assert.equal(fs.existsSync(path.join(dataDir, '.env.writing')), false,
+        'the staged file is moved into place, not left behind where the next write would find it');
+    // `.env` carries the session secret and the console's hash, and so does the copy of it:
+    // both are readable by their owner and by nobody else.
+    assert.equal(fs.statSync(path.join(dataDir, 'env.previous')).mode & 0o777, 0o600);
+    assert.equal(fs.statSync(path.join(dir, '.env')).mode & 0o777, 0o600);
 });

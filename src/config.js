@@ -97,7 +97,7 @@ function loadConfig() {
     const modeValue = (name, fallback = '') => text(modeKey(name), text(name, fallback));
 
     const publicOrigin = httpsOrigin(
-        modeValue('ORIGIN', `http://${host}:${integer('PORT', 3010, 1, 65535)}`),
+        modeValue('ORIGIN', `http://${host}:${integer('PORT', 3003, 1, 65535)}`),
         `PUBLIC_ORIGIN or ${modeKey('ORIGIN')}`,
     );
 
@@ -162,12 +162,14 @@ function loadConfig() {
 
     return Object.freeze({
         host,
-        port: integer('PORT', 3010, 0, 65535),
+        // The same number Caddy's `reverse_proxy 127.0.0.1:{$PORT:3003}` falls back to. Two
+    // defaults for one port is a public deployment that proxies to nothing, silently.
+    port: integer('PORT', 3003, 0, 65535),
         publicOrigin,
 
         // Files
         dataDir: path.resolve(text('DATA_DIR', './data')),
-        familyConfigPath: path.resolve(text('FAMILY_CONFIG_PATH', './data/family.json')),
+        directoryConfigPath: path.resolve(text('DIRECTORY_CONFIG_PATH', './data/directory.json')),
         webRoot: path.resolve(text('WEB_ROOT', './public')),
 
         // Transport and trust
@@ -178,7 +180,7 @@ function loadConfig() {
         // Identity
         // A login that arrives from the tailnet is enrolled on first sight, which is
         // what the service this replaces did. Turn it off to require every member to
-        // be written into the household file first.
+        // be written into the directory file first.
         autoEnrolIdentities: bool('AUTO_ENROL_IDENTITIES', true),
         allowDevIdentity,
         devIdentities: text('DEV_IDENTITIES', '')
@@ -204,7 +206,7 @@ function loadConfig() {
         callRingSeconds: integer('CALL_RING_SECONDS', 90, 30, 300),
         maxParticipants: integer('MAX_PARTICIPANTS', 4, 2, 8),
         // Ringing your own other devices. Off by default: a call with only you in
-        // it is not a call, and a household that never needs it should not be able
+        // it is not a call, and a directory that never needs it should not be able
         // to create one by accident.
         allowSelfCalls: bool('ALLOW_SELF_CALLS', false),
 
@@ -227,7 +229,7 @@ function loadConfig() {
                 : []),
         ]),
         // STUN and TURN for a deployment that relays. `iceServers` above is a static
-        // list, which is all a tailnet household ever needs; when a TURN host is
+        // list, which is all a tailnet directory ever needs; when a TURN host is
         // configured the per-device list from `ice.js` is used instead, because a
         // credential that ships inside a client is a credential everybody has.
         turn: Object.freeze({
@@ -292,9 +294,17 @@ function modeBlock(content, mode) {
 
 /**
  * The `.env` a switch produces: the selected mode's own values written under the names
- * everything downstream reads — the server, Caddy, the units — and the overrides that
- * would contradict the mode emptied, so the mode's own defaults decide. Everything
- * outside the generated section, comments included, is left exactly as it was.
+ * everything downstream reads — the server, Caddy, the units — inside the generated section,
+ * and the overrides that would contradict the mode emptied, so the mode's own defaults
+ * decide. Everything outside that section, comments included, is left exactly as it was.
+ *
+ * A generated name *outside* the section is refused rather than deleted or left alone.
+ * `loadDotEnv` keeps the first value it sees, so a hand-written `PUBLIC_ORIGIN=` above the
+ * section would quietly beat the one being written here: the deployment would be reached at
+ * an address its mode does not name. Deleting the line is what this is fixing — the plain
+ * names are the supported override for a run that is not a deployment (`loadConfig` above
+ * reads them) — and leaving it is worse than either, so the file has to be fixed by the
+ * person who wrote it.
  *
  * Pure, so the same content and mode always give the same answer, and it can be tested
  * without a file.
@@ -317,14 +327,29 @@ function applyMode(content, mode) {
     const lines = content.split('\n');
     const begin = lines.findIndex((line) => line.trim() === MODE_BEGIN);
     const end = lines.findIndex((line) => line.trim() === MODE_END);
-    // Whatever else in the file names one of these would be read first, and `loadDotEnv`
-    // keeps the first value it sees: a line left over from an earlier hand-edit would
-    // quietly beat the one being written here.
-    const outside = [
-        ...(begin === -1 ? lines : lines.slice(0, begin)),
-        ...(end === -1 ? [] : lines.slice(end + 1)),
-    ].filter((line) => !GENERATED_KEYS.some((key) => line.trim().startsWith(`${key}=`)));
-    return [...outside, ...generated].join('\n');
+    // One marker without the other, or them the wrong way round, means nobody can say which
+    // lines are the section's: half of them would be treated as the operator's and half as
+    // replaceable, and a refusal that says so is the only answer that cannot lose a line.
+    if ((begin === -1) !== (end === -1) || (begin !== -1 && end < begin)) {
+        throw new Error('The generated section is damaged: this file has one of its two marker lines without the other, or has them the wrong way round. Fix that, then switch.');
+    }
+    const section = begin !== -1;
+    // Which line matters: the operator has to find the one line to remove, and a file with two
+    // of these names in it has no way to say which one the mode would lose to.
+    for (let index = 0; index < lines.length; index += 1) {
+        if (section && index >= begin && index <= end) continue;
+        const key = GENERATED_KEYS.find((name) => lines[index].trim().startsWith(`${name}=`));
+        if (key) {
+            throw new Error(`${key} is set outside the generated section, on line ${index + 1}.`
+                + ' Remove that line: the mode writes this name itself, and a line left outside would'
+                + ' override what the mode decides.');
+        }
+    }
+    // Rewritten where it was, so the lines around it keep both their text and their order.
+    if (section) return [...lines.slice(0, begin), ...generated, ...lines.slice(end + 1)].join('\n');
+    // A hand-written `.env`, or one written before the first switch, has no section yet: it
+    // goes at the end, leaving the operator's own settings where they put them.
+    return [...lines, ...generated].join('\n');
 }
 
 // ── Changing the configuration from somewhere that is not a shell ───────────────
@@ -349,7 +374,7 @@ const KNOBS = Object.freeze([
     { key: 'ALLOW_SELF_CALLS', label: 'Calls with yourself', type: 'boolean',
       help: 'Whether one person may ring their own other devices. Useful for testing, odd otherwise.' },
     { key: 'AUTO_ENROL_IDENTITIES', label: 'Enrol arrivals automatically', type: 'boolean',
-      help: 'On, a login arriving from the tailnet joins the household by itself; off, only people already in the file are accepted.' },
+      help: 'On, a login arriving from the tailnet joins the directory by itself; off, only people already in the file are accepted.' },
     { key: 'CROSSBAR_ENROLLMENT_TTL_SECONDS', label: 'Invitation lifetime', type: 'integer', min: 60, max: 86400, unit: 'seconds',
       help: 'How long an enrolment code stays usable.' },
     { key: 'CROSSBAR_SESSION_TTL_SECONDS', label: 'Session lifetime', type: 'integer', min: 60, max: 2592000, unit: 'seconds',
@@ -431,12 +456,50 @@ function verifyEnvFile(dir, mode = null) {
     return { ok: result.status === 0, message: failure.replace(/^\w*Error: /, '') };
 }
 
+/**
+ * Where a write stages and what it keeps: inside the data directory, which the service may
+ * already write, so the hardened unit needs no new allowance and still cannot touch its code.
+ *
+ * A plain `writeFileSync` of `.env` is one crash away from a truncated file, and a truncated
+ * `.env` breaks the server and both units' `ExecCondition` greps at once — neither Caddy nor
+ * Tailscale Serve gets configured, and the box has no front door. So: stage a neighbour inside
+ * the data directory, keep the file as it was, then move the staged one into place. The move is
+ * a single filesystem operation, so a reader sees the whole old file or the whole new one.
+ *
+ * The staged name is deliberately not beside `.env`: `renameSync` works across directories on
+ * one filesystem, and the service's sandbox allows the data directory but not its own code.
+ * The `mkdirSync` is the same one `db.js` does for the same directory, so a first switch on a
+ * machine that has not yet started the server cannot fail here where a plain write succeeded.
+ *
+ * Errors are the caller's: a write that cannot complete has to be reported, because the caller
+ * is the only thing that knows whether a change still holds without it.
+ */
+function writeEnvFile(envPath, content) {
+    // The expression `loadConfig` resolves `config.dataDir` from, deliberately not
+    // `loadConfig().dataDir` — this must still work while putting back a file whose contents
+    // do not load, which is the one moment it matters.
+    const dataDir = path.resolve(text('DATA_DIR', './data'));
+    fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 });
+    const staging = path.join(dataDir, '.env.writing');
+    const previous = path.join(dataDir, 'env.previous');
+    fs.writeFileSync(staging, content, { mode: 0o600 });
+    if (fs.existsSync(envPath)) {
+        fs.copyFileSync(envPath, previous);
+        // `copyFileSync` gives the copy whatever permissions the original had, and `.env` holds
+        // the session secret and the console's hash: the kept copy is as sensitive as the file
+        // it came from, so it is pinned rather than inherited.
+        fs.chmodSync(previous, 0o600);
+    }
+    fs.renameSync(staging, envPath);
+}
+
 module.exports = {
     loadConfig,
     loadDotEnv,
     bool,
     integer,
     text,
+    writeEnvFile,
     applyMode,
     modeBlock,
     MODES,

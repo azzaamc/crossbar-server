@@ -1,0 +1,71 @@
+# Crossbar in private mode: the tailnet is the way in, and the public hostname is not one.
+#
+# The counterpart to `crossbar-public.service`, and read the comments there first: the same
+# check decides which of the two runs, the same `Before=` keeps the server from opening
+# anything before the box is in shape, and the same reason applies for using commands rather
+# than dependency directives to move Caddy.
+
+[Unit]
+Description=Crossbar in private mode (the tailnet in, the public hostname out)
+
+After=network-online.target tailscaled.service
+Wants=network-online.target tailscaled.service
+
+Before=crossbar.service
+
+[Service]
+Type=oneshot
+# `RemainAfterExit` is deliberately absent, and that absence is load-bearing. A oneshot
+# without it goes inactive the moment it has run, which is the whole mechanism of a switch:
+# the units are not active afterwards, so the next `systemctl restart crossbar` starts them
+# again and the shape is re-applied every time. `RemainAfterExit=yes` would leave this one
+# "active (exited)" after its first run; every later restart would find it already active,
+# skip it, and leave the box in the previous mode while reporting a clean restart. If you
+# are reading this because you are about to add it: don't.
+EnvironmentFile=/home/admin/crossbar/.env
+
+# Which mode this unit is for is answered by the same file the server reads, so there is one
+# answer to "which mode is this deployment in" and no second copy to drift.
+#
+# `grep` here rather than `ConditionEnvironment=`, which looks like the obvious tool and is
+# not: that condition is checked against the *manager's* environment (/proc/1/environ), so
+# `EnvironmentFile=` never reaches it and the check fails in both modes. Measured -- both
+# units were skipped, including the one whose mode was in force -- and a condition that
+# fails quietly is worse than no condition, because the box looks switched and is not.
+#
+# `-x` is a whole-line match, so a comment or a longer name that merely contains this one
+# cannot satisfy it.
+ExecCondition=/usr/bin/grep -qx CROSSBAR_NETWORK_MODE=private /home/admin/crossbar/.env
+
+# The public route goes first. Caddy is what holds port 443 on the public address, so
+# stopping it is what makes "the tailnet is the way in" true rather than merely preferred --
+# and it happens before the tailnet opens, so the two are never both available.
+#
+# Stopping a unit that is already stopped succeeds, so this is also the state it wants.
+ExecStart=/usr/bin/systemctl stop caddy
+
+# Then the server's loopback listener, published on the tailnet's own port 443 with a
+# certificate for the node's name -- which is why private mode needs no certificate of its
+# own and no public DNS record. The server stays on loopback in both modes; what the mode
+# changes is which of the two front doors is open onto it.
+#
+# `${PORT:-3003}`, not `$PORT`: the port is the server's own listener, read from the same
+# file, so the proxy target and the listener cannot disagree -- but a file with no `PORT`
+# line must fall back rather than expand to nothing, which would leave `tailscale serve` an
+# empty argument where the port belongs, with nothing reporting the mismatch. 3003 is the
+# same fallback the server itself uses (`src/config.js`, `integer('PORT', 3003, …)`) and the
+# one Caddy's `reverse_proxy 127.0.0.1:{$PORT:3003}` uses (`deploy/Caddyfile:76`), so all
+# three agree on an unconfigured box. systemd expands `${NAME:-word}` against *this unit's*
+# environment -- the one `EnvironmentFile=` above loads -- not the manager's, which is the
+# opposite of the `ConditionEnvironment=` trap noted above and the reason this is safe here.
+#
+# `tailscaled` keeps this rather than this unit, so a reboot brings the address back on its
+# own; this is here so that a switch reaches the tailnet's configuration too, which a reboot
+# alone would not.
+ExecStart=/usr/bin/tailscale serve --bg ${PORT:-3003}
+
+# Then the relay, if this box runs one. Same reason and same shape as in
+# `crossbar-public.service` (read the comment there): coturn renders its `realm` and
+# `external-ip` from `.env` once, at its own start, so a relay kept across a switch goes on
+# advertising the mode just left, and that presents as calls that will not relay.
+ExecStart=-/usr/bin/systemctl try-restart crossbar-turn.service

@@ -39,7 +39,7 @@ function iceConfigFor({ config, now, name = 'device' }) {
     const urls = [];
 
     if (relayed) {
-        // coturn answers STUN on the same port it serves TURN on, so a household that
+        // coturn answers STUN on the same port it serves TURN on, so a directory that
         // opens one port for relaying gets discovery on it as well.
         urls.push({ urls: `stun:${turn.host}:${turn.port}` });
     }

@@ -14,7 +14,7 @@ function createPushNotifier({ config, log }) {
 
     if (enabled) {
         const subject = config.vapidSubject
-            || (config.publicOrigin.startsWith('https:') ? config.publicOrigin : 'mailto:family-call@localhost.invalid');
+            || (config.publicOrigin.startsWith('https:') ? config.publicOrigin : 'mailto:crossbar@localhost.invalid');
         webPush.setVapidDetails(subject, config.vapidPublicKey, config.vapidPrivateKey);
     }
 
