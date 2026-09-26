@@ -14,8 +14,8 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { loadConfig, applyMode, modeBlock, modeConfigured, writtenMode, MODES, setEnvLine, verifyEnvFile, writeEnvFile } = require('./config');
 const { operatorToken, OPERATOR_HEADER } = require('./identity');
-const { Store } = require('./db');
 const auth = require('./auth');
+const prompts = require('./prompt');
 
 const USAGE = `Crossbar administration
 
@@ -45,6 +45,13 @@ const SETUP_USAGE = `node src/admin.js setup — ask what a fresh deployment nee
   Every question is answerable by flag, and every answer by a file. Without a terminal every
   answer has to come from one of the two: nothing is guessed for a value that changes what this
   deployment does, and what is missing is named rather than defaulted.
+
+  On a terminal the questions are drawn rather than typed at. The modes are a menu; each address
+  is a field with the value the deployment already holds — or the one derived from the name above
+  it — shown as the default Enter takes; the people are one field at a time, with another person
+  offered between them; and the run ends with a box saying what was chosen, what was written, and
+  which of the checks could be made here and which could not. --no-ask skips all of it, and
+  Ctrl-C leaves the terminal as it found it.
 
     --mode <private|public|both>      which configurations this deployment is reached in
     --in-force <private|public>       which of them the file is put in
@@ -199,6 +206,24 @@ function readPassword(prompt) {
 }
 
 /**
+ * The same line, asked the way everything else in this CLI is asked.
+ *
+ * The password is prompted in the middle of setting a deployment up — `setup --password` runs this
+ * command in the same terminal — so it is the renderer's masked field when there is a terminal to
+ * draw one on, and the raw reader above when there is not. A pipe has no frames to draw into, and
+ * `echo "$password" | node src/admin.js password` has to keep working.
+ */
+async function askPassword(message, validate) {
+    const terminal = prompts.createPrompter();
+    if (!terminal.present) return readPassword(`${message}: `);
+    try {
+        return await terminal.text({ message, hidden: true, validate });
+    } finally {
+        terminal.close();
+    }
+}
+
+/**
  * What this deployment is missing, as a sentence, or null.
  *
  * The store opens a database inside the data directory and syncs the directory file, so a
@@ -234,6 +259,11 @@ function deploymentProblem(config) {
 function openStore(config) {
     const problem = deploymentProblem(config);
     if (problem) throw new Error(problem);
+    // Required here rather than at the top of the file: `node:sqlite` prints an experimental
+    // warning the moment it loads, and the commands that never open a store — `setup` above all —
+    // draw their frames on a live terminal. Measured 2026-09-26: loaded at the top, the warning
+    // arrived mid-menu and drew over it, so the first thing a person saw was a garbled box.
+    const { Store } = require('./db');
     return new Store(config.dataDir, config.directoryConfigPath);
 }
 
@@ -327,12 +357,11 @@ async function main(argv) {
                 + ' Every answer is a flag, or a key in the file passed to --answers.');
             return 1;
         }
-        const { runSetup, SetupRefusal, answersFromOptions, makeAsker } = require('./setup');
+        const { runSetup, SetupRefusal, answersFromOptions, makeTerminal } = require('./setup');
         // A terminal is asked only when there is one and it was not refused, so a script piping
         // answers in never blocks on a prompt it cannot see. The browser page is the asker when it
-        // is used, so nothing here opens a readline interface that would compete with it.
-        const asker = process.stdin.isTTY && options['no-ask'] !== true && options.browser !== true
-            ? makeAsker() : null;
+        // is used, so nothing here opens a prompt that would compete with it.
+        const terminal = options['no-ask'] !== true && options.browser !== true ? makeTerminal() : null;
         try {
             if (options.browser === true) {
                 // `--browser`, `--bind` and `--force` are this command's own flags rather than
@@ -355,7 +384,7 @@ async function main(argv) {
             await runSetup({
                 dir: process.cwd(),
                 answers: answersFromOptions(options),
-                ask: asker ? asker.ask : null,
+                ask: terminal,
                 check: options['skip-checks'] !== true,
             });
             return 0;
@@ -364,7 +393,7 @@ async function main(argv) {
             console.error(error.message);
             return 1;
         } finally {
-            if (asker) asker.close();
+            if (terminal) terminal.close();
         }
     }
 
@@ -470,12 +499,14 @@ async function main(argv) {
                     console.error('No .env here. Copy .env.example to .env first.');
                     return 1;
                 }
-                const password = await readPassword('New console password: ');
+                const tooShort = 'Use at least 12 characters: this one password is the whole of the console’s defence.';
+                const password = await askPassword('New console password',
+                    (value) => (value.length < 12 ? tooShort : undefined));
                 if (password.length < 12) {
-                    console.error('Use at least 12 characters: this one password is the whole of the console’s defence.');
+                    console.error(tooShort);
                     return 1;
                 }
-                if (password !== await readPassword('Again: ')) {
+                if (password !== await askPassword('Again')) {
                     console.error('They did not match.');
                     return 1;
                 }

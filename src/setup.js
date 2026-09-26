@@ -31,6 +31,11 @@
 // the code copy and `npm ci`, which is before `node_modules` exists. `diagnostics` is the one
 // module that would break that (`ws` is a dependency), so it is required lazily inside the check
 // that needs it, and a check that cannot load its probe says so instead of stopping setup.
+//
+// What the operator sees is `src/prompt.js`: a terminal framed in Clack's shapes — the menu, the
+// fields with their defaults shown, the box at the end — and, with no terminal, the same frames
+// written into the log with none of the escape sequences in them. The questions are the only
+// thing that changes; an answer is written the same way whichever way it arrived.
 
 const crypto = require('node:crypto');
 const dns = require('node:dns').promises;
@@ -44,6 +49,7 @@ const {
     writeEnvFile, writtenMode,
 } = require('./config');
 const directoryFile = require('./directory');
+const prompts = require('./prompt');
 
 /** The default `loadConfig` falls back to, so the probe reports on the server the same address. */
 const DEFAULT_STUN = 'stun:stun.l.google.com:19302';
@@ -130,18 +136,36 @@ function answersFromOptions(options) {
     return { ...held, ...fromFlags };
 }
 
-/** A question on a real terminal, for the lines a flag or an answers file did not supply. */
-function makeAsker() {
-    const readline = require('node:readline/promises');
-    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-    return {
-        ask: async (prompt, fallback = '') => {
-            const shown = fallback ? `${prompt} [${fallback}]: ` : `${prompt}: `;
-            const answer = String(await rl.question(shown)).trim();
-            return answer || fallback;
-        },
-        close: () => rl.close(),
-    };
+/**
+ * The wizard's terminal, when it has one.
+ *
+ * Not a single question but the whole rendering layer `src/prompt.js` builds: the frames, the
+ * arrow keys, the spinner — and the one thing that cannot be drawn into a log. Which is why this
+ * returns nothing at all when there is no terminal, and the questions then fall to naming what
+ * only a terminal could have answered.
+ */
+function makeTerminal() {
+    const terminal = prompts.createPrompter();
+    return terminal.present ? terminal : null;
+}
+
+/**
+ * The injected prompt layer, told apart: `src/prompt.js`'s prompter, which can draw, or a plain
+ * `(message, fallback) -> answer` function, which can only ask. A prompter with no terminal behind
+ * it is the first of those that cannot draw a thing, and is no layer at all — which is what makes
+ * the refusal below name the answers rather than fail on a frame nobody can see.
+ */
+const askLayer = (ask) => (typeof ask === 'function'
+    ? { asker: ask, terminal: null }
+    : { asker: null, terminal: ask && ask.present === true ? ask : null });
+
+/**
+ * Where the report goes. A terminal frames it — the `┌`, the box, the `└` — and anything else gets
+ * the same frames written into `log`, character for character and with none of the escape
+ * sequences: a log file is not a screen, and the browser page's `<pre>` is not one either.
+ */
+function makeReport(terminal, log) {
+    return terminal || prompts.createPresentation({ write: (line) => log(line) });
 }
 
 // ── What the deployment already holds ───────────────────────────────────────────
@@ -263,6 +287,39 @@ const WIZARD_REQUIRED = Object.freeze({ private: Object.freeze([]), public: Obje
 
 const WILDCARD_BINDS = Object.freeze(['0.0.0.0', '::', '[::]', '*']);
 
+/**
+ * Why this address cannot be bound, as a sentence, or null when it can. It is one function because
+ * it is one refusal: a field says it while the wildcard is being typed, and the same sentence
+ * stops the same address arriving by flag or by answers file.
+ */
+function bindAddressProblem(mode, address) {
+    if (!WILDCARD_BINDS.includes(String(address))) return null;
+    return `${modeLabel(mode)} cannot bind ${address}: every address includes the one tailscaled`
+        + ' already holds in public mode, so Caddy never takes the port and never obtains a certificate'
+        + ' — what an operator sees then is a TLS failure about a hostname that is configured correctly.'
+        + ' Name the one address this deployment is reached at.';
+}
+
+/** The one question that decides every other one, as a menu and as a line. */
+const MODE_QUESTION = 'Which modes is this deployment reached in — private, public, or both?';
+
+/** The three answers `--mode` takes, as the menu they are chosen from, with what each one costs. */
+const MODE_OPTIONS = Object.freeze([
+    { value: 'private', label: 'Private (tailnet)', hint: 'reached over Tailscale, from anywhere on it' },
+    { value: 'public', label: 'Public (open internet)', hint: 'Caddy, a certificate, and a name that points here' },
+    { value: 'both', label: 'Both', hint: 'private now, public once its name points here' },
+]);
+
+/** What is about to be asked in step 4, said once rather than five times. */
+const OPTIONAL_NOTE = `A deployment works without any of these, and the summary says what it went
+without:
+
+  Relay     a TURN host, for media that cannot go direct
+  APNs      a key from the developer account, for ringing a phone whose screen is off
+  Web Push  a VAPID key pair, for waking a browser that is closed
+
+Blank at any of them skips it.`;
+
 const requiredIn = (mode) => [...MODE_REQUIRED[mode], ...WIZARD_REQUIRED[mode]];
 const blockKey = (mode, name) => `NETWORK_MODE_${mode.toUpperCase()}_${name}`;
 
@@ -346,6 +403,63 @@ function directoryFromPeople(people) {
 }
 
 /**
+ * The people, one field at a time, with "another person?" between them — the shape a terminal can
+ * ask. A directory file already there is offered back first, because keeping it is the ordinary
+ * case and naming people over it is the exception.
+ *
+ * An empty list is the answer "keep what is there": the caller reads it that way.
+ */
+async function askPeopleByFields(terminal, state) {
+    if (state.directory) {
+        const kept = await terminal.confirm({
+            message: `Keep the ${peopleCount(state.directory.users.length)} already in ${state.directoryPath}?`,
+            initialValue: true,
+        });
+        if (kept) return [];
+    }
+    const people = [];
+    for (;;) {
+        const first = people.length === 0;
+        const someone = {
+            id: await terminal.text({
+                message: `${first ? 'The first person' : 'Another person'}: the id the console knows them by`,
+                placeholder: 'abdullah',
+                validate: (value) => (value ? undefined : 'An id is how everybody else names them.'),
+            }),
+            name: await terminal.text({
+                message: 'their display name',
+                placeholder: 'Abdullah',
+                validate: (value) => (value ? undefined : 'A name is what the console shows.'),
+            }),
+            login: await terminal.text({
+                message: 'their tailscale login, if the tailnet names them — blank when it does not',
+                placeholder: 'abdullah@dev',
+            }),
+            admin: await terminal.confirm({ message: 'an administrator?', initialValue: first }),
+        };
+        people.push(someone);
+        if (!await terminal.confirm({ message: 'another person?', initialValue: false })) return people;
+    }
+}
+
+/**
+ * The people, one line each — the shape anything plainer than a terminal can be asked. A blank
+ * line answers for the whole file: done when there is none yet, and "keep what is there" when
+ * there is.
+ */
+async function askPeopleByLines(ask, report, state) {
+    report.note(`One person per line, as "id, display name, login, admin", and a blank line to`
+        + ` ${state.directory ? `keep the ${peopleCount(state.directory.users.length)} already there` : 'say you are done'}.`
+        + ' The login and the administrator flag may be left blank.', 'The directory');
+    const people = [];
+    for (;;) {
+        const named = await ask('Person', '');
+        if (!named) return people;
+        people.push(parsePersonLine(named));
+    }
+}
+
+/**
  * Ask every question, in order, and answer each one from the flags, the file, the terminal — or
  * refuse, naming what is missing.
  *
@@ -354,34 +468,70 @@ function directoryFromPeople(people) {
  * over a configured deployment a no-op and an unattended run of a file that does not exist a
  * refusal rather than a guess. A default is derived only where it changes nothing — the origin is
  * the hostname with `https://` in front, the mode in force is the mode the file already says.
+ *
+ * Where the questions go is two things, because they are not the same thing: `terminal` is the
+ * prompter `src/prompt.js` builds, which draws a menu and a field and a confirmation, and `asker`
+ * is a plain `(message, fallback) -> answer`, which can only ask a line at a time. `src/admin.js`
+ * injects the first on a terminal; a script or a test injects the second, and the questions the
+ * prompter would have drawn are then asked as lines — the same questions, and the same answers
+ * written from them. `report` is wherever the wizard is allowed to say something, which is the
+ * same prompter, or `src/prompt.js`'s frames written plainly into the log.
  */
-async function collectAnswers({ answers, state, ask, log, generate }) {
+async function collectAnswers({ answers, state, asker, terminal, report, generate }) {
     const misses = [];
     const supplied = (key) => {
         const value = answers[key];
         return value === undefined || value === '' || value === false ? null : value;
     };
-    const pick = async (key, prompt, { fallback = '', offer = fallback } = {}) => {
+
+    /**
+     * One line of text: what the flags or the file said, or what the terminal says, or what the
+     * deployment already holds — shown in the field and taken by Enter, so a second run over a
+     * live deployment is a matter of pressing it. A question nothing can answer is left to the
+     * refusal at the end rather than guessed at.
+     */
+    const line = async ({ key, message, held = '', validate = null }) => {
         const given = supplied(key);
         if (given !== null) return String(given);
-        if (ask) {
-            const answer = await ask(prompt, offer);
-            return answer === '' ? fallback : String(answer);
+        if (terminal) {
+            return String(await terminal.text({
+                message,
+                placeholder: held,
+                defaultValue: held,
+                validate: validate || undefined,
+            }));
         }
-        return fallback;
+        if (asker) {
+            const typed = await asker(message, held);
+            const value = typed === '' ? held : String(typed);
+            const refused = validate ? validate(value) : null;
+            if (refused) throw new SetupRefusal(refused);
+            return value;
+        }
+        return held;
     };
-    const required = async (key, prompt, fallback = '') => {
-        const value = await pick(key, prompt, { fallback });
-        if (!value) misses.push(key);
+
+    /** The same, for a question the deployment cannot do without. */
+    const needed = async (question) => {
+        const value = await line(question);
+        if (!value) misses.push(question.key);
         return value;
     };
 
     // 1. Which modes. Nothing is complete until this is answered, and it decides every question
     //    after it, so it is refused on its own rather than listed beside the answers it shapes.
-    const modeAnswer = await pick('mode',
-        'Which modes is this deployment reached in — private, public, or both?',
-        { offer: state.written || 'private', fallback: state.written });
-    if (!modeAnswer) throw new SetupRefusal(noTerminalMessage(['mode'], Boolean(ask)));
+    const modeGiven = supplied('mode');
+    let modeAnswer;
+    if (modeGiven !== null) modeAnswer = String(modeGiven);
+    else if (terminal) {
+        modeAnswer = String(await terminal.select({
+            message: MODE_QUESTION,
+            options: MODE_OPTIONS,
+            initial: state.written || 'private',
+        }));
+    } else if (asker) modeAnswer = (await asker(MODE_QUESTION, state.written || 'private')) || state.written;
+    else modeAnswer = state.written;
+    if (!modeAnswer) throw new SetupRefusal(noTerminalMessage(['mode'], Boolean(asker || terminal)));
     const modes = parseModes(modeAnswer);
 
     // 2. The addresses each chosen mode is reached at.
@@ -390,17 +540,18 @@ async function collectAnswers({ answers, state, ask, log, generate }) {
         for (const question of ADDRESS_QUESTIONS[mode]) {
             const held = state.block[mode][question.name];
             const derived = question.name === 'ORIGIN' && blocks[mode].HOSTNAME ? `https://${blocks[mode].HOSTNAME}` : '';
-            const fallback = held || derived;
-            const prompt = `${modeLabel(mode)}: ${question.prompt}`;
-            const value = requiredIn(mode).includes(question.name)
-                ? await required(question.key, prompt, fallback)
-                : await pick(question.key, prompt, { fallback });
-            if (question.name === 'BIND_ADDRESS' && WILDCARD_BINDS.includes(value)) {
-                throw new SetupRefusal(`${modeLabel(mode)} cannot bind ${value}: every address includes the one`
-                    + ' tailscaled already holds in public mode, so Caddy never takes the port and never obtains a'
-                    + ' certificate — what an operator sees then is a TLS failure about a hostname that is configured'
-                    + ' correctly. Name the one address this deployment is reached at.');
-            }
+            const bindProblem = question.name === 'BIND_ADDRESS' ? (address) => bindAddressProblem(mode, address) : null;
+            const asking = {
+                key: question.key,
+                message: `${modeLabel(mode)}: ${question.prompt}`,
+                held: held || derived,
+                validate: bindProblem,
+            };
+            const value = requiredIn(mode).includes(question.name) ? await needed(asking) : await line(asking);
+            // The wildcard is refused wherever it came from: the field refuses it while it is
+            // being typed, and this catches the same address arriving by flag or by answers file.
+            const refused = bindProblem ? bindProblem(value) : null;
+            if (refused) throw new SetupRefusal(refused);
             blocks[mode][question.name] = value;
         }
     }
@@ -422,21 +573,19 @@ async function collectAnswers({ answers, state, ask, log, generate }) {
         }
     } else if (givenPeople !== null) {
         directory = directoryFromPeople(parsePeople(givenPeople, state.dir));
-    } else if (ask) {
+    } else if (terminal || asker) {
+        // The rule the whole wizard follows, for the one question a blank answer can also settle:
+        // people named outright, or the file the deployment already has, and never an empty one.
+        // A terminal names them one field at a time and anything plainer one line at a time; both
+        // come back as a list, and an empty one is "keep what is there".
         for (;;) {
-            log(`The directory${state.directory ? ` — ${state.directory.users.length} people now` : ''}: one person per`
-                + ' line as "id, display name, login, admin"; a blank line when you are done'
-                + `${state.directory ? ', which keeps the people already there' : ''}.`);
-            const people = [];
-            for (;;) {
-                const line = await ask('Person', '');
-                if (!line) break;
-                people.push(parsePersonLine(line));
-            }
-            if (people.length) { directory = directoryFromPeople(people); break; }
-            if (state.directory) { directory = null; break; }
+            const named = terminal
+                ? await askPeopleByFields(terminal, state)
+                : await askPeopleByLines(asker, report, state);
+            if (named.length) { directory = directoryFromPeople(named); break; }
+            if (state.directory) break;
             if (state.directoryProblem) throw new SetupRefusal(`${state.directoryProblem}. Name the people here, or fix it and run setup again.`);
-            log('A directory needs at least one person, and one of them has to be an administrator.');
+            report.note('A directory needs at least one person, and one of them has to be an administrator.', 'Not yet');
         }
     } else if (state.directory) {
         // Nothing to write: the file the deployment already has is the answer, so the wizard does
@@ -449,28 +598,36 @@ async function collectAnswers({ answers, state, ask, log, generate }) {
     }
 
     // 4. The optional material. Every one of these is skippable, and a deployment that skips one
-    //    says so in the report rather than failing later.
-    const turnHost = await pick('turnHost',
-        'Relay: the TURN host that media which cannot go direct is relayed through — blank for no relay',
-        { fallback: state.turnHost });
+    //    says so in the report rather than failing later. The note is said once, and only when
+    //    somebody is there to answer it: a run of nothing but flags is answering, not being asked.
+    if (asker || terminal) report.note(OPTIONAL_NOTE, 'Optional material');
+    const turnHost = await line({
+        key: 'turnHost',
+        message: 'Relay: the TURN host media which cannot go direct is relayed through — blank for no relay',
+        held: state.turnHost,
+    });
     const pushAnswered = ['apnsKeyId', 'apnsTeamId', 'apnsKeyPath', 'apnsTopic'].some((key) => supplied(key) !== null);
-    const apnsKeyId = await pick('apnsKeyId',
-        'APNs, for ringing a phone whose screen is off: the key id from the developer account — blank to skip',
-        { fallback: state.apns.keyId });
+    const apnsKeyId = await line({
+        key: 'apnsKeyId',
+        message: 'APNs, for ringing a phone whose screen is off: the key id from the developer account — blank to skip',
+        held: state.apns.keyId,
+    });
     const apns = { keyId: apnsKeyId, teamId: state.apns.teamId, keyPath: state.apns.keyPath, topic: state.apns.topic };
     if (apnsKeyId || pushAnswered) {
-        apns.teamId = await pick('apnsTeamId', 'APNs: the team id', { fallback: state.apns.teamId });
-        apns.keyPath = await pick('apnsKeyPath', 'APNs: the .p8 key file on this host', { fallback: state.apns.keyPath });
-        apns.topic = await pick('apnsTopic', 'APNs: the app bundle id', { fallback: state.apns.topic });
+        apns.teamId = await line({ key: 'apnsTeamId', message: 'APNs: the team id', held: state.apns.teamId });
+        apns.keyPath = await line({ key: 'apnsKeyPath', message: 'APNs: the .p8 key file on this host', held: state.apns.keyPath });
+        apns.topic = await line({ key: 'apnsTopic', message: 'APNs: the app bundle id', held: state.apns.topic });
     }
     const webPushAnswered = ['vapidPublicKey', 'vapidPrivateKey', 'vapidSubject'].some((key) => supplied(key) !== null);
-    const vapidPublicKey = await pick('vapidPublicKey',
-        'Web Push for browser clients: the VAPID public key — blank to skip',
-        { fallback: state.vapid.publicKey });
+    const vapidPublicKey = await line({
+        key: 'vapidPublicKey',
+        message: 'Web Push for browser clients: the VAPID public key — blank to skip',
+        held: state.vapid.publicKey,
+    });
     const vapid = { publicKey: vapidPublicKey, privateKey: state.vapid.privateKey, subject: state.vapid.subject };
     if (vapidPublicKey || webPushAnswered) {
-        vapid.privateKey = await pick('vapidPrivateKey', 'Web Push: the VAPID private key', { fallback: state.vapid.privateKey });
-        vapid.subject = await pick('vapidSubject', 'Web Push: the contact subject (mailto: or a URL)', { fallback: state.vapid.subject });
+        vapid.privateKey = await line({ key: 'vapidPrivateKey', message: 'Web Push: the VAPID private key', held: state.vapid.privateKey });
+        vapid.subject = await line({ key: 'vapidSubject', message: 'Web Push: the contact subject (mailto: or a URL)', held: state.vapid.subject });
     }
 
     // 5. What can be generated. A secret the file already holds is kept, because replacing the
@@ -498,7 +655,7 @@ async function collectAnswers({ answers, state, ask, log, generate }) {
         throw new SetupRefusal(`--in-force is ${inForce}, which is not one of the modes being set up (${modes.join(', ')}).`);
     }
 
-    if (misses.length) throw new SetupRefusal(noTerminalMessage(misses, Boolean(ask)));
+    if (misses.length) throw new SetupRefusal(noTerminalMessage(misses, Boolean(asker || terminal)));
 
     return {
         modes,
@@ -789,17 +946,30 @@ async function runChecks({ state, resolved, stunUrl, locals }) {
 
 // ── The report ──────────────────────────────────────────────────────────────────
 
-const CHECK_WORD = Object.freeze({ ok: 'OK  ', warn: 'WARN', unknown: 'UNKN', fail: 'FAIL' });
+/** How a check reads in the summary: what could be made, and what could not. */
+const CHECK_MARK = Object.freeze({
+    ok: prompts.SYMBOL.submitted,
+    warn: prompts.SYMBOL.refused,
+    unknown: prompts.SYMBOL.quiet,
+    fail: prompts.SYMBOL.cancelled,
+});
 
 /** How one answer reads in the summary: the value, or how it was arrived at. */
 const secretWord = (from) => ({
     generated: 'generated (32 bytes of hex)', kept: 'kept from the file', given: 'given', unset: 'not set',
 }[from]);
 
-function reportSummary(log, state, resolved) {
-    const pairs = [
-        ['Modes', `${resolved.modes.join(', ')} (in force: ${resolved.inForce})`],
-    ];
+/** The two columns the summary is read down, with a long value's own lines kept under it. */
+function columns(pairs, width) {
+    return pairs
+        .flatMap(([label, value]) => prompts.frames.wrap(value, Math.max(width - 11, 16))
+            .map((part, index) => `${index ? ' '.repeat(11) : label.padEnd(11)}${part}`))
+        .join('\n');
+}
+
+/** What was chosen, which is the first thing the box says. */
+function chosenPairs(state, resolved) {
+    const pairs = [['Modes', `${resolved.modes.join(', ')} (in force: ${resolved.inForce})`]];
     for (const mode of resolved.modes) {
         const names = [resolved.blocks[mode].HOSTNAME, resolved.blocks[mode].ORIGIN].filter(Boolean).join(' · ');
         const bind = resolved.blocks[mode].BIND_ADDRESS ? ` · binding ${resolved.blocks[mode].BIND_ADDRESS}` : '';
@@ -808,8 +978,7 @@ function reportSummary(log, state, resolved) {
     const people = resolved.directory?.users || state.directory?.users || [];
     const administrators = people.filter((user) => user.admin && user.enabled !== false).length;
     pairs.push(['Directory', `${peopleCount(people.length)}, ${administrators}`
-        + ` administrator${administrators === 1 ? '' : 's'}`
-        + ` · ${state.directoryPath}${resolved.directory ? '' : ' (left as it is)'}`]);
+        + ` administrator${administrators === 1 ? '' : 's'}`]);
     pairs.push(['Relay', resolved.turnHost
         ? `${resolved.turnHost} · shared secret ${secretWord(resolved.secrets.turnFrom)}`
         : 'not configured — media that cannot go direct stays direct']);
@@ -821,30 +990,61 @@ function reportSummary(log, state, resolved) {
         ? push.join(' · ')
         : 'not configured — a phone whose screen is off cannot be rung, and a closed browser cannot be woken']);
     pairs.push(['Secrets', `session ${secretWord(resolved.secrets.sessionFrom)}${resolved.turnHost ? ` · relay ${secretWord(resolved.secrets.turnFrom)}` : ''}`]);
-
-    log('');
-    for (const [label, value] of pairs) log(`  ${label.padEnd(10)} ${value}`);
+    return pairs;
 }
 
-function reportChecks(log, checks) {
-    log('');
-    for (const check of checks) log(`  ${CHECK_WORD[check.verdict]}  ${check.name.padEnd(22)}${check.detail}`);
-    log('');
-    log('  These are reports, not gates: the files are written and verified, and the front door,'
-        + ' its certificate and the DNS record are the steps after this one — `node src/admin.js doctor`'
-        + ' asks all of them again once they are in place.');
+/** What the run wrote, and what it checked about it. */
+function writtenPairs(state, resolved, wroteDirectory) {
+    return [
+        ['Written', state.envPath],
+        ['', wroteDirectory
+            ? `${state.directoryPath} (${peopleCount(resolved.directory.users.length)})`
+            : `${state.directoryPath} (already there, left as it is)`],
+        ['Verified', `${resolved.inForce} is in force, and the file loads cleanly`],
+    ];
 }
+
+/** How one check reads: the mark for what it could say, and the sentence it says under it. */
+const checkLines = (checks, width) => checks.flatMap((check) => prompts.frames
+    .wrap(check.detail, Math.max(width - 22, 24))
+    .map((part, index) => `${index ? ' '.repeat(22) : `${CHECK_MARK[check.verdict]} ${check.name.padEnd(20)}`}${part}`));
 
 /** What is left for a person, which is exactly what a prompt and a one-time token need. */
-function reportNextSteps(log, state, resolved) {
+function nextSteps(state, resolved) {
     const admins = (resolved.directory?.users || state.directory?.users || [])
         .filter((user) => user.admin && user.enabled !== false);
-    log('');
-    log('  Then:');
-    log('    systemctl restart crossbar          # for the mode and the secrets to take effect');
-    log(`    node src/admin.js password          # the console's password, hashed by that command, never seen here`);
-    log(`    node src/admin.js enroll --user ${admins[0] ? admins[0].id : '<id>'}   # one invitation, printed once`);
-    log('');
+    return [
+        ['Then', 'systemctl restart crossbar'],
+        ['', 'node src/admin.js password'],
+        ['', `node src/admin.js enroll --user ${admins[0] ? admins[0].id : '<id>'}`],
+    ];
+}
+
+/**
+ * The box the wizard ends with: what was chosen, what was written, and which of the checks could
+ * be made — plus the three commands this process deliberately does not run. It is one note because
+ * it is one thing to read, and it is the last thing on the screen.
+ *
+ * The checks are reports and not gates, so a run that could not make one says which, in the same
+ * place as the ones it could: `--skip-checks` and a box with no `node_modules` on it are both
+ * ordinary, and neither is a failure.
+ */
+function reportSummary(report, state, resolved, { verified, checks, checked, wroteDirectory }) {
+    const made = checked ? checkLines(checks, report.width) : ['not made: --skip-checks was passed'];
+    if (checked) {
+        made.push('', 'These are reports, not gates. The front door, its certificate and the DNS record'
+            + ' come after this, and `node src/admin.js doctor` asks all of them again once they are in place.');
+    }
+    report.note([
+        columns(chosenPairs(state, resolved), report.width),
+        '',
+        columns(writtenPairs(state, resolved, wroteDirectory), report.width),
+        '',
+        made.join('\n'),
+        '',
+        columns(nextSteps(state, resolved), report.width),
+    ].join('\n'), 'Crossbar setup');
+    report.outro('Set up. `systemctl restart crossbar` when you are ready.');
 }
 
 // ── The command ─────────────────────────────────────────────────────────────────
@@ -856,9 +1056,12 @@ const defaultSpawn = (command, args, options) => spawnSync(command, args, option
  * Ask, write, verify, and report. Answers everything it can and refuses only what it must, in the
  * order the questions are asked, with nothing written until every chosen mode is complete.
  *
- * `ask` is a function `(prompt, fallback) -> answer`, or null when there is no terminal. `check`
- * false skips the probes at the end, which is what a caller with no network — or a test — wants;
- * the probes report rather than decide, so nothing they find changes the outcome or the exit code.
+ * `ask` is the prompt layer: a function `(message, fallback) -> answer`, or the prompter
+ * `src/prompt.js` builds, which is that and a menu and a box and a spinner besides. Either way a
+ * null means no terminal, and the answers then have to come from the flags or from `--answers`.
+ * `check` false skips the probes at the end, which is what a caller with no network — or a test —
+ * wants; the probes report rather than decide, so nothing they find changes the outcome or the
+ * exit code.
  */
 async function runSetup({
     dir = process.cwd(),
@@ -872,7 +1075,10 @@ async function runSetup({
     locals = hostAddresses(),
 } = {}) {
     const state = readState(dir);
-    const resolved = await collectAnswers({ answers, state, ask, log, generate });
+    const { asker, terminal } = askLayer(ask);
+    const report = makeReport(terminal, log);
+    report.intro(`Crossbar setup${state.hasEnv ? ' — this deployment already has a .env' : ''}`);
+    const resolved = await collectAnswers({ answers, state, asker, terminal, report, generate });
     const env = composeEnv(state, resolved);
 
     const short = shortfall(resolved, env);
@@ -891,32 +1097,43 @@ async function runSetup({
         }
     }
 
-    const verified = writeDeployment({ state, resolved, env });
+    const writing = terminal ? terminal.spinner() : null;
+    if (writing) writing.start(`Writing ${state.envPath}`);
+    let verified;
+    try {
+        verified = writeDeployment({ state, resolved, env });
+        if (writing) writing.stop(`${state.envPath}, and it loads`);
+    } catch (error) {
+        if (writing) writing.stop('nothing was written');
+        throw error;
+    }
 
-    log('');
-    log(`Crossbar setup — ${state.hasEnv ? 'rewrote' : 'wrote'} ${state.envPath}`);
-    reportSummary(log, state, resolved);
-    log('');
-    log(`  ${CHECK_WORD.ok}  ${'the file loads'.padEnd(22)}${resolved.inForce} is in force, and the file loads cleanly`);
-    if (resolved.directory) log(`  ${CHECK_WORD.ok}  ${'the directory'.padEnd(22)}${peopleCount(resolved.directory.users.length)}, written to ${state.directoryPath}`);
-    else log(`  ${CHECK_WORD.ok}  ${'the directory'.padEnd(22)}${state.directoryPath} is already there, and was left as it is`);
-
-    const checks = check ? await runChecks({ state, resolved, stunUrl, locals }) : [];
-    if (checks.length) reportChecks(log, checks);
+    let checks = [];
+    if (check) {
+        const probing = terminal ? terminal.spinner() : null;
+        if (probing) probing.start('Checking what this box looks like from outside');
+        checks = await runChecks({ state, resolved, stunUrl, locals });
+        if (probing) probing.stop('the checks are in the summary below');
+    }
 
     if (resolved.password) {
         if (spawn && ask) {
-            log('');
-            log('  Setting the console password — it is hashed by the command that owns it, and never passes through here.');
+            report.note('It is asked for and hashed by the command that owns the prompt, and never'
+                + ' passes through this one.', 'The console password');
             const status = spawn(process.execPath, [path.join(__dirname, 'admin.js'), 'password'], { cwd: state.dir, stdio: 'inherit' });
-            if (status !== 0) log('  The password was not set. Run `node src/admin.js password` when you are ready.');
+            if (status !== 0) report.note('Run `node src/admin.js password` when you are ready.', 'The password was not set');
         } else {
-            log('');
-            log('  The console password was not set: setting it asks a person for something, and there is no'
-                + ' terminal here. Run `node src/admin.js password`.');
+            report.note('Setting it asks a person for something, and there is no terminal here.'
+                + ' Run `node src/admin.js password`.', 'The console password was not set');
         }
     }
-    reportNextSteps(log, state, resolved);
+
+    reportSummary(report, state, resolved, {
+        verified,
+        checks,
+        checked: check,
+        wroteDirectory: Boolean(resolved.directory),
+    });
 
     return {
         envPath: state.envPath,
@@ -933,7 +1150,7 @@ module.exports = {
     runSetup,
     SetupRefusal,
     answersFromOptions,
-    makeAsker,
+    makeTerminal,
     readState,
     natVerdict,
     hostnameVerdict,
