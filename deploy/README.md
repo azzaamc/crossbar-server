@@ -486,8 +486,12 @@ To ring a phone whose screen is off, APNs must be configured (`CROSSBAR_APNS_KEY
 `_TEAM_ID`, `_KEY_PATH`, `_TOPIC` in `.env`); without it the console and `status` say
 `not configured — a phone with its screen off cannot be rung`, and a locked phone simply never
 rings while everything else keeps working. Web Push is the browser's equivalent and is
-optional. An APNs key is the Apple **team**'s, not a server's: deployments serving the same app
-share one key id, team id and topic, and each names the `.p8` file wherever it was put.
+optional: it needs a VAPID key pair, which `npx web-push generate-vapid-keys` prints (the
+public key, then the private one) plus a contact subject the push services can use — the
+wizard asks for all three, in that order, and writes them as `VAPID_PUBLIC_KEY`,
+`VAPID_PRIVATE_KEY` and `VAPID_SUBJECT`. An APNs key is the Apple **team**'s, not a server's:
+deployments serving the same app share one key id, team id and topic, and each names the `.p8`
+file on its own server — copy it there, and let the account the deployment runs as read it.
 
 Apple's own description of that key is what to plan against: **one signing key authenticates
 tokens for multiple apps, it does not expire, and it can be revoked**. The `.p8` is a credential
@@ -548,7 +552,10 @@ only matters if the server does not listen on 3003.
 `NETWORK_MODE_PUBLIC_BIND_ADDRESS` in the public block is the other value Caddy reads — the
 switch copies it to `CROSSBAR_BIND_ADDRESS`, which is the name the Caddyfile expands. It is
 the address Caddy listens on: set it to the address the router forwards to, never the
-wildcard. A host that already serves the same ports over a tailnet holds `:443` on its own
+wildcard. The wizard asks for it with this host's own IPv4 addresses in the question, so it is
+a choice among what the box can be bound at rather than a value to go and look up; which of
+them the router forwards to is not knowable from inside, which is why none of them is written
+in for you. A host that already serves the same ports over a tailnet holds `:443` on its own
 address, and a wildcard bind beside a specific one is either refused outright or resolved by
 the kernel's discretion, which is not a thing to leave a public listener to. It has to be
 stable, so reserve it on the router. Changing it while already in public mode needs

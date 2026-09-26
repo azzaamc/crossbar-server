@@ -530,7 +530,8 @@ function normalizePerson(entry) {
     const name = String(entry?.name ?? entry?.displayName ?? '').trim();
     if (!id || !name) {
         throw new SetupRefusal(`A person in --people needs an id and a name; "${JSON.stringify(entry)}" has`
-            + ' neither. The shape is { "id": "abdullah", "name": "Abdullah", "login": "abdullah@dev", "admin": true }.');
+            + ' neither. One person is written as {"id": "abdullah", "name": "Abdullah", "login": "abdullah@dev",'
+            + ' "admin": true} — JSON, inside the array, or in a file named with @.');
     }
     return {
         id,
@@ -606,7 +607,7 @@ async function askPeopleByFields(terminal, state) {
                 message: 'their display name — what the app shows other people in place of that id'
                     + ' (for example: Abdullah)',
                 placeholder: 'Abdullah',
-                validate: (value) => (value ? undefined : 'A name is what the console shows.'),
+                validate: (value) => (value ? undefined : 'A name is what the app shows in place of the id.'),
             }),
             // The login is optional in public mode and needed in private mode, where the tailnet
             // names the caller and a person without one cannot be found (§7). Saying both readings
@@ -942,9 +943,9 @@ function answerHelp(key) {
     return {
         mode: 'how people reach this deployment: private (Tailscale), public (open internet), or both',
         privateHostname: 'the address your people\'s phones dial over the tailnet, e.g. crossbar.tailnet-name.ts.net',
-        privateOrigin: 'the web address invitations open, e.g. https://crossbar.tailnet-name.ts.net',
+        privateOrigin: 'the web address an invitation opens, e.g. https://crossbar.tailnet-name.ts.net',
         publicHostname: 'the public name people reach this deployment at, e.g. calls.example.com',
-        publicOrigin: 'the web address invitations open, e.g. https://calls.example.com',
+        publicOrigin: 'the web address an invitation opens, e.g. https://calls.example.com',
         publicBindAddress: 'this server\'s own address that Caddy listens on, never 0.0.0.0, e.g. 203.0.113.10',
         people: 'the directory: a JSON array of { id, name, login, admin }, or @file naming one',
     }[key] || 'an answer this deployment needs';

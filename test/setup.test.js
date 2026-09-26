@@ -101,6 +101,48 @@ function setup(dir, ...args) {
     });
 }
 
+/**
+ * A prompter that draws nothing and answers from a script, recording every question and every note.
+ *
+ * `runSetup` asks a prompter the same questions whether or not it can draw them, so this is the
+ * cheapest way to hold the *wording* to account — and the wording is the only thing some defects
+ * live in. A question here is a template literal in `src/setup.js`; `' + '` written inside one of
+ * those is printed rather than joined, and the screen then says `knows' + ' them by`. Nothing that
+ * reads the answers back can see that, and this can.
+ *
+ * A script entry is the next answer; `undefined` takes the default the question offered, which is
+ * what pressing Enter does at a real prompt.
+ */
+function recordingTerminal(script) {
+    const asked = [];
+    const notes = [];
+    const next = (fallback) => {
+        const value = script.length ? script.shift() : undefined;
+        return value === undefined ? fallback : value;
+    };
+    return {
+        present: true,
+        asked,
+        notes,
+        intro: (title) => notes.push(title),
+        outro: (message) => notes.push(message),
+        note: (body, title) => notes.push(`${title}:\n${body}`),
+        spinner: () => ({ start() {}, stop() {}, message() {} }),
+        select: async ({ message, options, initial }) => {
+            asked.push({ kind: 'select', message, options });
+            return String(next(initial ?? options[0].value));
+        },
+        text: async ({ message, placeholder, defaultValue = '' }) => {
+            asked.push({ kind: 'text', message, placeholder, defaultValue });
+            return String(next(defaultValue));
+        },
+        confirm: async ({ message, initialValue }) => {
+            asked.push({ kind: 'confirm', message });
+            return Boolean(next(initialValue));
+        },
+    };
+}
+
 const envOf = (dir) => fs.readFileSync(path.join(dir, '.env'), 'utf8');
 const directoryOf = (dir) => fs.readFileSync(path.join(dir, 'data', 'directory.json'), 'utf8');
 
@@ -199,6 +241,10 @@ test('the wildcard bind address is refused, which is the one that looks right', 
             '--people', `@${people}`, '--no-ask');
         assert.equal(refused.status, 1, `${wildcard} must be refused`);
         assert.match(refused.stderr, /tailscaled/);
+        // The refusal leads with what to do, and names the value it means by "every address":
+        // a first-time reader meets this message instead of a certificate error three steps later.
+        assert.match(refused.stderr, /Name the one address this server is reached at/);
+        assert.match(refused.stderr, /0\.0\.0\.0 is every address/);
         assert.equal(envOf(dir), before);
         assert.equal(fs.existsSync(path.join(dir, 'data')), false);
     }
@@ -338,6 +384,86 @@ test('the optional questions say they can be skipped, and that an Apple key is t
     // And the blank lines at each are what skipped them: the file holds none of the four names.
     assert.deepEqual(readState(dir).apns, { keyId: '', teamId: '', keyPath: '', topic: '' });
     assert.deepEqual(readState(dir).vapid, { publicKey: '', privateKey: '', subject: '' });
+
+    // The question for a key pair says where a pair comes from: a person who has never made one
+    // cannot answer "its VAPID public key" at all, and nowhere else in the run says it either.
+    assert.match(webpush, /generate-vapid-keys/);
+    // And the APNs question says which of its four values this prompt is for, because it is the one
+    // question in the run whose answer opens three more.
+    assert.match(apns, /This question asks for the key id; the three after it ask/);
+});
+
+test('the questions a first-time reader meets name the thing and show an answer', async (t) => {
+    // Every question the wizard asks a terminal, read as a person who has never seen Crossbar. The
+    // assertion that matters is the person id's exact text: it is a template literal, and the `' + '`
+    // that used to sit inside it was printed at the screen rather than joined — a defect no
+    // answers-to-files test can see.
+    const dir = deployment(t);
+    const terminal = recordingTerminal([
+        'public',
+        'calls.example.com', undefined, '203.0.113.7',   // hostname, origin (derived), bind address
+        'abdullah', 'Abdullah', 'abdullah@dev', undefined, undefined, // one person, not an admin: no
+        undefined, undefined, undefined,                  // relay, APNs and Web Push: each skipped
+        false, false,                                     // no console password, no invitation
+    ]);
+    await runSetup({
+        dir,
+        answers: {},
+        ask: terminal,
+        log: () => {},
+        check: false,
+        tailscale: '',
+        locals: ['192.168.1.10', '127.0.0.1', '169.254.1.9', '100.64.3.4', '203.0.113.7', 'fe80::1', 'fd7a:115c:a1e0::b635:a0c'],
+    });
+
+    const messageOf = (pattern) => {
+        const found = terminal.asked.find((question) => pattern.test(question.message));
+        assert.ok(found, `no question matched ${pattern}: ${terminal.asked.map((q) => q.message).join(' | ')}`);
+        return found.message;
+    };
+
+    // The mode question says what Tailscale is: a tailnet is not a word a first-timer has.
+    assert.match(messageOf(/reach this deployment/), /over Tailscale, a private network/);
+    // The person id: one clean question, and the one that is not about a value the machine knows.
+    assert.equal(terminal.asked.find((question) => /short id/.test(question.message)).message,
+        'The first person: the short id everybody else knows them by (for example: abdullah)');
+    // The login is needed in private mode and optional in public, and the question says both — the
+    // blank it used to invite was refused after the last question had been asked.
+    assert.match(messageOf(/Tailscale login/), /a private deployment finds people by this/);
+    // The bind address is this host's address, so the question shows the host's own: no loopback,
+    // no link-local, no tailnet, no IPv6 — the candidates are what a router could forward to.
+    assert.match(messageOf(/web front end \(Caddy\)/),
+        /this host's own IPv4 addresses: 192\.168\.1\.10, 203\.0\.113\.7$/);
+    // The origin is derived, so the question says the Enter key keeps what it is showing.
+    assert.match(messageOf(/invitation opens/), /press Enter to keep the one this question offers/);
+    // The relay is named, and so is where its value comes from when the relay is this server.
+    assert.match(messageOf(/relayed through a TURN server/), /if the relay runs on this server/);
+});
+
+test('the notes and the summary say what the questions said, without a sentence broken in half', async (t) => {
+    // A note is wrapped at spaces, so a newline written inside a sentence comes out as a line that
+    // ends early — the optional-material note said "the summary says what it went" / "without:".
+    // The notes are collected raw here, which is the one place that breakage is visible.
+    const dir = deployment(t);
+    const terminal = recordingTerminal([
+        'public',
+        'calls.example.com', undefined, '203.0.113.7',
+        'abdullah', 'Abdullah', '', undefined, undefined,
+        undefined, undefined, undefined,
+        false, false,
+    ]);
+    await runSetup({ dir, answers: {}, ask: terminal, log: () => {}, check: false, tailscale: '' });
+
+    const optional = terminal.notes.find((note) => note.includes('Relay'));
+    assert.ok(optional, `the optional-material note was not made: ${terminal.notes.join(' | ')}`);
+    assert.match(optional, /the summary says what it went without:/);
+    assert.doesNotMatch(optional, /went\nwithout/);
+
+    // The summary repeats the questions' own words, not a vocabulary of its own.
+    const summary = terminal.notes.find((note) => /^Crossbar setup:\n/.test(note) && note.includes('Verified'));
+    assert.ok(summary, `the summary was not made: ${terminal.notes.join(' | ')}`);
+    assert.match(summary, /not configured — calls still work, but some networks will fail/);
+    assert.match(summary, /session \(what signs a device in\) generated \(32 bytes of hex\)/);
 });
 
 test('a generated secret is 32 bytes of hex, and a second run generates a different one', (t) => {
