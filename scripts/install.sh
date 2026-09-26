@@ -8,13 +8,18 @@
 #      `--source` copied to `--prefix`;
 #   2. the data directory, and the `.env` the server reads (seeded from `.env.example`, with the
 #      template's production paths rendered for this host);
-#   3. **onboarding** — `node src/admin.js setup` (§2.2.1, §2.3–§2.4), run in `$PREFIX` as the
-#      deployment's own account: it writes the mode blocks, the secrets and the **directory
-#      file** in one pass, and then the front door the chosen modes need — Caddy for a public
-#      block, and Tailscale itself for a private one, installed, enabled and logged in from
-#      `--tailscale-authkey` when a key is given (§2.8). `--no-setup` turns it off and reproduces
-#      what this script did before: the directory file has to exist already, and it says exactly
-#      what to write when it does not;
+#   3. **onboarding** — with `--tailscale-authkey`, Tailscale is installed, `tailscaled` is enabled
+#      and started, and the login happens **first**, before any question: the private address the
+#      wizard asks for is derived from this machine's own tailnet name, and there is no name until
+#      a login has happened (§2.8.1). Then `node src/admin.js setup` (§2.2.1, §2.3–§2.4), run in
+#      `$PREFIX` as the deployment's own account: it writes the mode blocks, the secrets and the
+#      **directory file** in one pass, and then the front door the chosen modes need — Caddy for a
+#      public block, and Tailscale itself for a private one, installed and enabled here when no key
+#      was given (§2.8). Without a key the login is the person's, so the questions keep their
+#      place; afterwards, a private block that disagrees with the name the machine now answers at
+#      is corrected by running the wizard once more with that name. `--no-setup` turns the phase
+#      off and reproduces what this script did before: the directory file has to exist already,
+#      and it says exactly what to write when it does not;
 #   4. `npm ci --omit=dev` in the deployment's own account;
 #   5. the units, rendered for this host's paths and installed, `daemon-reload`, the service
 #      enabled and started, and the backup **timer** enabled — the backup service has no
@@ -42,9 +47,13 @@
 #   --with-relay   install the coturn relay unit even if it is not obvious this host relays
 #   --tailscale-authkey KEY
 #                  a Tailscale auth key, for a private deployment: it joins this machine to the
-#                  tailnet without the browser login a person would otherwise do. The key is
-#                  handed to `tailscale up` through TS_AUTHKEY, so it appears in no transcript
-#                  and no process list. Without it, `sudo tailscale up` is the one step left.
+#                  tailnet without the browser login a person would otherwise do, and it does so
+#                  before the wizard asks anything, so the private address the wizard offers as its
+#                  default is the name the machine actually answers at. The key is handed to
+#                  `tailscale up` through TS_AUTHKEY, so it appears in no transcript and no process
+#                  list. Without it, `sudo tailscale up --operator=<account>` is the one step left;
+#                  the installer says so when it finishes, and offers to correct the private
+#                  address if the machine turns out to answer at another name.
 #   --dry-run      print every command and change nothing
 #
 # Idempotent: every step either already holds or is re-applied, so a second run is how a unit that
@@ -258,6 +267,13 @@ fi
 # is complete. It runs before `node_modules` exists, which is why it is here and not after
 # `npm ci`.
 #
+# The order inside this phase is not free. The private address is the one answer already on the
+# machine — it is the name Tailscale gives this host — and with `--tailscale-authkey` the login
+# that gives it happens here, before the wizard (`onboard_deployment` in the library, §2.8.1); a
+# login after the question is a `.env` holding a guess, and an invitation carries that guess.
+# Without a key there is nothing to read before the person logs in, so the question keeps its
+# place and the front door's report corrects the file once there is a name to compare it with.
+#
 # `--no-setup` turns it off and reproduces what this install did before there was a wizard: the
 # directory file has to be there already, and the refusal below says exactly what to write. That
 # refusal lives in a function so a dry run prints the message a real run would give, word for
@@ -419,8 +435,25 @@ say ''
 say 'A public deployment'"'"'s Caddy, its Caddyfile and the drop-in that hands it this .env were'
 say 'installed and validated in the onboarding phase. What is left is what software cannot see:'
 say 'the DNS record, the port forwards, the firewall, and the address the router forwards to —'
-say 'deploy/README.md §2.8, with the host facts in §8. A private deployment'"'"'s Tailscale was'
-say 'installed, enabled and started in the same phase; when no --tailscale-authkey was given,'
-say '`sudo tailscale up` is the one login left, and it is a browser approval a person does.'
+say 'deploy/README.md §2.8, with the host facts in §8.'
+# Tailscale's own state, at the end, because the login is the one thing this install can still be
+# waiting on: until it happens nothing on this host can check the private address the wizard was
+# asked for, and an invitation built on a name that is not the machine's own opens nowhere. A
+# `--no-setup` run never touched Tailscale, so `TAILSCALE_READY` keeps this off there.
+if [ -n "$TAILSCALE_READY" ] && [ -n "$(env_value NETWORK_MODE_PRIVATE_HOSTNAME)" ] \
+        && [ -z "$(tailnet_name)" ]; then
+    say ''
+    say 'This deployment is set to private, and Tailscale is installed with tailscaled running,'
+    say 'but this machine is not logged in yet: the private address in .env'
+    say "($(env_value NETWORK_MODE_PRIVATE_HOSTNAME)) has not been checked against the name the tailnet"
+    say 'gives it, and a name that is not this machine'"'"'s own is an invitation nobody can open.'
+    say 'The one command left is:'
+    say ''
+    say "    sudo $TAILSCALE_BIN up --operator=$CROSSBAR_USER"
+    say ''
+    say 'Re-run this installer afterwards: it reads the name this machine answers at, and runs the'
+    say 'wizard once more with it if .env disagrees (deploy/README.md §2.8.1).'
+fi
+say ''
 say 'The relay is §2.9.'
 exit 0

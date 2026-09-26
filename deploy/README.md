@@ -53,7 +53,14 @@ step-by-step for installing a second household.
 >   tailscaled`, and `TS_AUTHKEY=<hidden> tailscale up` when a key is given), and the wizard's
 >   derived private address, its reworded questions and the two finishing questions were read as
 >   pty frames and covered by `test/setup-finish.test.js` — including that neither finishing
->   command runs with no terminal. **What that does not cover is the real thing**: no Linux host,
+>   command runs with no terminal. The ordering decision behind the private address — the login
+>   before the questions when `--tailscale-authkey` is given, and the correction of a name that
+>   disagrees afterwards — was driven on this Mac too (no systemd, no Tailscale installed) with
+>   `TAILSCALE_BIN` handed a stand-in answering `status --json`, and is covered by
+>   `test/install-order.test.js`: the keyed run prints the login before the wizard, a disagreeing
+>   name prints the correction and the one `--no-ask` wizard run, an agreeing name prints neither,
+>   and a machine with no login yet ends with the report naming the one command left.
+>   **What that does not cover is the real thing**: no Linux host,
 >   so `npm ci`, the units, `/api/health`, the Caddy install and `caddy validate`, and the
 >   Tailscale install and login were never run — §2.10 is the list;
 > - ~~the full server test suite on the merged tree~~ — 177 tests, 177 pass, 0 fail, 0 skipped,
@@ -131,7 +138,7 @@ sudo scripts/install.sh --dry-run                          # every command, noth
 sudo scripts/install.sh                                    # in place, as admin, at /home/admin/crossbar
 sudo scripts/install.sh --prefix /home/other --user other   # a second household elsewhere
 sudo scripts/install.sh --answers /root/answers.json        # unattended: the wizard is not asked anything (§2.2.1)
-sudo scripts/install.sh --tailscale-authkey tskey-auth-…    # a private deployment joins the tailnet without a browser (§2.8.1)
+sudo scripts/install.sh --tailscale-authkey tskey-auth-…    # a private deployment joins the tailnet before the wizard's questions (§2.8.1)
 sudo scripts/install.sh --no-setup                          # today's behaviour: write .env and the directory file by hand first
 ```
 
@@ -175,10 +182,24 @@ asked to type it again; a machine with no Tailscale is asked the same question, 
 answer is knowable without either, and the run says the private address is your people's phones'
 way in.
 
+**That default exists only after a login, which is why the order of this phase matters.** With
+`--tailscale-authkey` the installer joins the machine to the tailnet *before* the wizard runs, so
+the private-hostname question is a confirmation of the name that will actually be served. Without a
+key the login is the person's and cannot be brought forward: the address is whatever they type, and
+the front-door step afterwards — which runs as root, and reads `tailscale status --json` itself —
+compares it with the name the machine now answers at. When the two differ it says what `.env` holds
+and what the machine is called now, and runs the wizard once more with the discovered name
+(`--no-ask --private-hostname <name> --private-origin https://<name>`). The wizard keeps the mode,
+every other address, the people and every secret from the files it wrote, so this is one call and
+not a second `.env` writer; an invitation's origin is built from that address, which is why a guess
+is corrected rather than reported. Nothing is said when the two agree, and nothing when Tailscale
+cannot answer — a machine that is not logged in has no name to correct to, and the install's final
+report says that plainly and names the one command left.
+
 ```bash
 sudo scripts/install.sh --answers /root/answers.json   # every answer from one JSON file
 sudo scripts/install.sh --browser                      # the wizard's browser front end instead of the terminal
-sudo scripts/install.sh --tailscale-authkey tskey-auth-…   # join the tailnet without a browser login (private, §2.8.1)
+sudo scripts/install.sh --tailscale-authkey tskey-auth-…   # join the tailnet before the questions, so their default is the real name (private, §2.8.1)
 ```
 
 `--answers` is passed straight to the wizard, whose `--answers <file>` takes the same keys it does
@@ -208,12 +229,17 @@ Then the front door, for exactly the modes the wizard set up:
   deployment with no door is the one thing worse than one that refused.
 - **private** — Tailscale itself is installed if it is not already (`tailscale.com/install.sh`,
   which adds its own `apt` repository — the vendor script, so a host on any supported distribution
-  works), and `tailscaled` is enabled and started. The **login** is the one part that is a
-  person's: a browser approval. Pass `--tailscale-authkey <key>` and it is done for them — the key
-  goes to `tailscale up` through `TS_AUTHKEY` (never argv, so it is in no transcript and no process
-  list) and the machine's own tailnet name is read back and checked against the private block the
-  wizard wrote. With no key the installer says plainly that `sudo tailscale up` is the one step
-  left and why it cannot be done for it (§2.8.1).
+  works), and `tailscaled` is enabled and started. With `--tailscale-authkey` all of that, and the
+  login, happened before the questions (§2.2.1): the key goes to `tailscale up` through `TS_AUTHKEY`
+  (never argv, so it is in no transcript and no process list), and the login also names the
+  deployment's account the tailnet operator (`--operator=<account>`) so the wizard and `doctor` can
+  read this machine's name — on Linux the daemon is root's and answers nobody else until an operator
+  is named. The machine's own tailnet name is then read back (as root) and compared with the private
+  block the wizard wrote; a disagreement re-runs the wizard with the name the machine answers at.
+  Without a key the **login** is the one part that is a person's: the installer says so plainly,
+  names `sudo tailscale up --operator=<account>` as the step left, and makes the same comparison —
+  and the same correction — once the login has happened. A private deployment with no login yet
+  ends its report saying so (§2.8.1).
 
 `--no-setup` turns the phase off and installs exactly what this script did before there was a
 wizard: `.env` is a template you edit by hand (§2.3), the directory file has to exist already
@@ -463,26 +489,51 @@ Install the `Caddyfile` at `/etc/caddy/Caddyfile` and check it with `caddy valid
 the private shaper unit on every start (§2.5), so the route itself needs nothing installed by hand.
 
 The **login** is the one part a browser owns. With `--tailscale-authkey <key>` it is done for the
-person: the key is handed to `tailscale up` through `TS_AUTHKEY` — so it is in neither the process
-list nor the transcript, and `--dry-run` prints `TS_AUTHKEY=<hidden>` — and afterwards the
-installer reads the machine's tailnet name back (`tailscale status --json`'s `Self.DNSName`, with
-the trailing dot dropped) and warns if it differs from `NETWORK_MODE_PRIVATE_HOSTNAME` in `.env`.
-Without a key the installer says plainly that this is the one step left and names it:
+person — and it is done **before the wizard asks anything**, because the private address the wizard
+asks for is this machine's tailnet name and there is no name until a login has happened. The key is
+handed to `tailscale up` through `TS_AUTHKEY` — so it is in neither the process list nor the
+transcript, and `--dry-run` prints `TS_AUTHKEY=<hidden>`. The same command names the deployment's
+own account the tailnet **operator** (`--operator=<account>`): on Linux only root manages the daemon
+until a user is named the operator, and the two things that ask are the wizard, which derives the
+private address while running as that account, and `doctor`, which runs `tailscale serve status` as
+it. Without the operator the machine can be joined and that account still cannot see the name.
+
+Without a key the login is the person's, and it is the one step the installer cannot do — so it
+says plainly that this is what is left and names it:
 
 ```bash
-sudo tailscale up            # prints the approval URL; this machine joins as whoever approves it
+sudo tailscale up --operator=<account>   # prints the approval URL; the machine joins as whoever approves it
 ```
+
+Either way, once `tailscale status --json` answers, the installer reads `Self.DNSName` (with the
+trailing dot dropped) and compares it with `NETWORK_MODE_PRIVATE_HOSTNAME` in `.env`. That address
+is what `NETWORK_MODE_PRIVATE_ORIGIN` is built from and what an invitation carries, so a
+disagreement is an address nobody can dial, not a cosmetic slip. When the two differ the installer
+says what `.env` holds and what the machine is called now, and runs the wizard once more with the
+discovered name:
+
+```bash
+node src/admin.js setup --no-ask --private-hostname <name> --private-origin https://<name>
+```
+
+`--no-ask` is what makes that a correction: the mode, the other addresses, the people and every
+secret come from the `.env` and the directory file the first run wrote, and the console password and
+first invitation are left alone rather than re-run. Nothing is said when the two agree. When
+Tailscale cannot answer at all — no login yet — there is no name to correct to, and the install's
+final report says the machine is not logged in and names the one command left, rather than leaving
+an unchecked address in `.env`.
 
 An auth key comes from the Tailscale admin console's *Settings → Keys* (`tskey-auth-…`); make it
 pre-authorized (so it needs no browser approval) and non-ephemeral for a machine that must stay in
 the tailnet. It is a credential — keep it out of shell history and out of the answers file if that
 file is shared.
 
-Once the machine is logged in, `tailscale status` prints the name the private block wants: the
-wizard's private hostname question offers that name as its default when it can read it, and asks
-the same question with the field explained when Tailscale is not there yet. A private hostname that
-disagrees with the name the machine actually answers at is a tailnet address nobody can dial, which
-is why the installer compares the two.
+Once the machine is logged in, `tailscale status` prints the name the private block wants, and the
+wizard's private hostname question offers that name as its default: with a key the login is already
+done when the question is asked, and without one the installer's own comparison — run as root, after
+the front door — is what catches a name that differs. That read is the account's, which is why the
+login names it the operator; where it cannot ask, the wizard asks the same question with the field
+explained and the comparison still corrects the file afterwards.
 
 ### 2.9 Installing the relay (optional)
 
@@ -530,8 +581,13 @@ have run:
    which is the door the tailnet provides instead.
    Tailscale, for a private deployment: `systemctl status tailscaled` is active, `tailscale
    status` names the machine, and that name matches `NETWORK_MODE_PRIVATE_HOSTNAME`. With no
-   `--tailscale-authkey`, `sudo tailscale up` is the one step here that is a person's, and nothing
-   on a workstation can do it; with a key, the installer has already done it and checked the name.
+   `--tailscale-authkey`, `sudo tailscale up --operator=<account>` is the one step here that is a
+   person's, and nothing on a workstation can do it, so the first run ends by naming it: read that
+   message, and check `.env` after logging in. With a key, the installer has already done the login
+   — before the wizard asked, so the private address in `.env` was offered as this machine's name
+   rather than guessed — and checked it. Either way a name that disagreed is corrected on the spot
+   by a second, `--no-ask` wizard run (§2.8.1); the rehearsal is what proves the account can read
+   the name at all (`tailscale status` as the deployment account, not as root).
 4. `systemctl status crossbar crossbar-backup.timer` — the service **active (running)**, the timer
    **active (waiting)** with a next elapse. A timer that is not waiting is a backup that never runs.
 5. `systemctl list-timers crossbar-backup.timer`, then `sudo systemctl start crossbar-backup.service`
