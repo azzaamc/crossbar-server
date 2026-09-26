@@ -122,6 +122,7 @@ const tailnetJoinInstructions = (hostname, lead) => [
     '',
     `    tailscale up --hostname ${hostname}`,
     'It prints a link; approving this machine there gives it a tailnet name.',
+    'A tailnet name is the name this machine is known by in your Tailscale network.',
     'Then re-run this install and the private address is set from that name',
     'rather than typed.',
 ].join('\n');
@@ -401,7 +402,8 @@ const ADDRESS_QUESTIONS = Object.freeze({
         {
             key: 'privateOrigin',
             name: 'ORIGIN',
-            prompt: 'the web address an invitation opens — the same tailnet address with https:// in front'
+            prompt: 'the web address an invitation opens — the tailnet address above with https:// in front,'
+                + ' so press Enter to keep the one this question offers'
                 + ' (for example: https://crossbar.tailnet-name.ts.net)',
         },
     ]),
@@ -415,14 +417,19 @@ const ADDRESS_QUESTIONS = Object.freeze({
         {
             key: 'publicOrigin',
             name: 'ORIGIN',
-            prompt: 'the web address an invitation opens — the same public name with https:// in front'
+            prompt: 'the web address an invitation opens — the public name above with https:// in front,'
+                + ' so press Enter to keep the one this question offers'
                 + ' (for example: https://calls.example.com)',
         },
         {
             key: 'publicBindAddress',
             name: 'BIND_ADDRESS',
-            prompt: 'the one local address Caddy listens on — this server\'s own address, never 0.0.0.0'
-                + ' (for example: 203.0.113.10)',
+            // The one answer here that is a fact about this machine rather than about a name, and the
+            // one the machine can list: `ownAddressClause` puts this host's own addresses in the
+            // question. No default is invented from them — which of them the router forwards to is
+            // not knowable from inside — but it is not left for a person to look up either.
+            prompt: 'the one local address the web front end (Caddy) listens on — this server\'s own address,'
+                + ' never 0.0.0.0, which is every address at once (for example: 203.0.113.10)',
         },
     ]),
 });
@@ -448,26 +455,39 @@ const WILDCARD_BINDS = Object.freeze(['0.0.0.0', '::', '[::]', '*']);
  */
 function bindAddressProblem(mode, address) {
     if (!WILDCARD_BINDS.includes(String(address))) return null;
-    return `${modeLabel(mode)} cannot bind ${address}: every address includes the one tailscaled`
-        + ' already holds in public mode, so Caddy never takes the port and never obtains a certificate'
-        + ' — what an operator sees then is a TLS failure about a hostname that is configured correctly.'
-        + ' Name the one address this deployment is reached at.';
+    return `${modeLabel(mode)} cannot bind ${address}. Name the one address this server is reached at`
+        + ' — 0.0.0.0 is every address, including the one tailscaled already holds in public mode, so'
+        + ' Caddy never takes the port and never obtains a certificate: what you would see is a TLS'
+        + ' failure about a hostname that is configured correctly.';
 }
 
-/** The one question that decides every other one, as a menu and as a line. */
-const MODE_QUESTION = 'How will your people reach this deployment — over your Tailscale network only,'
-    + ' over the open internet, or both?';
+/**
+ * The one question that decides every other one, as a menu and as a line.
+ *
+ * Tailscale is named and said what it is here rather than left to the labels: this is the first
+ * thing the wizard asks, the only thing `install.sh` has done about Tailscale by then is prepare
+ * the daemon (§2.8.1), and a person who has never met the word cannot choose the mode that needs
+ * it — or tell whether the tailnet the options name is one they have.
+ */
+const MODE_QUESTION = 'How will your people reach this deployment — over Tailscale, a private network'
+    + ' between your own devices, over the open internet, or both?';
 
 /** The three answers `--mode` takes, as the menu they are chosen from, with what each one costs. */
 const MODE_OPTIONS = Object.freeze([
-    { value: 'private', label: 'Tailscale only (private)', hint: 'reachable from anywhere on your tailnet, nowhere else' },
+    { value: 'private', label: 'Tailscale only (private)', hint: 'your own devices, from anywhere — and nothing else reaches it' },
     { value: 'public', label: 'Open internet (public)', hint: 'needs a domain name that points here, and an open port' },
     { value: 'both', label: 'Both', hint: 'private now, public once its name points here' },
 ]);
 
-/** What is about to be asked in step 4, said once rather than five times. */
-const OPTIONAL_NOTE = `A deployment works without any of these, and the summary says what it went
-without:
+/**
+ * What is about to be asked in step 4, said once rather than five times.
+ *
+ * One sentence per line, and no line broken by hand: `prompts.frames.wrap` breaks the body at
+ * spaces, so a newline inside a sentence comes out as a line that ends where the source did —
+ * "the summary says what it went" then "without:", which is what this note said before the
+ * newline moved behind the colon.
+ */
+const OPTIONAL_NOTE = `A deployment works without any of these, and the summary says what it went without:
 
   Relay     a TURN server, for calls that cannot connect directly
   APNs      an Apple push key, for ringing an iPhone whose screen is off
@@ -577,19 +597,26 @@ async function askPeopleByFields(terminal, state) {
         const first = people.length === 0;
         const someone = {
             id: await terminal.text({
-                message: `${first ? 'The first person' : 'Another person'}: the short id the console knows'
-                    + ' them by (for example: abdullah)`,
+                message: `${first ? 'The first person' : 'Another person'}: the short id everybody else`
+                    + ' knows them by (for example: abdullah)',
                 placeholder: 'abdullah',
                 validate: (value) => (value ? undefined : 'An id is how everybody else names them.'),
             }),
             name: await terminal.text({
-                message: 'their display name — what the app shows the other person (for example: Abdullah)',
+                message: 'their display name — what the app shows other people in place of that id'
+                    + ' (for example: Abdullah)',
                 placeholder: 'Abdullah',
                 validate: (value) => (value ? undefined : 'A name is what the console shows.'),
             }),
+            // The login is optional in public mode and needed in private mode, where the tailnet
+            // names the caller and a person without one cannot be found (§7). Saying both readings
+            // in the question is the whole fix: "leave blank if it does not" invited an answer the
+            // private run then refuses with `${id} has no login, and a person is found by theirs
+            // here` — after every other question had been asked.
             login: await terminal.text({
-                message: 'their tailscale login, if your tailnet names them — this is how they are recognised'
-                    + ' when they call; leave blank if it does not (for example: abdullah@dev)',
+                message: 'their Tailscale login, if their tailnet account names them — a private deployment'
+                    + ' finds people by this, so it is needed there; a public one can leave it blank'
+                    + ' (for example: abdullah@dev)',
                 placeholder: 'abdullah@dev',
             }),
             admin: await terminal.confirm({
@@ -606,12 +633,17 @@ async function askPeopleByFields(terminal, state) {
  * The people, one line each — the shape anything plainer than a terminal can be asked. A blank
  * line answers for the whole file: done when there is none yet, and "keep what is there" when
  * there is.
+ *
+ * The two readings of the login are said here too, for the reason the field's own question says
+ * them: a private deployment needs one per person, and the note is the only thing a caller
+ * without a prompter is asked.
  */
 async function askPeopleByLines(ask, report, state) {
     report.note(`One person per line, as "id, display name, login, admin", and a blank line to`
         + ` ${state.directory ? `keep the ${peopleCount(state.directory.users.length)} already there` : 'say you are done'}.`
-        + ' The id and the display name are what the line needs; the login (how the tailnet names them)'
-        + ' and the word "admin" may be left blank.', 'The directory');
+        + ' The id and the display name are what the line needs. The login is their Tailscale'
+        + ' account, which a private deployment needs (it is how a caller is found) and a public one'
+        + ' can leave blank, and "admin" makes them an administrator.', 'The directory');
     const people = [];
     for (;;) {
         const named = await ask('Person', '');
@@ -644,9 +676,11 @@ async function askPeopleByLines(ask, report, state) {
  * injectable seam `runSetup` takes, so a test needs no Tailscale. `authkey` joins the machine
  * without anybody approving it, and `spawn` is what runs the login. The join is attempted only for
  * a mode set that includes private, and only where it can be answered, so a public-only run never
- * spawns Tailscale at all and neither does one that cannot be joined from here.
+ * spawns Tailscale at all and neither does one that cannot be joined from here. `locals` is this
+ * host's own addresses, which is what the public bind address is a choice among — `runSetup`
+ * reads them once, so the question and the checks reason about the same list.
  */
-async function collectAnswers({ answers, state, asker, terminal, report, generate, tailscale = '', authkey = '', spawn = null }) {
+async function collectAnswers({ answers, state, asker, terminal, report, generate, tailscale = '', authkey = '', spawn = null, locals = [] }) {
     const misses = [];
     const supplied = (key) => {
         const value = answers[key];
@@ -736,7 +770,8 @@ async function collectAnswers({ answers, state, asker, terminal, report, generat
             const bindProblem = question.name === 'BIND_ADDRESS' ? (address) => bindAddressProblem(mode, address) : null;
             const asking = {
                 key: question.key,
-                message: `${modeLabel(mode)}: ${known && question.settled ? question.settled : question.prompt}`,
+                message: `${modeLabel(mode)}: ${known && question.settled ? question.settled : question.prompt}`
+                    + ownAddressClause(question.name, locals),
                 held: held || derived,
                 validate: bindProblem,
             };
@@ -800,39 +835,45 @@ async function collectAnswers({ answers, state, asker, terminal, report, generat
     if (asker || terminal) report.note(OPTIONAL_NOTE, 'Optional material');
     const turnHost = await line({
         key: 'turnHost',
-        message: 'If a call cannot connect directly, the server relays it through a TURN server:'
-            + ' that server\'s hostname (for example: relay.example.com). Blank for no relay — calls'
-            + ' still work, but some networks will fail',
+        message: 'If a call cannot connect directly, it is relayed through a TURN server. This is that'
+            + ' server\'s hostname, as people reach it — if the relay runs on this server that is this'
+            + ' deployment\'s own public address (for example: relay.example.com). The relay\'s shared'
+            + ' secret is generated for you. Blank for no relay: calls still work, but some networks'
+            + ' will fail',
         held: state.turnHost,
     });
     const pushAnswered = ['apnsKeyId', 'apnsTeamId', 'apnsKeyPath', 'apnsTopic'].some((key) => supplied(key) !== null);
     const apnsKeyId = await line({
         key: 'apnsKeyId',
-        message: 'Push is optional: blank skips it — a phone whose screen is off cannot be rung.'
-            + ' An APNs key belongs to the Apple team, not to this server, so a deployment serving'
-            + ' the same app can use the key another one already uses: carry across the key id from'
-            + ' your Apple developer account (for example: ABC123DE45), the team id (for example:'
-            + ' TEAM123456) and the topic, the app\'s bundle id (for example: com.example.crossbar).'
-            + ' The .p8 itself is wherever it was put',
+        message: 'Push is optional (this is APNs, Apple\'s push service for iPhones): blank skips it — a'
+            + ' phone whose screen is off cannot be rung. An APNs key belongs to the Apple team, not'
+            + ' to this server, so a deployment serving the same app can use the key another one'
+            + ' already uses: carry across its key id (for example: ABC123DE45), its team id and its'
+            + ' topic. This question asks for the key id; the three after it ask for the team id, the'
+            + ' path to the .p8 file on this server, and the topic, the app\'s bundle id (for example:'
+            + ' com.example.crossbar)',
         held: state.apns.keyId,
     });
     const apns = { keyId: apnsKeyId, teamId: state.apns.teamId, keyPath: state.apns.keyPath, topic: state.apns.topic };
     if (apnsKeyId || pushAnswered) {
-        apns.teamId = await line({ key: 'apnsTeamId', message: 'APNs: the team id the key belongs to (for example: TEAM123456)', held: state.apns.teamId });
-        apns.keyPath = await line({ key: 'apnsKeyPath', message: 'APNs: where the .p8 key file was put on this server (for example: /etc/crossbar/apns.p8)', held: state.apns.keyPath });
+        apns.teamId = await line({ key: 'apnsTeamId', message: 'APNs: the team id the key belongs to, from the same Apple developer account (for example: TEAM123456)', held: state.apns.teamId });
+        apns.keyPath = await line({ key: 'apnsKeyPath', message: 'APNs: the path to the .p8 key file on this server — copy the file there first, and let the account this deployment runs as read it (for example: /etc/crossbar/apns.p8)', held: state.apns.keyPath });
         apns.topic = await line({ key: 'apnsTopic', message: 'APNs: the app\'s bundle id (for example: com.example.crossbar)', held: state.apns.topic });
     }
     const webPushAnswered = ['vapidPublicKey', 'vapidPrivateKey', 'vapidSubject'].some((key) => supplied(key) !== null);
     const vapidPublicKey = await line({
         key: 'vapidPublicKey',
         message: 'Web Push is optional: blank skips it — a closed browser cannot be woken. To wake'
-            + ' one, Web Push needs its VAPID public key',
+            + ' one, Web Push needs a VAPID key pair: `npx web-push generate-vapid-keys` prints one'
+            + ' (run it after this install, or on any machine with web-push), and this question wants'
+            + ' the public key of that pair; the private key is the next question'
+            + ' (for example: BEl62iUYgUivxIkv69yViEuiBIa-Ib9-SkvMeAtA3LFgDzkrxZJjSgSnfckjBJuBkr3qBUYIHBQFLXYp5Nksh8)',
         held: state.vapid.publicKey,
     });
     const vapid = { publicKey: vapidPublicKey, privateKey: state.vapid.privateKey, subject: state.vapid.subject };
     if (vapidPublicKey || webPushAnswered) {
-        vapid.privateKey = await line({ key: 'vapidPrivateKey', message: 'Web Push: the VAPID private key (a long base64 string)', held: state.vapid.privateKey });
-        vapid.subject = await line({ key: 'vapidSubject', message: 'Web Push: a contact for the push service, a mailto: or a URL (for example: mailto:you@example.com)', held: state.vapid.subject });
+        vapid.privateKey = await line({ key: 'vapidPrivateKey', message: 'Web Push: the private key from that pair — the second line `npx web-push generate-vapid-keys` printed (a long base64url string)', held: state.vapid.privateKey });
+        vapid.subject = await line({ key: 'vapidSubject', message: 'Web Push: a contact the push services can use if something is wrong with your keys, a mailto: or a URL (for example: mailto:you@example.com)', held: state.vapid.subject });
     }
 
     // 6. What can be generated. A secret the file already holds is kept, because replacing the
@@ -889,11 +930,11 @@ async function collectAnswers({ answers, state, asker, terminal, report, generat
  */
 function noTerminalMessage(misses, asked) {
     const header = asked
-        ? 'setup could not finish: these answers are still missing, and the terminal gave nothing for them.'
+        ? 'setup could not finish: nothing was answered for these, and a mode cannot be written without them.'
         : 'setup has no terminal to ask on, and no answer for these:';
     const lines = misses.map((key) => `  ${flagName(key).padEnd(24)}${answerHelp(key)}`);
-    return [header, ...lines, 'Pass them as flags, or write them into a file and pass --answers <file>.',
-        '`node src/admin.js setup --help` lists every answer.'].join('\n');
+    return [header, ...lines, 'Nothing was written. Pass them as flags, or write them into a file and',
+        'pass --answers <file>. `node src/admin.js setup --help` lists every answer.'].join('\n');
 }
 
 /** What one missing answer is for, in the refusal above. */
@@ -1054,6 +1095,29 @@ function hostAddresses() {
 }
 
 /**
+ * This host's own addresses, as a clause on the one question whose answer is one of them.
+ *
+ * The public bind address is a fact about the machine and nothing else in the deployment can
+ * supply it, so the question shows what this box can be bound at rather than sending a person to
+ * look it up — the same move the private address makes by reading the tailnet name back. What it
+ * does *not* do is choose: which of these the router forwards 443 to is not knowable from inside,
+ * so none of them is offered as a default, and the field stays empty until one is named.
+ *
+ * What is listed is only what could be that answer. A link-local address is reachable from one
+ * link and a browser cannot even be handed one without a scope id (the reading `src/setup-page.js`
+ * makes of them, for the same reason); a 100.64/10 address is the tailnet's — where Tailscale
+ * listens, not where a router forwards, and the wildcard refusal exists because of what
+ * tailscaled already holds there; and IPv6 is left out rather than guessed at, because the name
+ * this deployment serves is reached over IPv4 (§8.3).
+ */
+function ownAddressClause(name, locals) {
+    if (name !== 'BIND_ADDRESS') return '';
+    const own = (locals || []).map(String).filter((address) => !address.includes(':')
+        && !/^(127\.|169\.254\.|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.)/.test(address));
+    return own.length ? ` — this host's own IPv4 addresses: ${own.join(', ')}` : '';
+}
+
+/**
  * What the address the internet sees says about this box, given the addresses it holds itself.
  *
  * The honest limit is stated rather than papered over: whether the ISP's NAT is carrier-grade is
@@ -1183,9 +1247,12 @@ function chosenPairs(state, resolved) {
     const administrators = people.filter((user) => user.admin && user.enabled !== false).length;
     pairs.push(['Directory', `${peopleCount(people.length)}, ${administrators}`
         + ` administrator${administrators === 1 ? '' : 's'}`]);
+    // The relay's blank reading gives the same consequence the question did, in the same words: the
+    // summary is where a person reads what skipping it cost, and "media that cannot go direct stays
+    // direct" said it in a vocabulary the question never used.
     pairs.push(['Relay', resolved.turnHost
         ? `${resolved.turnHost} · shared secret ${secretWord(resolved.secrets.turnFrom)}`
-        : 'not configured — media that cannot go direct stays direct']);
+        : 'not configured — calls still work, but some networks will fail']);
     const push = [
         resolved.apns.keyId || resolved.apns.topic ? `APNs ${resolved.apns.keyId}${resolved.apns.topic ? ` (${resolved.apns.topic})` : ''}` : '',
         resolved.vapid.publicKey ? 'Web Push' : '',
@@ -1193,7 +1260,10 @@ function chosenPairs(state, resolved) {
     pairs.push(['Push', push.length
         ? push.join(' · ')
         : 'not configured — a phone whose screen is off cannot be rung, and a closed browser cannot be woken']);
-    pairs.push(['Secrets', `session ${secretWord(resolved.secrets.sessionFrom)}${resolved.turnHost ? ` · relay ${secretWord(resolved.secrets.turnFrom)}` : ''}`]);
+    // "session" is the one secret whose purpose a name cannot carry, and the one whose replacement
+    // signs every device out (`--new-secrets`): said here, where the value is reported.
+    pairs.push(['Secrets', `session (what signs a device in) ${secretWord(resolved.secrets.sessionFrom)}`
+        + `${resolved.turnHost ? ` · relay ${secretWord(resolved.secrets.turnFrom)}` : ''}`]);
     return pairs;
 }
 
@@ -1237,10 +1307,17 @@ function nextSteps(state, resolved, done) {
  * ordinary, and neither is a failure.
  */
 function reportSummary(report, state, resolved, { verified, checks, checked, wroteDirectory, done }) {
-    const made = checked ? checkLines(checks, report.width) : ['not made: --skip-checks was passed'];
+    const made = checked
+        ? checkLines(checks, report.width)
+        : ['The checks were not made: --skip-checks was passed.'];
     if (checked) {
-        made.push('', 'These are reports, not gates. The front door, its certificate and the DNS record'
-            + ' come after this, and `node src/admin.js doctor` asks all of them again once they are in place.');
+        // "The front door" is this deployment's word for whichever door the mode opens, and a person
+        // reading this box has just been asked which one they want: the sentence names its two halves
+        // rather than leaving them to the runbook.
+        made.push('', 'These are reports, not gates: none of them stops the install. The front door comes'
+            + ' after this — the DNS record and Caddy\'s certificate in public mode, the Tailscale login'
+            + ' in private mode — and `node src/admin.js doctor` asks all of them again once they are in'
+            + ' place.');
     }
     report.note([
         columns(chosenPairs(state, resolved), report.width),
@@ -1302,12 +1379,13 @@ async function finishByHand({ answers, terminal, report, state, resolved, spawn 
     }
 
     let invite = false;
-    if (answered('invite') ?? (await askNow('Invite somebody now? It prints a one-time code for their phone.'))) {
+    if (answered('invite') ?? (await askNow('Invite somebody now? It prints a one-time code for their'
+        + ' phone, which is what lets them install the app and sign in.'))) {
         const admin = (resolved.directory?.users || state.directory?.users || [])
             .find((user) => user.admin && user.enabled !== false) || null;
         if (!admin) {
-            report.note('There is no administrator in the directory to invite, so nobody was.'
-                + ' Run `node src/admin.js enroll --user <id>`.', 'Nobody was invited');
+            report.note('There is no administrator in the directory to invite, so nobody was invited.'
+                + ' Run `node src/admin.js enroll --user <id>` after naming one.', 'Nobody was invited');
         } else if (terminal && spawn) {
             invite = runInTerminal(['enroll', '--user', admin.id], 'The first invitation',
                 `Give this to ${admin.id}'s phone: the code is printed once and stored nowhere.`);
@@ -1361,7 +1439,7 @@ async function runSetup({
     // The join happens inside, and only for a mode set that includes private: a public-only run
     // never spawns Tailscale.
     const resolved = await collectAnswers({
-        answers, state, asker, terminal, report, generate, tailscale, authkey, spawn,
+        answers, state, asker, terminal, report, generate, tailscale, authkey, spawn, locals,
     });
     const env = composeEnv(state, resolved);
 

@@ -86,6 +86,12 @@ step-by-step for installing a second household.
 >   **What that does not cover is the real thing end to end**: no full Linux install, so `npm ci`,
 >   the units, `/api/health`, the Caddy install and `caddy validate`, and an *approved* Tailscale
 >   login were never run — §2.10 is the list;
+> - **the APNs key's blast radius and what to do when it leaks** (§2.7) — written from Apple's
+>   documentation, not measured on a deployment: no key here has been revoked or rotated, so the
+>   procedure is Apple's instruction restated rather than a rehearsal, and it is worth the trust
+>   Apple's own help pages get. The file mode and owner it asks for (0600, the deployment's own
+>   account) is this repository's convention for the other two credentials — `.env` and the
+>   directory file — not a posture a deployment was watched enforcing on a `.p8`;
 > - ~~the full server test suite on the merged tree~~ — 177 tests, 177 pass, 0 fail, 0 skipped,
 >   the operator path's five and the `doctor` checks' five included.
 >
@@ -482,6 +488,28 @@ To ring a phone whose screen is off, APNs must be configured (`CROSSBAR_APNS_KEY
 rings while everything else keeps working. Web Push is the browser's equivalent and is
 optional. An APNs key is the Apple **team**'s, not a server's: deployments serving the same app
 share one key id, team id and topic, and each names the `.p8` file wherever it was put.
+
+Apple's own description of that key is what to plan against: **one signing key authenticates
+tokens for multiple apps, it does not expire, and it can be revoked**. The `.p8` is a credential
+in its own right, not a copy of one — with the key id, team id and topic beside it, whoever holds
+the file can send push notifications **as this app**, a forged incoming call included. It cannot
+read anything and cannot sign an app: it authenticates the team to Apple's push service and
+nothing else. So it is worth the care `CROSSBAR_SESSION_SECRET` gets, and that is why the posture
+is the file readable by the deployment's own account and nobody else (mode 0600, owned by the
+deployment user, as `.env` and the directory file are): a server has to read it unattended at
+every push, so encrypting it at rest would only move the secret to wherever the decryption key
+lives.
+
+If it leaks — into a backup, a git history, or a host whose access is no longer trusted — rotation
+is the fix, and it happens in Apple's developer account rather than here: **Keys** under
+Certificates, Identifiers & Profiles, where the key was created, and which only the Account Holder
+or an Admin can reach. Revoke the key, create the replacement with APNs enabled, put the new `.p8`
+where `CROSSBAR_APNS_KEY_PATH` names, set `CROSSBAR_APNS_KEY_ID` to the new key's id (Apple's
+filename carries it, `AuthKey_<KEYID>.p8`), and `sudo systemctl restart crossbar`. Apple's own
+note on a suspected compromise runs those first two the other way — the replacement created first,
+the old key revoked after the transition — which avoids a window with no push at all; revoking
+first spends that window to stop a forged call reaching a phone sooner. Either way the old key is
+dead, and the new one is what the deployment signs with.
 
 ### 2.8 Public mode: Caddy, DNS, ports
 
