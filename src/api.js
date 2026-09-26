@@ -11,7 +11,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { MODES, KNOBS, modeBlock, applyMode, applyKnobs, verifyEnvFile, writeEnvFile } = require('./config');
-const { resolveIdentity, isLoopback } = require('./identity');
+const { resolveIdentity, isLoopback, isOperatorRequest } = require('./identity');
 const { DEVICE_ID_PATTERN } = require('./db');
 const auth = require('./auth');
 const directoryFile = require('./directory');
@@ -225,7 +225,13 @@ function createRequestHandler({ config, store, bus, push, apns, lifecycle, log, 
         }
         // Where a device key is required, being reachable is not enough. This is the
         // line that stops "arrived over the tailnet" from meaning "is that person".
-        if (config.requireDeviceAuth && !device) {
+        //
+        // The operator's own tooling is the exception, and only from loopback with the
+        // derived token: public mode demands a device key of every client, and the CLI is
+        // the box talking to itself rather than a client — a refusal here would leave the
+        // deployment unable to test itself exactly when it most needs to. A request with no
+        // token, or a wrong one, still reaches this line and is refused as before.
+        if (config.requireDeviceAuth && !device && !isOperatorRequest(req, config)) {
             sendError(res, 401, 'DEVICE_AUTH_REQUIRED', 'This device is not enrolled with this server.');
             return null;
         }
@@ -326,8 +332,20 @@ function createRequestHandler({ config, store, bus, push, apns, lifecycle, log, 
             // The version is here because it is the one question nothing else answers: the
             // CLI can be a shell's checkout and the file can be anything, so the running
             // process is the only thing that knows what it is.
+            //
+            // `origin` is here so a device can find this server after it moves. It is the
+            // address this process believes it is reached at, and it is answered without a
+            // credential on purpose: a phone whose stored address is the old one has no way to
+            // authenticate -- the old door may be gone -- and the one thing it can still do is
+            // ask the address it has. A switch keeps that door open long enough for exactly
+            // this question to be asked, which is what stops a moved server costing every
+            // person a new invitation code. Nothing secret is in it: the deployment's own
+            // address is what any client that can reach it already knows.
             return sendJson(res, 200, {
-                status: 'ok', mode: config.networkMode, version: require('../package.json').version,
+                status: 'ok',
+                mode: config.networkMode,
+                version: require('../package.json').version,
+                origin: config.publicOrigin,
             });
         }
 
@@ -623,8 +641,37 @@ function createRequestHandler({ config, store, bus, push, apns, lifecycle, log, 
             // the file: their row stays so their history does, and this is where that is
             // visible rather than confusing.
             if (req.method === 'GET' && pathname === '/api/admin/people') {
-                const known = new Map(store.listUsers().map((user) => [user.id, user]));
+                const rows = store.listUsers();
+                const known = new Map(rows.map((user) => [user.id, user]));
                 const directory = currentDirectory();
+                // The people the file does not name.
+                //
+                // Private mode mints a user for any identity that reaches it
+                // (`observeIdentity`, `src/api.js:175`), so those people are in the database
+                // — with devices, sessions and calls pointing at them — while the file this
+                // console edits has never heard of them. Measured 2026-09-26: a probe login
+                // was `ts_72497f475e4f76d0b28f57c7 | Someone | someone@example.com` in the
+                // database with `first_seen_at` set, and the file still listed three people.
+                // Without this they are invisible here, and invisible is the one thing they
+                // are not: their device keys work.
+                //
+                // A row that is not enabled is somebody taken out of the file on purpose —
+                // removal keeps the row so the history does — and it is reported as such
+                // rather than as an arrival, because the two need different answers.
+                const listed = new Set(directory.users.map((user) => user.id.toLowerCase()));
+                const unlisted = rows
+                    .filter((user) => !listed.has(String(user.id).toLowerCase()))
+                    .map((user) => ({
+                        id: user.id,
+                        displayName: user.displayName,
+                        login: user.login || '',
+                        firstSeen: user.firstSeen,
+                        lastAuthenticated: user.lastAuthenticated,
+                        // Active devices, the same count the People table shows, so the two
+                        // read consistently; the Devices section is where a revocation is done.
+                        devices: user.activeDevices,
+                        takenOutOfTheFile: user.enabled === false,
+                    }));
                 return sendJson(res, 200, {
                     // Whether a login is how somebody is found here, so the console can ask
                     // for one where it is identity and leave the field optional where it is
@@ -639,6 +686,7 @@ function createRequestHandler({ config, store, bus, push, apns, lifecycle, log, 
                     // no pairs in it reads as an empty app — a state an operator has to be
                     // able to see rather than deduce.
                     contacts: directory.contacts || [],
+                    unlisted,
                     people: directory.users.map((user) => ({
                         id: user.id,
                         displayName: user.displayName,
@@ -760,10 +808,12 @@ function createRequestHandler({ config, store, bus, push, apns, lifecycle, log, 
             // setting is good. A change that holds is followed by a restart, because the
             // configuration is read once and that is the only moment it is consistent.
             //
-            // The change and the putting-back both go through `writeEnvFile`, so a write
-            // interrupted by a crash or a power cut leaves the old file or the new one: a
-            // truncated `.env` is a server that will not start, and neither front door's
-            // `ExecCondition` can read a file that is not there.
+            // The change and the putting-back both go through `writeEnvFile`, which writes
+            // `.env` in place: this is the console, so it runs inside the service's sandbox,
+            // where the file may be written and its directory may not — see the comment on
+            // the writer. What that costs is atomicity; what stands behind it is
+            // `<DATA_DIR>/env.previous`, written first, and `doctor`, which reports a file
+            // that no longer says which mode it is in.
             const envPath = config.envFile;
             const envContent = () => fs.readFileSync(envPath, 'utf8');
 
@@ -905,6 +955,11 @@ function createRequestHandler({ config, store, bus, push, apns, lifecycle, log, 
             if (req.method === 'GET' && pathname === '/api/admin/status') {
                 const now = new Date().toISOString();
                 return sendJson(res, 200, {
+                    // The build that answered, which is the first question about a deployment
+                    // that nobody can answer from anywhere else: the checkout on the box, the
+                    // CLI and the file it reads can all be something other than the process.
+                    // Same answer `/api/health` gives, and the same reason for it.
+                    version: require('../package.json').version,
                     mode: config.networkMode,
                     hostname: config.publicHostname || null,
                     origin: config.publicOrigin,

@@ -12,10 +12,11 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
-const { loadConfig, applyMode, modeBlock, MODES, setEnvLine, verifyEnvFile, writeEnvFile } = require('./config');
+const { loadConfig, applyMode, modeBlock, writtenMode, MODES, setEnvLine, verifyEnvFile, writeEnvFile } = require('./config');
+const { operatorToken, OPERATOR_HEADER } = require('./identity');
 const { Store } = require('./db');
 const auth = require('./auth');
-const { diagnose } = require('./diagnostics');
+const { diagnose, summariseResults } = require('./diagnostics');
 
 const USAGE = `Crossbar administration
 
@@ -32,7 +33,7 @@ const USAGE = `Crossbar administration
   mode private|public                    Switch this deployment to that one
   password                               Set the console's password, prompted
   ring --from <id> --to <id>              Ring a device, to test that it does
-  doctor                                 Reachability checks
+  doctor                                 Reachability and first-install checks
 `;
 
 function parseArgs(argv) {
@@ -144,6 +145,78 @@ function readPassword(prompt) {
     });
 }
 
+/**
+ * What this deployment is missing, as a sentence, or null.
+ *
+ * The store opens a database inside the data directory and syncs the directory file, so a
+ * command that needs it cannot run before a deployment is otherwise complete — which is
+ * expected, and which is also the moment an operator is most likely to be reading this
+ * output. Measured 2026-09-26, on a first install with the tree in place and no `.env` and
+ * no directory file: `node src/admin.js mode private` printed `unable to open database
+ * file` and nothing else. It names no path, no setting and no next step, and the same
+ * failure arrives as a stack trace when it is thrown rather than said.
+ *
+ * The store creates the data directory itself, so absence there is not a problem; a
+ * directory it cannot write is, and SQLite's message for that names neither the path nor
+ * the reason. Both are said here instead.
+ */
+function deploymentProblem(config) {
+    if (!fs.existsSync(config.envFile)) {
+        return `No .env beside this process (${config.envFile}). Copy .env.example to .env — it names every setting — and fill in the block for the mode this deployment is in.`;
+    }
+    if (!fs.existsSync(config.directoryConfigPath)) {
+        return `No directory file at ${config.directoryConfigPath}. Write one — data/directory.example.json is the shape, and it needs at least one administrator who is not suspended.`;
+    }
+    if (fs.existsSync(config.dataDir)) {
+        try {
+            fs.accessSync(config.dataDir, fs.constants.W_OK);
+        } catch {
+            return `The data directory ${config.dataDir} cannot be written by ${process.env.USER || 'this user'}, and the database and the backups are kept there.`;
+        }
+    }
+    return null;
+}
+
+/** A store for a deployment that has what it needs, or a refusal that says what is missing. */
+function openStore(config) {
+    const problem = deploymentProblem(config);
+    if (problem) throw new Error(problem);
+    return new Store(config.dataDir, config.directoryConfigPath);
+}
+
+/**
+ * The commands that need a database, and so a deployment that is otherwise complete.
+ *
+ * Everything else runs on a box that has none yet, which is the state a first install is in:
+ * `mode` rewrites `.env` and `doctor` asks questions about the machine, and neither has any
+ * business opening a database to do it. `doctor` opens its own inside its branch — it has to
+ * *report* a database it cannot open rather than refuse over one, and what it says is the
+ * sentence above rather than a SQLite string.
+ */
+const NEEDS_STORE = new Set([
+    'users', 'devices', 'enroll', 'enrollments', 'revoke-enrollment', 'rename-device',
+    'revoke-device', 'remove-device', 'status', 'ring',
+]);
+
+/**
+ * The headers every request this CLI makes to the running server carries.
+ *
+ * The CLI asks the live process over the loopback it already treats as its proxy, and in
+ * public mode that connection is not believed on the strength of a login — the server
+ * demands a device key there, which a shell does not have. The derived operator token is
+ * what says this is the machine talking to itself rather than a client; the login stays,
+ * because it is what names the person the request is made as, exactly as in private mode.
+ * A deployment with no secret derives no token, and none is sent, so nothing changes there.
+ */
+function operatorHeaders(config, extra = {}) {
+    const token = operatorToken(config);
+    return {
+        'content-type': 'application/json',
+        ...(token ? { [OPERATOR_HEADER]: token } : {}),
+        ...extra,
+    };
+}
+
 async function main(argv) {
     const { command, options, positional } = parseArgs(argv);
     if (!command || command === 'help' || command === '--help') {
@@ -152,7 +225,9 @@ async function main(argv) {
     }
 
     const config = loadConfig();
-    const store = new Store(config.dataDir, config.directoryConfigPath);
+    // Opened only by the commands that need one, so `mode`, `password` and `doctor` work on a
+    // box whose deployment is not complete yet — which is exactly when they are run.
+    const store = NEEDS_STORE.has(command) ? openStore(config) : null;
     const now = new Date().toISOString();
 
     try {
@@ -298,18 +373,31 @@ async function main(argv) {
                     console.error(`mode takes one of ${MODES.join(', ')}.`);
                     return 1;
                 }
-                if (wanted === config.networkMode) {
-                    console.log(`Already in ${wanted}; nothing to change.`);
+                if (wanted === writtenMode(content)) {
+                    // Compared against what the *file* says, not against what the configuration
+                    // resolved to. `loadConfig` defaults to private, so a fresh install's file
+                    // — `deploy/.env.example`, with both blocks and no generated section — is in
+                    // force as private while carrying no `CROSSBAR_NETWORK_MODE` line at all;
+                    // this comparison used to call that "already in private" and write nothing.
+                    // Both mode shapers run under
+                    // `ExecCondition=/usr/bin/grep -qx CROSSBAR_NETWORK_MODE=<mode>` on that
+                    // file, so on a fresh private install `tailscale serve` was never run and
+                    // nobody on the tailnet could reach a server that was perfectly healthy on
+                    // loopback. Measured on the rehearsal host, 2026-09-26.
+                    console.log(`Already in ${wanted}; the file says so, and nothing has changed.`);
                     return 0;
                 }
 
                 // Written before it is checked, because the only honest test is what the
                 // file says to a process starting from it — and put back if it does not
                 // hold up. A switch that leaves a deployment unable to start is worse
-                // than no switch at all. Both writes stage inside the data directory and
-                // keep the file they replace: a crash during a switch must leave one
-                // whole `.env`, not half of one, because both front doors' `ExecCondition`
-                // greps read the file this command is rewriting.
+                // than no switch at all. Both writes land on `.env` itself and keep the
+                // file they replace in the data directory: the console reaches this code
+                // inside the service's sandbox, which may write the file and not the
+                // directory it is in, so an in-place write is the only one that gets
+                // there — and the price is that a crash leaves the file half-written
+                // rather than one of two whole ones, which is what `env.previous` and
+                // `doctor` are for.
                 writeEnvFile(file, applyMode(content, wanted));
                 const check = verifyEnvFile(process.cwd(), wanted);
                 if (!check.ok) {
@@ -368,7 +456,7 @@ async function main(argv) {
                 }
                 const response = await fetch(`http://${config.host}:${config.port}/api/calls`, {
                     method: 'POST',
-                    headers: { 'content-type': 'application/json', 'Tailscale-User-Login': login },
+                    headers: operatorHeaders(config, { 'Tailscale-User-Login': login }),
                     body: JSON.stringify({ inviteeIds: [to], video: true }),
                 });
                 const body = await response.text();
@@ -381,11 +469,39 @@ async function main(argv) {
             }
 
             case 'doctor': {
-                const results = await diagnose({ config, store });
-                for (const result of results) {
-                    console.log(`${result.ok ? 'OK  ' : 'FAIL'}  ${pad(result.name, 22)}${result.detail}`);
+                // The store is a check like any other here, and on a first install it is the
+                // one that fails first: there is no directory file yet. It is reported on its
+                // own line with the sentence that says which path and what to do, rather than
+                // thrown before anything else has been asked.
+                let store = null;
+                let storeError = null;
+                try {
+                    store = openStore(config);
+                } catch (error) {
+                    storeError = String(error && error.message) || 'the database could not be opened';
                 }
-                return results.every((result) => result.ok) ? 0 : 1;
+                try {
+                    const results = await diagnose({ config, store, storeError });
+                    for (const result of results) {
+                        // Three levels, not two. A warning is a check that passed and still has
+                        // something to say — a name in `.env` that nothing reads, say — and it must
+                        // not fail this command: a first install with a stray line is not broken,
+                        // and a command that says it is teaches the operator to ignore it. What it
+                        // must do is be seen, which is why it is its own word rather than a detail
+                        // under OK.
+                        const level = result.warn ? 'WARN' : (result.ok ? 'OK  ' : 'FAIL');
+                        console.log(`${level}  ${pad(result.name, 22)}${result.detail}`);
+                    }
+                    // Counted at the end as well as marked above: the lines are read from the top,
+                    // and a warning that scrolled off the top is a warning nobody saw. Warnings do
+                    // not decide the exit code — see `summariseResults` — or a first install with a
+                    // stray line would read as broken.
+                    const { failed, warned } = summariseResults(results);
+                    if (warned || failed) console.log(`\n${failed} failed, ${warned} warned.`);
+                    return failed ? 1 : 0;
+                } finally {
+                    if (store) store.close();
+                }
             }
 
             default:
@@ -394,7 +510,7 @@ async function main(argv) {
                 return 1;
         }
     } finally {
-        store.close();
+        if (store) store.close();
     }
 }
 

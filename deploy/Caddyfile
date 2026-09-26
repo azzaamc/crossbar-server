@@ -64,6 +64,10 @@ http://{$CROSSBAR_PUBLIC_HOSTNAME} {
 	# header inside it was typed by whoever is calling. `Tailscale-User-Name` and
 	# `Tailscale-User-Profile-Pic` are the same claim by other names, and `X-Dev-Identity`
 	# is the development stand-in the server accepts when an operator has turned it on.
+	# `X-Crossbar-Operator` is the credential the operator's own CLI presents, believed only
+	# when it arrives from loopback -- which is exactly the connection Caddy makes to the
+	# backend, so a request typed on the internet would otherwise arrive carrying the one
+	# thing that stands in for a device key in public mode. Stripped here, it cannot.
 	#
 	# This is a security requirement rather than tidiness: without it, anyone on the
 	# internet becomes anybody in the directory by sending one header, and every device-key check
@@ -72,6 +76,7 @@ http://{$CROSSBAR_PUBLIC_HOSTNAME} {
 	request_header -Tailscale-User-Name
 	request_header -Tailscale-User-Profile-Pic
 	request_header -X-Dev-Identity
+	request_header -X-Crossbar-Operator
 
 	reverse_proxy 127.0.0.1:{$PORT:3003} {
 		# Set rather than left to the default. The defaults happen to produce these
