@@ -204,19 +204,19 @@ function loadConfig() {
     // Where this deployment is, per mode. Both configurations live in `.env` at once
     // — `node src/admin.js mode` moves between them — so the address a mode needs is
     // named for that mode, and the plain names stay as overrides for a run that is
-    // not a deployment (a laptop, a test).
-    const modeKey = (name) => `NETWORK_MODE_${networkMode.toUpperCase()}_${name}`;
-    const modeValue = (name, fallback = '') => text(modeKey(name), text(name, fallback));
+    // not a deployment (a laptop, a test). `modeKey` is declared with the mode vocabulary
+    // below, beside the names a mode's own block holds.
+    const modeValue = (name, fallback = '') => text(modeKey(networkMode, name), text(name, fallback));
 
     const publicOrigin = httpsOrigin(
         modeValue('ORIGIN', `http://${host}:${integer('PORT', 3003, 1, 65535)}`),
-        `PUBLIC_ORIGIN or ${modeKey('ORIGIN')}`,
+        `PUBLIC_ORIGIN or ${modeKey(networkMode, 'ORIGIN')}`,
     );
 
     const publicHostname = modeValue('HOSTNAME').toLowerCase();
     if (networkMode === 'public') {
         if (!publicHostname) {
-            throw new Error(`${modeKey('HOSTNAME')} (or CROSSBAR_PUBLIC_HOSTNAME) is required in public mode: it is the host invitations send people to`);
+            throw new Error(`${modeKey(networkMode, 'HOSTNAME')} (or CROSSBAR_PUBLIC_HOSTNAME) is required in public mode: it is the host invitations send people to`);
         }
         // The origin handed to clients inside a join URL has to be the address they
         // reached this server on. Getting this wrong sends every invitation to a host
@@ -387,21 +387,86 @@ const MODE_END = '# <<< end of the configuration in force <<<';
 const MODES = Object.freeze(['private', 'public']);
 const MODE_NAMES = Object.freeze(['HOSTNAME', 'ORIGIN', 'BIND_ADDRESS']);
 
+/** The name one of `MODE_NAMES` is written under in a mode's own block, in `.env`. */
+const modeKey = (mode, name) => `NETWORK_MODE_${mode.toUpperCase()}_${name}`;
+
 /** The names the generated section owns, in the order it writes them. */
 const GENERATED_KEYS = Object.freeze([
     'CROSSBAR_NETWORK_MODE', 'CROSSBAR_PUBLIC_HOSTNAME', 'PUBLIC_ORIGIN',
     'CROSSBAR_BIND_ADDRESS', 'TRUST_TAILSCALE_HEADERS', 'CROSSBAR_REQUIRE_DEVICE_AUTH',
 ]);
 
+/**
+ * What each mode's own block has to name before that mode is a configuration rather than a
+ * placeholder, as `MODE_NAMES` entries. This table is the whole of "this mode is configured":
+ * every reader of that question goes through `modeConfigured` below.
+ *
+ * Derived from the reads in `loadConfig`, and bound to them by `test/mode-configured.test.js`,
+ * which loads a file per mode with these names set and then the same file with each name
+ * emptied in turn. A name belongs here exactly when its absence is what stops the server, so
+ * this cannot drift into a second opinion about what a mode needs.
+ *
+ * `private` needs only its origin. Its hostname is not read in that mode at all — it exists so
+ * that public mode can build the invitation origin — and an absent private origin is survivable
+ * because `loadConfig` falls back to the loopback default. That default is the reason the name
+ * is required all the same: an invitation carries the origin, and nobody can accept an
+ * invitation to `http://127.0.0.1:3003`.
+ *
+ * `public` needs a hostname, and an origin that names it: an absent origin falls back to the
+ * loopback one and is refused for naming the wrong host, and an empty line is refused outright.
+ * `BIND_ADDRESS` is deliberately not here. Nothing in `loadConfig` reads it — it is the address
+ * Caddy binds, put in the generated section for the proxy by `applyMode` — so an empty one
+ * leaves a server that starts and a proxy that does not. That is `doctor`'s Public bind address
+ * check, which reports it where an operator can act on it; a predicate that refused every mode
+ * the proxy cannot serve would also refuse the runs that are not deployments.
+ */
+const MODE_REQUIRED = Object.freeze({
+    private: Object.freeze(['ORIGIN']),
+    public: Object.freeze(['HOSTNAME', 'ORIGIN']),
+});
+
 /** A mode's own block, as `{ HOSTNAME, ORIGIN, BIND_ADDRESS }` — empty strings unset. */
 function modeBlock(content, mode) {
     const values = {};
     for (const name of MODE_NAMES) {
-        const key = `NETWORK_MODE_${mode.toUpperCase()}_${name}=`;
+        const key = `${modeKey(mode, name)}=`;
         const line = content.split('\n').find((item) => item.trim().startsWith(key));
         values[name] = line ? line.trim().slice(key.length).trim() : '';
     }
     return values;
+}
+
+/**
+ * Whether a mode is one this deployment can be shaped for: its own block names everything that
+ * mode needs to start, or the names it does not. Answers `{ configured, missing }`, with
+ * `missing` naming the file's own keys (`NETWORK_MODE_PUBLIC_HOSTNAME`), because that is what an
+ * operator has to go and fill in.
+ *
+ * The question the two mode units ask before they move a front door, through
+ * `node src/admin.js mode --configured`, and the question a setup wizard will ask before it
+ * offers a mode. Deliberately not the same as which mode is in force — `writtenMode` answers
+ * that, and a file can say one thing and hold nothing — so a caller that needs both asks both.
+ *
+ * The units used to ask `writtenMode` alone, as a whole-line `grep -qx
+ * CROSSBAR_NETWORK_MODE=public`. Measured 2026-09-26, on a file saying `public` whose public
+ * block was empty: that grep passed, so the public shaper started Caddy — which cannot render
+ * the Caddyfile without `CROSSBAR_BIND_ADDRESS` — and scheduled `tailscale serve off` for the
+ * end of the grace window, while the server crash-looped on the names that were missing.
+ * Fifteen minutes later there was no front door in either direction, and the close that made it
+ * so was on a timer: nothing outside the box can undo it. A mode that cannot start may not
+ * close a door on a deployment's behalf, which is why this is a predicate and not a grep.
+ *
+ * `modeBlock` reads the block, so the answer is about the names a mode owns and not about the
+ * plain-name overrides a run that is not a deployment may set: whether a mode can be switched
+ * to is not the same question as whether this process starts. A file that is not there is not
+ * configured, for either mode — every name is missing.
+ */
+function modeConfigured(mode, envPath = null) {
+    if (!MODES.includes(mode)) throw new Error(`mode must be one of ${MODES.join(', ')}`);
+    const file = envPath === null ? ENV_FILE : path.resolve(envPath);
+    const block = modeBlock(fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : '', mode);
+    const missing = MODE_REQUIRED[mode].filter((name) => !block[name]).map((name) => modeKey(mode, name));
+    return { configured: missing.length === 0, missing };
 }
 
 /**
@@ -411,11 +476,12 @@ function modeBlock(content, mode) {
  * `loadConfig` defaults to `private`, so a `.env` with no generated section — which is what
  * `deploy/.env.example` produces, because the section is written by the first switch — is in
  * force as private while saying nothing at all. Something outside this process reads the
- * line: both mode shapers run under
- * `ExecCondition=/usr/bin/grep -qx CROSSBAR_NETWORK_MODE=<mode> …`, so a fresh install whose
- * file does not carry it configures no front door — the server is healthy on loopback and
- * nobody on the tailnet can reach it, which `status` and `/api/health` both report as fine.
- * A value that is merely the default still has to be written down, and this is why.
+ * line: both mode shapers ask for it before they configure anything
+ * (`node src/admin.js mode --configured`, which is this *and* `modeConfigured` below), so a
+ * fresh install whose file does not carry it configures no front door — the server is healthy
+ * on loopback and nobody on the tailnet can reach it, which `status` and `/api/health` both
+ * report as fine. A value that is merely the default still has to be written down, and this is
+ * why.
  *
  * The first occurrence wins, because `loadDotEnv` keeps the first value it sees.
  */
@@ -693,6 +759,9 @@ module.exports = {
     writeEnvFile,
     applyMode,
     modeBlock,
+    modeConfigured,
+    MODE_REQUIRED,
+    MODE_NAMES,
     writtenMode,
     MODES,
     KNOBS,

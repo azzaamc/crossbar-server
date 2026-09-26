@@ -155,10 +155,10 @@ test('switching to the mode already written changes nothing', () => {
 test('a file with no generated section gets one, and the run after that changes nothing', () => {
     // `deploy/.env.example` is this file: both mode blocks, no section yet, because the section
     // is what a switch writes. The mode is in force by default — so nothing inside this process
-    // can tell the difference — but both mode shapers run under
-    // `ExecCondition=/usr/bin/grep -qx CROSSBAR_NETWORK_MODE=<mode>`, and a fresh private install
-    // whose file has no such line never runs `tailscale serve`: the server is healthy on loopback
-    // and nobody on the tailnet can reach it. Measured on the rehearsal host, 2026-09-26.
+    // can tell the difference — but both mode shapers read the line before they act
+    // (`mode --configured`), and a fresh private install whose file has no such line never runs
+    // `tailscale serve`: the server is healthy on loopback and nobody on the tailnet can reach
+    // it. Measured on the rehearsal host, 2026-09-26.
     const dir = deployment(CONFIGURED);
     assert.equal(writtenMode(envFile(dir)), null, 'the fixture is a file that does not say');
 
@@ -198,6 +198,23 @@ test('a mode that is not configured is refused, and the file is left as it was',
     assert.equal(envFile(dir), before);
 });
 
+test('a switch to a mode that cannot start is refused, even where the file loads anyway', () => {
+    // The private block with its origin line gone. This one used to land: `loadConfig` gives an
+    // absent origin the loopback default, so the rewritten file loads and the write-and-verify
+    // below has nothing to object to — the box would say `private` from the next start, the server
+    // would be healthy on loopback, and no door would be opened for it, because the units refuse to
+    // shape a mode that is not configured. Refused before the write, and against the same answer
+    // the units use, so the switch cannot land a mode whose front door would never open.
+    const dir = deployment(CONFIGURED.replace(/^NETWORK_MODE_PRIVATE_ORIGIN=.*$/m, ''));
+    const before = envFile(dir);
+    const result = admin(dir, 'mode', 'private');
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /Cannot switch to private: NETWORK_MODE_PRIVATE_ORIGIN is not set in its block/);
+    assert.equal(envFile(dir), before, 'a refusal before the write leaves nothing to put back');
+    assert.equal(fs.existsSync(path.join(dir, 'data', 'env.previous')), false,
+        'and not even the copy a write leaves behind');
+});
+
 test('with no argument it shows both, and which one is in force', () => {
     const dir = deployment(CONFIGURED);
     const result = admin(dir, 'mode');
@@ -205,6 +222,34 @@ test('with no argument it shows both, and which one is in force', () => {
     assert.match(result.stdout, /private/);
     assert.match(result.stdout, /crossbar\.example\.com/);
     assert.match(result.stdout, /in force/);
+});
+
+test('the listing says per mode whether it is configured, and names what is missing', () => {
+    // The public block with its origin line gone: private is the mode in force, so the file still
+    // loads — `loadConfig` falls back to the loopback origin — and this listing is the only thing
+    // that says public mode has no address for an invitation to carry. Which is the state the
+    // shaper has to refuse to act in, and the one a hand-emptied line reaches.
+    const dir = deployment(CONFIGURED.replace(/^NETWORK_MODE_PUBLIC_ORIGIN=.*$/m, ''));
+    const result = admin(dir, 'mode');
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /CONFIGURED/);
+    assert.match(result.stdout, /^-> private\s+yes\b/m);
+    assert.match(result.stdout, /^ {3}public\s+no\b/m);
+    assert.match(result.stdout, /missing NETWORK_MODE_PUBLIC_ORIGIN/);
+    assert.doesNotMatch(result.stdout, /missing NETWORK_MODE_PRIVATE_ORIGIN/,
+        'the mode that is complete is not reported as missing anything');
+
+    // And the mode in force being the one that is not configured is said in the summary, because
+    // that is the shape where no door is opened at all: the server starts on the defaults, so
+    // nothing else in the output would notice.
+    const hollow = deployment(CONFIGURED
+        .replace(/^NETWORK_MODE_PRIVATE_ORIGIN=.*$/m, '')
+        .replace(/^NETWORK_MODE_PUBLIC_ORIGIN=.*$/m, ''));
+    const asked = admin(hollow, 'mode');
+    assert.equal(asked.status, 0, asked.stderr);
+    assert.match(asked.stdout, /^-> private\s+no\b/m);
+    assert.match(asked.stdout, /missing NETWORK_MODE_PRIVATE_ORIGIN/);
+    assert.match(asked.stdout, /Its block is incomplete/);
 });
 
 test('a switch that meets an override outside the section refuses, and the file is untouched', () => {

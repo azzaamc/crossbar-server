@@ -147,7 +147,9 @@ Fill in, at minimum:
   every device out.
 - **One block per mode this deployment can be reached in** — `NETWORK_MODE_PRIVATE_HOSTNAME` /
   `_ORIGIN` and `NETWORK_MODE_PUBLIC_HOSTNAME` / `_ORIGIN` / `_BIND_ADDRESS`. A mode whose
-  block is empty is refused at switch time, leaving the file as it was.
+  block is empty is refused at switch time, leaving the file as it was, and the units that shape
+  the box no longer act for it either (§3.3): closing the other door on the strength of a mode
+  that cannot start is not something an operator can undo from outside the box.
 - Optionally, **the switch window** — `CROSSBAR_SWITCH_GRACE_SECONDS`, in seconds, default 900
   (fifteen minutes). It is read by the mode units, not by the server, and it is not in
   `.env.example`; add the line only to change the window. See §3.4.
@@ -230,7 +232,7 @@ runs at all — the box looks configured and has no front door.
 /home/admin/crossbar/src/server.js`, `ExecStart=/usr/bin/node
 /home/admin/crossbar/src/backup.js`, and `ReadWritePaths=/home/admin/crossbar/data
 [/home/admin/crossbar/.env]` in the server and backup units; the same `EnvironmentFile` plus
-`/home/admin/crossbar/.env` in the two mode units' `ExecCondition` greps and in their
+`/home/admin/crossbar/.env` in the two mode units' `ExecCondition`s and in their
 grace-window `systemd-run` lines; and `/etc/crossbar/coturn.conf` in the relay unit.
 
 **A second household at a different user or path does not edit them.** `scripts/install.sh`
@@ -389,16 +391,21 @@ answers whether the file loads as a process would read it:
 
 ```
 $ node src/admin.js mode
-   MODE       HOSTNAME                              ORIGIN
--> private    -                                     (unset: invitations would carry the default origin)
-   public     -                                     (unset: invitations would carry the default origin)
+   MODE       CONFIGURED  HOSTNAME                              ORIGIN
+-> private    no          -                                     (unset: invitations would carry the default origin)
+              missing NETWORK_MODE_PRIVATE_ORIGIN
+   public     no          -                                     (unset: invitations would carry the default origin)
+              missing NETWORK_MODE_PUBLIC_HOSTNAME, NETWORK_MODE_PUBLIC_ORIGIN
 
 private is in force, and loads cleanly.
+Its block is incomplete, so no front door is opened for it: the units shape a mode only when it is configured, and a switch to one is refused.
 ```
 
 (That is the development checkout, whose blocks are empty. A deployment's two lines carry its
-tailnet name and its public hostname.) Exit code is 1 when the file does **not** load, so this
-is also the command to run before a restart when something is wrong.
+tailnet name and its public hostname, and `CONFIGURED` says for each block whether it can start
+as written: the same question the mode units ask before they move a door, so a `no` beside the
+mode in force is a front door that will not be opened.) Exit code is 1 when the file does
+**not** load, so this is also the command to run before a restart when something is wrong.
 
 `node src/admin.js mode public` rewrites the generated section and verifies it by starting a
 child process that reads nothing but that file:
@@ -414,12 +421,16 @@ Then restart. In the same mode it answers `Already in public; nothing to change.
 
 What it refuses, and why:
 
-- **An empty mode block.** It writes the file, the verification fails, it puts the file back
-  byte for byte, and it names what is missing:
-  `Cannot switch to public: NETWORK_MODE_PUBLIC_HOSTNAME (or CROSSBAR_PUBLIC_HOSTNAME) is
-  required in public mode: it is the host invitations send people to`, followed by
+- **An empty mode block.** It is refused before anything is written — the mode is worked out
+  before the file is touched, so not even an `env.previous` appears — and it names what is
+  missing:
+  `Cannot switch to public: NETWORK_MODE_PUBLIC_HOSTNAME, NETWORK_MODE_PUBLIC_ORIGIN are not
+  set in its block.`, followed by
   `Fill in its block in .env — NETWORK_MODE_PUBLIC_HOSTNAME and NETWORK_MODE_PUBLIC_ORIGIN —
-  and try again.` The origin not naming the hostname is refused the same way.
+  and try again.` That is the same question the mode units ask before they move a door
+  (`modeConfigured`), so a switch cannot land a mode whose front door would never open. An
+  origin that is set but does not name the hostname is a different fault, with both names
+  present, and the write-and-verify below puts that one back byte for byte.
 - **A generated name outside the markers.** This is the one that surprises people, and it is
   deliberate:
 
@@ -476,18 +487,26 @@ was interrupted or a setting was saved by mistake (§5.4).
 
 `sudo systemctl restart crossbar` restarts the server and, because the server unit wants them,
 re-runs `crossbar-public.service` and `crossbar-private.service`. Each is a oneshot whose
-`ExecCondition` is a whole-line grep of `.env`:
+`ExecCondition` asks the mode predicate through the CLI:
 
 ```
-ExecCondition=/usr/bin/grep -qx CROSSBAR_NETWORK_MODE=public /home/admin/crossbar/.env
+ExecCondition=/usr/bin/node /home/admin/crossbar/src/admin.js mode --configured public /home/admin/crossbar/.env
 ```
 
 Exactly one passes, so exactly one acts, and which one is answered by the same file the
-server reads — one answer to "which mode is this deployment in". The check is a `grep` rather
-than `ConditionEnvironment=`, which looks like the obvious tool and is silently wrong here:
-that condition is evaluated against the *manager's* environment, so `EnvironmentFile=` never
-reaches it and it fails in **both** modes. Both units being skipped quietly is worse than
-having none, because the box looks switched and is not.
+server reads — one answer to "which mode is this deployment in". The check asks **two** things
+of that file: that it says this mode, and that this mode is configured — every name its own
+block has to carry is set (`modeConfigured` in `src/config.js`; the same answer the listing and
+`doctor` give). It was a whole-line `grep -qx CROSSBAR_NETWORK_MODE=public`, and that asked only
+the first half: a file saying `public` with an empty public block passed it, so the unit started
+Caddy — which cannot render the Caddyfile without a bind address — and scheduled
+`tailscale serve off` while the server crash-looped on exactly the names the block was missing.
+A switch to an unconfigured mode is refused, and a shaper no longer acts for one, because the
+close is the half of a switch that lands on a timer and cannot be undone from outside the box.
+The check is a command rather than `ConditionEnvironment=`, which looks like the obvious tool
+and is silently wrong here: that condition is evaluated against the *manager's* environment, so
+`EnvironmentFile=` never reaches it and it fails in **both** modes. Both units being skipped
+quietly is worse than having none, because the box looks switched and is not.
 
 The units move Caddy with a command rather than a dependency, and that is deliberate. A
 `Conflicts=` or a `Wants=` is resolved while the start is still being planned, *before* any
@@ -597,7 +616,8 @@ systemctl list-timers --all | grep crossbar-grace     # a close still pending?
 publishing the loopback port is private — but inside the window both doors answer on purpose, so
 the third command is what tells you whether the switch has finished. If nothing is pending and
 the shape is wrong, the shaping units did not run: `sudo systemctl restart crossbar` applies
-them.
+them — unless the mode in force is not configured, in which case no restart will shape it
+(`node src/admin.js mode` says so beside the mode), and its block has to be filled in first.
 
 ### 3.5 How to tell what mode is in force
 
@@ -605,7 +625,7 @@ Three different questions, three answers — they disagree only in the window be
 and the restart:
 
 ```bash
-node src/admin.js mode        # what the FILE says, and whether it loads
+node src/admin.js mode        # what the FILE says, whether it loads, and which block can start
 node src/admin.js status      # what the RUNNING process is using
 curl -fsS http://127.0.0.1:3003/api/health
 ```
@@ -645,6 +665,11 @@ journalctl -u 'crossbar-grace-*' -n 20            # closes that have fired, and 
   restart, the file says public and the process is still private. `mode` reads the file;
   `status` and `/api/health` read the process. They must disagree in that window — that is the
   command working as designed, not a fault.
+- **A mode whose block is not filled in.** A switch to it is refused, and the units no longer
+  act for it either: they check that the mode is configured as well as written before they move
+  a front door, so the box is left as it is rather than with its old door closed on the strength
+  of a mode that cannot start. `node src/admin.js mode` says which names are missing, and
+  `doctor` reports the same for each mode.
 - **A second switch inside the grace window.** This is *handled* rather than forbidden: the
   deferred close re-reads the mode when it fires, so switching back inside the window leaves the
   door the second switch opened alone, and the journal shows one failed `crossbar-grace-*.service`

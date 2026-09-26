@@ -10,7 +10,7 @@
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { MODES, KNOBS, modeBlock, applyMode, applyKnobs, verifyEnvFile, writeEnvFile } = require('./config');
+const { MODES, KNOBS, modeBlock, modeConfigured, applyMode, applyKnobs, verifyEnvFile, writeEnvFile } = require('./config');
 const { resolveIdentity, isLoopback, isOperatorRequest } = require('./identity');
 const { DEVICE_ID_PATTERN } = require('./db');
 const auth = require('./auth');
@@ -876,12 +876,20 @@ function createRequestHandler({ config, store, bus, push, apns, lifecycle, log, 
                 const content = envContent();
                 return sendJson(res, 200, {
                     mode: config.networkMode,
-                    modes: MODES.map((mode) => ({
-                        mode,
-                        hostname: modeBlock(content, mode).HOSTNAME,
-                        origin: modeBlock(content, mode).ORIGIN,
-                        inForce: mode === config.networkMode,
-                    })),
+                    modes: MODES.map((mode) => {
+                        const block = modeBlock(content, mode);
+                        // The question the mode units' `ExecCondition` asks, so what the console
+                        // shows and what the shapers act on cannot drift apart.
+                        const { configured, missing } = modeConfigured(mode, envPath);
+                        return {
+                            mode,
+                            hostname: block.HOSTNAME,
+                            origin: block.ORIGIN,
+                            inForce: mode === config.networkMode,
+                            configured,
+                            missing,
+                        };
+                    }),
                     knobs: KNOBS.map((knob) => ({ ...knob, value: currentValue(knob.key) })),
                 });
             }
@@ -902,8 +910,19 @@ function createRequestHandler({ config, store, bus, push, apns, lifecycle, log, 
                 if (!MODES.includes(wanted)) {
                     return sendError(res, 400, 'MODE_REFUSED', `The mode has to be one of ${MODES.join(', ')}.`);
                 }
-                const outcome = writeEnv((content) => applyMode(content, wanted),
-                    'mode_changed', { mode: wanted, by: actor });
+                const outcome = writeEnv((content) => {
+                    // Refused before anything is written, and it is the same question the mode units
+                    // ask before they move a door (`modeConfigured`) — the answer this route's own
+                    // card shows. Verification below cannot stand in for it: a private block with no
+                    // origin loads on the loopback default, so the rewrite would pass and leave a box
+                    // saying `private` whose front door never opens.
+                    const { configured, missing } = modeConfigured(wanted, envPath);
+                    if (!configured) {
+                        throw new Error(`Cannot switch to ${wanted}: ${missing.join(', ')}`
+                            + ` ${missing.length === 1 ? 'is' : 'are'} not set in its block.`);
+                    }
+                    return applyMode(content, wanted);
+                }, 'mode_changed', { mode: wanted, by: actor });
                 if (!outcome.ok) return sendError(res, 400, 'MODE_REFUSED', outcome.message);
                 return restarting(res, outcome.changed);
             }

@@ -46,18 +46,34 @@ EnvironmentFile=/home/admin/crossbar/.env
 # the order is the same in both. 900 is fifteen minutes.
 Environment=CROSSBAR_SWITCH_GRACE_SECONDS=900
 
-# Which mode this unit is for is answered by the same file the server reads, so there is one
-# answer to "which mode is this deployment in" and no second copy to drift.
+# Which mode this unit is for, and whether this box can actually be in that mode, is answered by
+# the same file the server reads, so there is one answer to "which mode is this deployment in"
+# and no second copy to drift.
 #
-# `grep` here rather than `ConditionEnvironment=`, which looks like the obvious tool and is
+# `mode --configured` passes only when the file says `public` *and* the public block names
+# everything public mode needs to start (`modeConfigured` in `src/config.js`, which is the
+# predicate and where the measurement is written down). It used to be a whole-line
+# `grep -qx CROSSBAR_NETWORK_MODE=public` on that file, which asked only the first half: a file
+# that says `public` with an empty public block passed it, so this unit started Caddy -- which
+# cannot render the Caddyfile without `CROSSBAR_BIND_ADDRESS` -- while the server crash-looped on
+# the very names the block was missing.
+#
+# The close this unit schedules is why that matters more than a unit that fails to do its job.
+# Closing a door is the one half of a switch that cannot be undone from outside the box: it lands
+# on a timer, with the server it was meant to be shaped around already refused, and whoever is on
+# the wrong side of it has no way back in. So the shapers act for a mode that can start, and for
+# nothing else.
+#
+# A command line rather than `ConditionEnvironment=`, which looks like the obvious tool and is
 # not: that condition is checked against the *manager's* environment (/proc/1/environ), so
 # `EnvironmentFile=` never reaches it and the check fails in both modes. Measured -- both
 # units were skipped, including the one whose mode was in force -- and a condition that
 # fails quietly is worse than no condition, because the box looks switched and is not.
 #
-# `-x` is a whole-line match, so a comment or a longer name that merely contains this one
-# cannot satisfy it.
-ExecCondition=/usr/bin/grep -qx CROSSBAR_NETWORK_MODE=public /home/admin/crossbar/.env
+# The file is named by absolute path rather than left to the working directory, which is not this
+# deployment's: these are the literal paths every unit here is written with, and `render_unit`
+# rewrites them for the host being installed on, so nothing new has to be remembered.
+ExecCondition=/usr/bin/node /home/admin/crossbar/src/admin.js mode --configured public /home/admin/crossbar/.env
 
 # The public route comes back first, so the new way in exists before the old one goes.
 #

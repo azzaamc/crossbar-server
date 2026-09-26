@@ -12,7 +12,7 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
-const { loadConfig, applyMode, modeBlock, writtenMode, MODES, setEnvLine, verifyEnvFile, writeEnvFile } = require('./config');
+const { loadConfig, applyMode, modeBlock, modeConfigured, writtenMode, MODES, setEnvLine, verifyEnvFile, writeEnvFile } = require('./config');
 const { operatorToken, OPERATOR_HEADER } = require('./identity');
 const { Store } = require('./db');
 const auth = require('./auth');
@@ -30,6 +30,7 @@ const USAGE = `Crossbar administration
   remove-device <deviceId>               Take a revoked device out of the records
   status                                 Configuration and counts
   mode                                   Both configurations, and which is in force
+  mode --configured <mode> [file]        Whether this file says that mode, and it can start
   mode private|public                    Switch this deployment to that one
   password                               Set the console's password, prompted
   ring --from <id> --to <id>              Ring a device, to test that it does
@@ -217,11 +218,49 @@ function operatorHeaders(config, extra = {}) {
     };
 }
 
+/**
+ * `node src/admin.js mode --configured <mode> [file]`, which is what both mode units run as
+ * their `ExecCondition`: 0 when the file says it is in that mode and the block that mode owns
+ * names everything it needs to start, 1 otherwise, with the names to fill in on stderr.
+ *
+ * Both halves are asked of the file it was given, by path, and neither through `loadConfig`:
+ * the units run this against exactly the files that may not load yet, which is the state it
+ * exists to answer about. The mode line is checked here rather than inside the predicate
+ * because `doctor` and the console ask "is this mode configured" about modes that are not in
+ * force, and that question must not depend on which one is written.
+ */
+function modeConfiguredExitCode(mode, envPath) {
+    if (!MODES.includes(mode)) {
+        console.error(`mode --configured takes one of ${MODES.join(', ')}.`);
+        return 1;
+    }
+    const file = path.resolve(process.cwd(), envPath || '.env');
+    if (!fs.existsSync(file)) {
+        console.error(`No .env at ${file}, so neither mode is configured.`);
+        return 1;
+    }
+    if (writtenMode(fs.readFileSync(file, 'utf8')) !== mode) {
+        console.error(`The file does not say it is in ${mode}, so nothing is shaped for it.`);
+        return 1;
+    }
+    const { configured, missing } = modeConfigured(mode, file);
+    if (configured) return 0;
+    console.error(`${mode} is not configured: ${missing.join(', ')} ${missing.length === 1 ? 'is' : 'are'} not set.`);
+    return 1;
+}
+
 async function main(argv) {
     const { command, options, positional } = parseArgs(argv);
     if (!command || command === 'help' || command === '--help') {
         console.log(USAGE);
         return 0;
+    }
+
+    // Answered before `loadConfig` is asked anything, because the callers are the two mode
+    // units' `ExecCondition`s: a file whose mode block is empty is precisely the file this
+    // question is about, and it is also one `loadConfig` refuses.
+    if (command === 'mode' && options.configured !== undefined) {
+        return modeConfiguredExitCode(options.configured, positional[0]);
     }
 
     const config = loadConfig();
@@ -353,19 +392,30 @@ async function main(argv) {
                 const [wanted] = positional;
 
                 if (!wanted) {
-                    console.log(`${pad('', 3)}${pad('MODE', 11)}${pad('HOSTNAME', 38)}ORIGIN`);
+                    console.log(`${pad('', 3)}${pad('MODE', 11)}${pad('CONFIGURED', 12)}${pad('HOSTNAME', 38)}ORIGIN`);
                     for (const mode of MODES) {
                         const block = modeBlock(content, mode);
                         const active = config.networkMode === mode;
+                        // `modeConfigured` rather than the block read just above: whether a mode
+                        // can start is one question with one answer, and the mode units ask the
+                        // same one through this CLI before they touch a front door.
+                        const { configured, missing } = modeConfigured(mode, file);
                         console.log(
-                            pad(active ? '->' : '', 3) + pad(mode, 11) + pad(block.HOSTNAME || '-', 38)
+                            pad(active ? '->' : '', 3) + pad(mode, 11) + pad(configured ? 'yes' : 'no', 12)
+                            + pad(block.HOSTNAME || '-', 38)
                             + (block.ORIGIN || '(unset: invitations would carry the default origin)'),
                         );
+                        if (!configured) console.log(`${pad('', 14)}missing ${missing.join(', ')}`);
                     }
                     const check = verifyEnvFile(process.cwd(), config.networkMode);
                     console.log(check.ok
                         ? `\n${config.networkMode} is in force, and loads cleanly.`
                         : `\n${config.networkMode} is in force but does not load: ${check.message}`);
+                    const inForce = modeConfigured(config.networkMode, file);
+                    if (!inForce.configured) {
+                        console.log(`Its block is incomplete, so no front door is opened for it:`
+                            + ` the units shape a mode only when it is configured, and a switch to one is refused.`);
+                    }
                     return check.ok ? 0 : 1;
                 }
 
@@ -373,17 +423,33 @@ async function main(argv) {
                     console.error(`mode takes one of ${MODES.join(', ')}.`);
                     return 1;
                 }
+
+                // Refused before anything is written, and it is the same question the mode units
+                // ask before they move a door (`modeConfigured`), so a switch cannot land a mode
+                // whose front door would never open. That is not hypothetical: a private block
+                // with its origin line gone loads perfectly well — `loadConfig` falls back to the
+                // loopback origin — so verification below cannot see it, and the box would say
+                // `private` while nobody on the tailnet could reach it.
+                const configured = modeConfigured(wanted, file);
+                if (!configured.configured) {
+                    console.error(`Cannot switch to ${wanted}: ${configured.missing.join(', ')}`
+                        + ` ${configured.missing.length === 1 ? 'is' : 'are'} not set in its block.`);
+                    console.error(`Fill in its block in .env — NETWORK_MODE_${wanted.toUpperCase()}_HOSTNAME`
+                        + ` and NETWORK_MODE_${wanted.toUpperCase()}_ORIGIN — and try again.`);
+                    return 1;
+                }
+
                 if (wanted === writtenMode(content)) {
                     // Compared against what the *file* says, not against what the configuration
                     // resolved to. `loadConfig` defaults to private, so a fresh install's file
                     // — `deploy/.env.example`, with both blocks and no generated section — is in
                     // force as private while carrying no `CROSSBAR_NETWORK_MODE` line at all;
                     // this comparison used to call that "already in private" and write nothing.
-                    // Both mode shapers run under
-                    // `ExecCondition=/usr/bin/grep -qx CROSSBAR_NETWORK_MODE=<mode>` on that
-                    // file, so on a fresh private install `tailscale serve` was never run and
-                    // nobody on the tailnet could reach a server that was perfectly healthy on
-                    // loopback. Measured on the rehearsal host, 2026-09-26.
+                    // The mode shapers read that line before they act (`mode --configured` is
+                    // the check, and it wants the line written down), so on a fresh private
+                    // install `tailscale serve` was never run and nobody on the tailnet could
+                    // reach a server that was perfectly healthy on loopback. Measured on the
+                    // rehearsal host, 2026-09-26.
                     console.log(`Already in ${wanted}; the file says so, and nothing has changed.`);
                     return 0;
                 }

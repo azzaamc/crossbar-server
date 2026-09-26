@@ -24,7 +24,7 @@ const WebSocket = require('ws');
 const directoryFile = require('./directory');
 // The names this process reads live in `config.js`, beside the reads they describe. This is
 // the one place that asks what a `.env` holds that they do not cover.
-const { unreadEnvKeys, writtenMode } = require('./config');
+const { unreadEnvKeys, writtenMode, modeConfigured, MODES } = require('./config');
 
 const PROBE_TIMEOUT_MS = 4000;
 
@@ -421,16 +421,19 @@ function checkTailscale(config, command = 'tailscale') {
 }
 
 /**
- * The configuration file, as something other than this process reads it: the names in it, and
- * whether it says which mode it is in.
+ * The configuration file, as something other than this process reads it: the names in it,
+ * whether it says which mode it is in, and whether each mode it holds is one that can start.
  *
  * A warning rather than a failure, and the only check here that is: the server is running and
- * neither of these changes what it does — which is exactly what makes them worth saying. A
+ * none of these changes what it does — which is exactly what makes them worth saying. A
  * typo'd `CROSSBAR_SESSION_SECERT` is a setting the operator believes is in force. A file with
  * no `CROSSBAR_NETWORK_MODE` line is a *fresh install*, and there the mode is in force by
- * default while both front doors' units grep for that line before they configure anything: on
- * a new private deployment nothing ever runs `tailscale serve`, so the server is healthy on
- * loopback and unreachable from the tailnet. Measured on the rehearsal host, 2026-09-26.
+ * default while both front doors' units read that line before they configure anything: on a
+ * new private deployment nothing ever runs `tailscale serve`, so the server is healthy on
+ * loopback and unreachable from the tailnet. And a mode whose own block is incomplete is a
+ * front door that will not be shaped either, because the units ask whether the mode can start
+ * before they act (`modeConfigured`) rather than whether the file merely names it. Measured on
+ * the rehearsal host, 2026-09-26.
  */
 function checkEnvFile(config) {
     if (!config.envFile || !fs.existsSync(config.envFile)) {
@@ -453,14 +456,32 @@ function checkEnvFile(config) {
             + ` the difference. \`node src/admin.js mode ${config.networkMode}\` writes the section it is missing.`);
     }
 
+    // Each mode's own block, which is what a mode unit checks before it moves a front door
+    // (`modeConfigured`, through `node src/admin.js mode --configured` in its `ExecCondition`).
+    // Reported for both modes, and warned about only for the one the file says it is in: a
+    // tailnet deployment is not broken for having no public block, and a warning about a door
+    // this box never opens is how an operator learns to ignore the output. The warning is worth
+    // raising for the mode in force because the server starts anyway — `loadConfig` falls back
+    // to the loopback origin — so what is missing is the box's shape, and only the journal says so.
+    const modes = MODES.map((mode) => ({ mode, ...modeConfigured(mode, config.envFile) }));
+    const inForce = modes.find((entry) => entry.mode === writtenMode(content));
+    if (inForce && !inForce.configured) {
+        said.push(`The file says it is in ${inForce.mode} mode, and that mode's block is missing`
+            + ` ${inForce.missing.join(', ')}: the server starts on the defaults instead, and no unit opens`
+            + ' that mode\'s front door, because the units shape a mode only when it is configured.');
+    }
+    const state = modes.map((entry) => (entry.configured
+        ? `${entry.mode} is configured`
+        : `${entry.mode} is missing ${entry.missing.join(', ')}`)).join('; ');
+
     if (!said.length) {
         return {
             ok: true,
             detail: `every name in ${path.basename(config.envFile)} is one this server reads,`
-                + ' and the file says which mode it is in',
+                + ` the file says which mode it is in, and ${state}`,
         };
     }
-    return { ok: true, warn: true, detail: said.join(' ') };
+    return { ok: true, warn: true, detail: `${said.join(' ')} ${state}` };
 }
 
 /**

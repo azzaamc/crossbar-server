@@ -862,14 +862,22 @@ function settingsView(settings) {
 
     const modeCards = settings.modes.map((entry) => el('div', { class: `card${entry.inForce ? ' active' : ''}` }, [
         el('div', { class: 'label', text: entry.inForce ? `${entry.mode} — in force` : entry.mode }),
-        el('div', { class: 'value', text: entry.hostname || 'not configured' }),
+        el('div', { class: 'value', text: entry.hostname || 'no hostname set' }),
         entry.origin ? el('div', { class: 'muted mono', text: entry.origin }) : null,
+        // The answer the mode units themselves act on, said here so an operator can see why no
+        // door is opened for a mode — or why a switch to it will be refused — without the journal.
+        entry.configured ? null : el('div', {
+            class: 'muted',
+            text: `Not configured — missing ${entry.missing.join(', ')}. A mode that cannot start is not switched to, and no unit opens its door.`,
+        }),
         entry.inForce ? null : el('button', {
             type: 'button',
             text: `Switch to ${entry.mode}`,
             onClick: () => applyChange('/api/admin/mode', { mode: entry.mode },
                 `Switch this server to ${entry.mode}?\n\nIt restarts, and everyone reconnects. `
-                + (entry.hostname ? `It will be reached at ${entry.origin}.` : 'That mode has no address set, so this will be refused.')),
+                + (entry.configured
+                    ? `It will be reached at ${entry.origin}.`
+                    : `That mode is missing ${entry.missing.join(', ')}, so this will be refused.`)),
         }),
     ]));
 

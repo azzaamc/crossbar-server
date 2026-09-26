@@ -166,6 +166,59 @@ test('a setting that would stop the server starting is refused, and put back', a
     assert.deepEqual(await unchanged.json(), { ok: true, changed: false, restarting: false });
 });
 
+test('the settings list says which modes can start, and what is missing from the others', async (t) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'crossbar-modes-'));
+    t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+    const envFile = path.join(dir, '.env');
+    // Private is a configuration; public is a placeholder — the block exists and says nothing,
+    // which is the state no shaper may act in. The console is where an operator sees that, so the
+    // answer has to be the predicate's (`modeConfigured`) rather than a second reading of the file.
+    fs.writeFileSync(envFile, [
+        'CROSSBAR_NETWORK_MODE=private',
+        'NETWORK_MODE_PRIVATE_HOSTNAME=box.tailnet.ts.net',
+        'NETWORK_MODE_PRIVATE_ORIGIN=https://box.tailnet.ts.net',
+        'NETWORK_MODE_PUBLIC_HOSTNAME=',
+        'NETWORK_MODE_PUBLIC_ORIGIN=',
+    ].join('\n') + '\n');
+    const { server, base } = await startTestServer({ ...WITH_PASSWORD, envFile });
+    t.after(() => server.close());
+    const { cookie } = await signIn(base, PASSWORD);
+
+    const response = await fetch(`${base}/api/admin/settings`, { headers: { cookie: cookiePair(cookie) } });
+    assert.equal(response.status, 200);
+    const byMode = new Map((await response.json()).modes.map((entry) => [entry.mode, entry]));
+
+    assert.deepEqual(byMode.get('private'), {
+        mode: 'private',
+        hostname: 'box.tailnet.ts.net',
+        origin: 'https://box.tailnet.ts.net',
+        inForce: true,
+        configured: true,
+        missing: [],
+    });
+    assert.deepEqual(byMode.get('public'), {
+        mode: 'public',
+        hostname: '',
+        origin: '',
+        inForce: false,
+        configured: false,
+        missing: ['NETWORK_MODE_PUBLIC_HOSTNAME', 'NETWORK_MODE_PUBLIC_ORIGIN'],
+    });
+
+    // And the switch is refused for the same reason, before anything is written — what the card
+    // says will happen ("this will be refused") has to be what the write does. The server is not
+    // asked to restart either, which is what a 400 rather than a 200 says.
+    const before = fs.readFileSync(envFile, 'utf8');
+    const refused = await fetch(`${base}/api/admin/mode`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', cookie: cookiePair(cookie) },
+        body: JSON.stringify({ mode: 'public' }),
+    });
+    assert.equal(refused.status, 400);
+    assert.equal((await refused.json()).error.code, 'MODE_REFUSED');
+    assert.equal(fs.readFileSync(envFile, 'utf8'), before, 'a refusal before the write leaves the file as it was');
+});
+
 test('the directory can be changed from the console, and suspending is not removing', async (t) => {
     const { server, base } = await startTestServer(WITH_PASSWORD);
     t.after(() => server.close());

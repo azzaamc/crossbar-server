@@ -168,11 +168,30 @@ test('the doctor warns about an unread name and does not fail on it', (t) => {
     assert.equal(warned.warn, true);
     assert.match(warned.detail, /CROSSBAR_SESSION_SECERT, did you mean CROSSBAR_SESSION_SECRET\?/);
 
-    fs.writeFileSync(config.envFile, 'CROSSBAR_SESSION_SECRET=fine\nHOST=127.0.0.1\nCROSSBAR_NETWORK_MODE=private\n');
+    fs.writeFileSync(config.envFile, 'CROSSBAR_SESSION_SECRET=fine\nHOST=127.0.0.1\nCROSSBAR_NETWORK_MODE=private\n'
+        + 'NETWORK_MODE_PRIVATE_ORIGIN=https://box.tailnet.ts.net\n');
     const quiet = diagnostics.checkEnvFile(config);
     assert.equal(quiet.ok, true);
-    assert.equal(quiet.warn, undefined, 'a file everything reads, that says its mode, is not warned about');
+    assert.equal(quiet.warn, undefined,
+        'a file everything reads, that says its mode, and can start in it is not warned about');
     assert.match(quiet.detail, /every name in \.env is one this server reads/);
+    assert.match(quiet.detail, /private is configured/);
+    assert.match(quiet.detail, /public is missing NETWORK_MODE_PUBLIC_HOSTNAME, NETWORK_MODE_PUBLIC_ORIGIN/,
+        'the mode that is not in force is reported rather than warned about: a tailnet deployment is '
+        + 'not broken for having no public block');
+
+    // The mode the file says it is in has to be one it can start in. The units open a front door
+    // only for a configured mode (`modeConfigured`), so a block that is not filled in is a door
+    // that will not be opened — and the server starts anyway, on `loadConfig`'s fallbacks, so
+    // nothing else in the report would say so.
+    fs.writeFileSync(config.envFile,
+        'CROSSBAR_NETWORK_MODE=private\nNETWORK_MODE_PRIVATE_HOSTNAME=box.tailnet.ts.net\n');
+    const incomplete = diagnostics.checkEnvFile(config);
+    assert.equal(incomplete.ok, true, 'the server starts; it is the box that is not shaped');
+    assert.equal(incomplete.warn, true);
+    assert.match(incomplete.detail, /The file says it is in private mode, and that mode's block is missing/);
+    assert.match(incomplete.detail, /NETWORK_MODE_PRIVATE_ORIGIN/);
+    assert.match(incomplete.detail, /private is missing NETWORK_MODE_PRIVATE_ORIGIN/);
 
     // And what a warning means to the exit code: counted, and never a failure.
     assert.deepEqual(diagnostics.summariseResults([warned]), { failed: 0, warned: 1, checked: 1 });

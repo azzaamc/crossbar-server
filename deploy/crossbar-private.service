@@ -49,18 +49,24 @@ EnvironmentFile=/home/admin/crossbar/.env
 Environment=PORT=3003
 Environment=CROSSBAR_SWITCH_GRACE_SECONDS=900
 
-# Which mode this unit is for is answered by the same file the server reads, so there is one
-# answer to "which mode is this deployment in" and no second copy to drift.
+# Which mode this unit is for, and whether this box can actually be in that mode, is answered by
+# the same file the server reads, so there is one answer to "which mode is this deployment in"
+# and no second copy to drift.
 #
-# `grep` here rather than `ConditionEnvironment=`, which looks like the obvious tool and is
+# Read `crossbar-public.service` first: the check is the same one there, and so is the reason it
+# asks for more than the mode line. `mode --configured private` passes only when the file says
+# `private` *and* the private block names everything private mode needs to start
+# (`modeConfigured`). The whole-line `grep -qx CROSSBAR_NETWORK_MODE=private` this used to be
+# passed a file that said `private` and could not start in it -- and this unit would then have
+# scheduled Caddy's stop, taking the public door with it on a timer, which is not recoverable from
+# outside the box. A shaper acts for a mode that can start, and for nothing else.
+#
+# A command line rather than `ConditionEnvironment=`, which looks like the obvious tool and is
 # not: that condition is checked against the *manager's* environment (/proc/1/environ), so
 # `EnvironmentFile=` never reaches it and the check fails in both modes. Measured -- both
 # units were skipped, including the one whose mode was in force -- and a condition that
 # fails quietly is worse than no condition, because the box looks switched and is not.
-#
-# `-x` is a whole-line match, so a comment or a longer name that merely contains this one
-# cannot satisfy it.
-ExecCondition=/usr/bin/grep -qx CROSSBAR_NETWORK_MODE=private /home/admin/crossbar/.env
+ExecCondition=/usr/bin/node /home/admin/crossbar/src/admin.js mode --configured private /home/admin/crossbar/.env
 
 # The tailnet opens first, so the new way in exists before the old one goes.
 #
