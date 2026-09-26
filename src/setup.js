@@ -294,7 +294,8 @@ const ADDRESS_QUESTIONS = Object.freeze({
             key: 'privateHostname',
             name: 'HOSTNAME',
             prompt: 'the address your people\'s phones dial over the tailnet — Tailscale gives this machine one,'
-                + ' and `tailscale status` prints it (for example: crossbar.tailnet-name.ts.net)',
+                + ' and the installer sets it from the machine\'s own tailnet name once you approve the'
+                + ' machine on the link Tailscale shows (for example: crossbar.tailnet-name.ts.net)',
         },
         {
             key: 'privateOrigin',
