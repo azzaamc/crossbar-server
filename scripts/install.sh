@@ -11,9 +11,10 @@
 #   3. **onboarding** — `node src/admin.js setup` (§2.2.1, §2.3–§2.4), run in `$PREFIX` as the
 #      deployment's own account: it writes the mode blocks, the secrets and the **directory
 #      file** in one pass, and then the front door the chosen modes need — Caddy for a public
-#      block, a report that Tailscale's own login belongs to the person for a private one
-#      (§2.8). `--no-setup` turns it off and reproduces what this script did before: the
-#      directory file has to exist already, and it says exactly what to write when it does not;
+#      block, and Tailscale itself for a private one, installed, enabled and logged in from
+#      `--tailscale-authkey` when a key is given (§2.8). `--no-setup` turns it off and reproduces
+#      what this script did before: the directory file has to exist already, and it says exactly
+#      what to write when it does not;
 #   4. `npm ci --omit=dev` in the deployment's own account;
 #   5. the units, rendered for this host's paths and installed, `daemon-reload`, the service
 #      enabled and started, and the backup **timer** enabled — the backup service has no
@@ -28,7 +29,8 @@
 #
 # Usage:
 #   sudo scripts/install.sh [--prefix DIR] [--user NAME] [--source DIR] [--with-relay]
-#                           [--answers FILE] [--browser] [--no-setup] [--dry-run]
+#                           [--answers FILE] [--browser] [--tailscale-authkey KEY]
+#                           [--no-setup] [--dry-run]
 #
 #   --prefix DIR   where the deployment runs        (env CROSSBAR_HOME, default /home/admin/crossbar)
 #   --user NAME    the account that runs it         (env CROSSBAR_USER, default admin)
@@ -38,6 +40,11 @@
 #   --browser      the wizard's browser front end (`--browser`) instead of the terminal questions
 #   --no-setup     do not run the wizard: the directory file has to be there already
 #   --with-relay   install the coturn relay unit even if it is not obvious this host relays
+#   --tailscale-authkey KEY
+#                  a Tailscale auth key, for a private deployment: it joins this machine to the
+#                  tailnet without the browser login a person would otherwise do. The key is
+#                  handed to `tailscale up` through TS_AUTHKEY, so it appears in no transcript
+#                  and no process list. Without it, `sudo tailscale up` is the one step left.
 #   --dry-run      print every command and change nothing
 #
 # Idempotent: every step either already holds or is re-applied, so a second run is how a unit that
@@ -59,6 +66,7 @@ WITH_RELAY=''
 ANSWERS=''
 BROWSER=''
 NO_SETUP=''
+TAILSCALE_AUTHKEY=''
 
 usage() {
     usage_from "$0"
@@ -76,16 +84,20 @@ while [ "$#" -gt 0 ]; do
         --browser) BROWSER=1; shift ;;
         --no-setup) NO_SETUP=1; shift ;;
         --with-relay) WITH_RELAY=1; shift ;;
+        # A secret, and validated as one: an empty key is a typo that would otherwise reach
+        # `tailscale up` as "no key at all" and leave the login to a browser without saying so.
+        --tailscale-authkey) [ "$#" -ge 2 ] || die '--tailscale-authkey needs a key'; [ -n "$2" ] || die '--tailscale-authkey needs a non-empty key'; TAILSCALE_AUTHKEY="$2"; shift 2 ;;
         --dry-run) DRY_RUN=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) die "unknown argument: $1 (try --help)" ;;
     esac
 done
 
-# `--answers` and `--browser` are answers to the wizard's questions, and this flag says there is no
-# wizard: together they are a typo that would otherwise install nothing and say nothing about why.
-if [ -n "$NO_SETUP" ] && { [ -n "$ANSWERS" ] || [ -n "$BROWSER" ]; }; then
-    die '--no-setup turns the setup wizard off, so --answers and --browser have nothing to run: pass one or the other'
+# `--answers`, `--browser` and `--tailscale-authkey` are all answers to, or work of, the wizard
+# and the front door it installs; this flag says there is no onboarding phase, so together they
+# are a typo that would otherwise install nothing and say nothing about why.
+if [ -n "$NO_SETUP" ] && { [ -n "$ANSWERS" ] || [ -n "$BROWSER" ] || [ -n "$TAILSCALE_AUTHKEY" ]; }; then
+    die '--no-setup turns the onboarding phase off, so --answers, --browser and --tailscale-authkey have nothing to run: pass one or the other'
 fi
 
 # The two values that end up inside a unit file, refused unless they are shaped like what they are
@@ -298,7 +310,7 @@ if [ -n "$NO_SETUP" ]; then
     fi
 else
     step 'onboarding'
-    onboard_deployment "$ANSWERS" "$BROWSER"
+    onboard_deployment "$ANSWERS" "$BROWSER" "$TAILSCALE_AUTHKEY"
     if [ "$DRY_RUN" = '1' ]; then
         say "a real run writes the directory file at $DIRECTORY_PATH before it installs a unit"
     else
@@ -394,8 +406,11 @@ say "  cd $PREFIX"
 say "  sudo -u $CROSSBAR_USER node src/admin.js mode       # which mode the file is in, and that it loads"
 say "  sudo -u $CROSSBAR_USER node src/admin.js status     # the running configuration and the counts"
 say "  sudo -u $CROSSBAR_USER node src/admin.js doctor     # every line OK before anybody is invited"
-say "  sudo -u $CROSSBAR_USER node src/admin.js password   # the console's password, at /admin"
-say "  sudo -u $CROSSBAR_USER node src/admin.js enroll --user <login>   # one invitation, printed once"
+say ''
+say '  The onboarding phase asks the console password and the first invitation at a terminal,'
+say '  and runs them there. If either was skipped, or there was no terminal to ask, they are:'
+say "      sudo -u $CROSSBAR_USER node src/admin.js password                # the console's password, at /admin"
+say "      sudo -u $CROSSBAR_USER node src/admin.js enroll --user <login>   # one invitation, printed once"
 say ''
 say '  journalctl -u crossbar -f                            # what it is saying'
 say '  systemctl list-timers crossbar-backup.timer          # the daily backup, and when it next runs'
@@ -404,6 +419,8 @@ say ''
 say 'A public deployment'"'"'s Caddy, its Caddyfile and the drop-in that hands it this .env were'
 say 'installed and validated in the onboarding phase. What is left is what software cannot see:'
 say 'the DNS record, the port forwards, the firewall, and the address the router forwards to —'
-say 'deploy/README.md §2.8, with the host facts in §8. A private deployment needs `tailscale up`,'
-say 'which is a browser login a person does. The relay is §2.9.'
+say 'deploy/README.md §2.8, with the host facts in §8. A private deployment'"'"'s Tailscale was'
+say 'installed, enabled and started in the same phase; when no --tailscale-authkey was given,'
+say '`sudo tailscale up` is the one login left, and it is a browser approval a person does.'
+say 'The relay is §2.9.'
 exit 0

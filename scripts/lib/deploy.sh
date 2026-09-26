@@ -61,6 +61,20 @@ run_pipe() {
     /bin/sh -c "$1"
 }
 
+# A step whose argument is a secret: printed with the value replaced, because a `--dry-run`
+# transcript is a thing people paste, and a credential in it is a credential leaked. `TS_AUTHKEY`
+# is also how `tailscale up` itself prefers to be handed a key — off the command line, so it is
+# not in the process list either.
+run_secret() { # run_secret <VAR> <value> <command...>
+    local var="$1" value="$2"
+    shift 2
+    printf '  $ %s=<hidden> %s\n' "$var" "$*"
+    if [ "$DRY_RUN" = '1' ]; then
+        return 0
+    fi
+    env "$var=$value" "$@"
+}
+
 # A step whose shape is a loop or a probe rather than one command — waiting for health, reading
 # one field out of an answer. Printed so the dry run does not go silent exactly where the
 # interesting part of the script is.
@@ -498,17 +512,75 @@ install_public_front_door() { # install_public_front_door
     say "the port forwards and the firewall are §8."
 }
 
-# The private door is Tailscale's, and its login is an interactive browser flow that belongs to
-# the person: this install can do nothing about it and must not pretend otherwise. Said here
-# rather than left to the next-steps list, because a private deployment whose box is not logged
-# in has no door at all and nothing on the box can open one.
-report_private_front_door() { # report_private_front_door
-    say 'Private mode is reached through `tailscale serve`, and Tailscale'\''s own login is an'
-    say 'interactive browser flow that belongs to the person, not to this install:'
-    say '    sudo tailscale up            # prints the login URL; this box joins the tailnet as whoever approves it'
-    say '    tailscale status             # says who this box is, before anybody is invited'
+# This machine's tailnet name, from the same field the wizard derives the private address from:
+# `tailscale status --json`'s `Self.DNSName`, with the trailing dot dropped. Empty when Tailscale
+# cannot answer — not installed, not running, or not logged in — which is an ordinary state here
+# rather than a failure: the login below may not have happened yet.
+tailnet_name() {
+    "$NODE_BIN" -e 'const { execFileSync } = require("node:child_process"); try { const status = JSON.parse(execFileSync("tailscale", ["status", "--json"], { encoding: "utf8" })); process.stdout.write(String((status.Self || {}).DNSName || "").replace(/\.$/, "")); } catch { /* not installed, not running, or not logged in */ }' 2>/dev/null || true
+}
+
+# The private door: Tailscale itself, installed, enabled, and — when a key is given — logged in,
+# followed by the name the machine answers at. Only for a deployment whose private block the
+# wizard filled in, and only as root — this is `apt`/the vendor script, `systemctl` and `/etc`.
+#
+# What cannot be done here is the *login*, when there is no key: it is a browser flow that
+# approves this machine, and it belongs to the person. That is said plainly, with the one command
+# that finishes it, rather than pretended away. `--tailscale-authkey` is the way to hand the
+# login over: the key is read from `TS_AUTHKEY` (never argv), and afterwards the machine's own
+# tailnet name is read back and checked against the private block the wizard wrote, because a box
+# that joined under a different name serves a name nobody was told about.
+install_private_front_door() { # install_private_front_door <authkey-or-''>
+    local authkey="$1" name='' wrote=''
+    if command -v tailscale >/dev/null 2>&1; then
+        say 'tailscale is already installed'
+    else
+        say 'installing Tailscale from its official install script (which adds its own package repository)'
+        if ! run_pipe 'curl -fsSL https://tailscale.com/install.sh | sh'; then
+            die "Tailscale could not be installed, and private mode is reached through it. Install it by hand (https://tailscale.com/download/linux), then run this again: this step is re-applied, and nothing else about the deployment needs redoing."
+        fi
+    fi
+    # Enabled and started here rather than left to the login below: tailscaled is what the private
+    # shaper unit talks to on every start, and a box that reboots without it has no tailnet door.
+    if ! run systemctl enable --now tailscaled; then
+        die "tailscaled could not be enabled and started, and private mode is reached through it. The command above says why; a host whose Tailscale came without a systemd unit needs it started by whatever manages services there. Nothing else about the deployment needs redoing."
+    fi
+
+    if [ -n "$authkey" ]; then
+        # The key joins this machine without the browser flow a person would otherwise do. Read
+        # from the environment rather than passed as `--authkey` so it is in neither the process
+        # list nor the transcript above.
+        if ! run_secret TS_AUTHKEY "$authkey" tailscale up; then
+            die "tailscale up did not finish with the key given to --tailscale-authkey. Check that the key is valid and has not expired, then run this again — or run 'sudo tailscale up' by hand, which is the same approval in a browser. Nothing else about the deployment needs redoing."
+        fi
+        if [ "$DRY_RUN" = '1' ]; then
+            would_run 'tailscale status --json | Self.DNSName, for $PREFIX/.env to agree with'
+            return 0
+        fi
+        name="$(tailnet_name)"
+        if [ -z "$name" ]; then
+            warn 'tailscale up finished but this machine did not report a tailnet name;'
+            warn 'check `tailscale status`, and that the key belongs to this tailnet.'
+        else
+            say "this machine is on the tailnet as $name"
+            wrote="$(env_value NETWORK_MODE_PRIVATE_HOSTNAME || true)"
+            if [ -n "$wrote" ] && [ "$wrote" != "$name" ]; then
+                warn "the wizard's private hostname is $wrote, but this machine answers at $name"
+                warn "set NETWORK_MODE_PRIVATE_HOSTNAME and NETWORK_MODE_PRIVATE_ORIGIN to $name"
+                warn '(and https:// before it) in '"$PREFIX"'/.env, then restart crossbar.'
+            fi
+        fi
+    else
+        say 'One step here is still a person'\''s: the login, which approves this machine in a browser.'
+        say '    sudo tailscale up'
+        say 'This installer cannot supply that, and nothing else about the deployment needs it.'
+        say 'Pass --tailscale-authkey <key> to a later run (or to this one) to join the tailnet'
+        say 'without the browser; the key is handed to Tailscale through TS_AUTHKEY, so it is not'
+        say 'printed here. Once the machine is logged in, `tailscale status` prints the address the'
+        say 'wizard asked for as the private hostname.'
+    fi
     say 'The private shaper unit runs `tailscale serve --bg <port>` on every start, so the route'
-    say 'itself needs nothing here once the box is logged in (deploy/README.md §2.8, §8.1).'
+    say 'itself needs nothing more now that the machine is joined (deploy/README.md §2.8, §8.1).'
 }
 
 # The front door for the modes the wizard set up. Which those are is read from the file it just
@@ -516,7 +588,7 @@ report_private_front_door() { # report_private_front_door
 # one for every mode it is asked to set up) — so there is one answer to "what was chosen" and no
 # second copy to drift. A dry run has no file yet: the answers file names the mode when one was
 # given, and where it does not, the plan says what would follow either.
-install_front_door() { # install_front_door <answers-file-or-''>
+install_front_door() { # install_front_door <answers-file-or-''> <authkey-or-''>
     local public='' private='' mode=''
     if [ "$DRY_RUN" = '1' ]; then
         mode="$(answers_mode "$1")"
@@ -531,13 +603,20 @@ install_front_door() { # install_front_door <answers-file-or-''>
         if [ -n "$(env_value NETWORK_MODE_PRIVATE_HOSTNAME)" ]; then private=1; fi
     fi
     if [ -n "$public" ]; then install_public_front_door; fi
-    if [ -n "$private" ]; then report_private_front_door; fi
+    if [ -n "$private" ]; then
+        install_private_front_door "$2"
+    elif [ -n "$2" ]; then
+        # A key with no private mode to use it on is the silent-flag failure this project refuses
+        # everywhere else: it would look like a login that happened.
+        warn '--tailscale-authkey was given, but no private mode was set up, so nothing was logged in.'
+    fi
 }
 
 # The phase. `--answers` and `--browser` are the installer's passthroughs to the wizard; the
 # front door follows what the wizard wrote rather than what was asked for, so a mode that was
-# not set up installs nothing for it.
-onboard_deployment() { # onboard_deployment <answers-file-or-''> <browser-or-''>
+# not set up installs nothing for it. `--tailscale-authkey` reaches the private door, which is
+# the only place a login can be made.
+onboard_deployment() { # onboard_deployment <answers-file-or-''> <browser-or-''> <authkey-or-''>
     run_setup_wizard "$1" "$2"
-    install_front_door "$1"
+    install_front_door "$1" "$3"
 }

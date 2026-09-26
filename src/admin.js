@@ -53,31 +53,42 @@ const SETUP_USAGE = `node src/admin.js setup — ask what a fresh deployment nee
   which of the checks could be made here and which could not. --no-ask skips all of it, and
   Ctrl-C leaves the terminal as it found it.
 
-    --mode <private|public|both>      which configurations this deployment is reached in
+    --mode <private|public|both>      how people reach this deployment: Tailscale only, open
+                                      internet, or both
     --in-force <private|public>       which of them the file is put in
                                       (default: the one it already says, else private)
-    --private-hostname <name>         the tailnet name this deployment is reached at
-    --private-origin <url>            the origin invitations carry (default https://<hostname>)
-    --public-hostname <name>          the name Caddy serves
-    --public-origin <url>             the origin invitations carry (default https://<hostname>)
-    --public-bind-address <address>   the address Caddy binds — never a wildcard
+    --private-hostname <name>         the address your people's phones dial over the tailnet,
+                                      e.g. crossbar.tailnet-name.ts.net
+    --private-origin <url>            the web address invitations open (default https://<hostname>)
+    --public-hostname <name>          the public name people reach this deployment at,
+                                      e.g. calls.example.com
+    --public-origin <url>             the web address invitations open (default https://<hostname>)
+    --public-bind-address <address>   this server's own address that Caddy listens on — never a
+                                      wildcard
     --people <json|@file>             the directory: [{ "id": …, "name": …, "login": …, "admin": … }]
     --directory <file>                or a directory file to use as the people
-    --turn-host <host>                the relay, if this deployment runs one; blank for none
+    --turn-host <host>                a TURN server for calls that cannot connect directly;
+                                      blank for none
     --turn-secret <secret>            its shared secret (generated when a host is given)
-    --vapid-public-key <key>          Web Push, for browser clients
+    --vapid-public-key <key>          Web Push, for waking a browser tab that is closed
     --vapid-private-key <key>
     --vapid-subject <mailto:|url>
-    --apns-key-id <id>                APNs, for ringing a phone whose screen is off
+    --apns-key-id <id>                APNs, for ringing an iPhone whose screen is off
     --apns-team-id <id>
     --apns-key-path <file>
     --apns-topic <bundle id>
     --session-secret <secret>         signs sessions (generated when the file holds none)
     --new-secrets                     generate new secrets even though the file holds some
-    --password                        run \`node src/admin.js password\` afterwards
+    --password                        set the console password afterwards without asking
+    --invite                          invite somebody afterwards without asking
     --answers <file>                  all of the above as one JSON object
     --no-ask                          never prompt; refuse naming what is missing
     --skip-checks                     do not probe DNS or STUN afterwards
+
+  The console password and the first invitation — one command each, both prompted or printed in
+  the terminal this one is running in — are questions at the end of a terminal run, both defaulting
+  to yes. --password and --invite answer them from a flag or from --answers and run them the same
+  way; with no terminal neither runs at all, and the summary says what is left to run by hand.
 
   --browser serves the same questions as a form on a temporary page, and hands what is typed
   to the same engine this command runs — so the two cannot answer differently. It prints a URL

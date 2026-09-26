@@ -48,9 +48,14 @@ step-by-step for installing a second household.
 >   generated 64-hex session secret, `DATA_DIR`/`DIRECTORY_CONFIG_PATH` rendered for the scratch
 >   prefix, and `data/directory.json` with one administrator — a second run kept the session
 >   secret and rewrote the same directory file, and with no answers and no terminal the phase
->   refused, named `--answers`, and wrote no directory file. **What that does not cover is the
->   real thing**: no Linux host, so `npm ci`, the units, `/api/health` and the Caddy install and
->   `caddy validate` were never run — §2.10 is the list;
+>   refused, named `--answers`, and wrote no directory file. `--dry-run` also prints the private
+>   front door now that there is one to install (the Tailscale install, `systemctl enable --now
+>   tailscaled`, and `TS_AUTHKEY=<hidden> tailscale up` when a key is given), and the wizard's
+>   derived private address, its reworded questions and the two finishing questions were read as
+>   pty frames and covered by `test/setup-finish.test.js` — including that neither finishing
+>   command runs with no terminal. **What that does not cover is the real thing**: no Linux host,
+>   so `npm ci`, the units, `/api/health`, the Caddy install and `caddy validate`, and the
+>   Tailscale install and login were never run — §2.10 is the list;
 > - ~~the full server test suite on the merged tree~~ — 177 tests, 177 pass, 0 fail, 0 skipped,
 >   the operator path's five and the `doctor` checks' five included.
 >
@@ -126,6 +131,7 @@ sudo scripts/install.sh --dry-run                          # every command, noth
 sudo scripts/install.sh                                    # in place, as admin, at /home/admin/crossbar
 sudo scripts/install.sh --prefix /home/other --user other   # a second household elsewhere
 sudo scripts/install.sh --answers /root/answers.json        # unattended: the wizard is not asked anything (§2.2.1)
+sudo scripts/install.sh --tailscale-authkey tskey-auth-…    # a private deployment joins the tailnet without a browser (§2.8.1)
 sudo scripts/install.sh --no-setup                          # today's behaviour: write .env and the directory file by hand first
 ```
 
@@ -158,15 +164,21 @@ What it asks, and where each answer lands:
 | who is in the directory — `id, display name, login, admin` per person | the directory file (§2.4) |
 | the relay host and secret, APNs, Web Push — each optional, each skippable | the names in `.env` |
 | nothing about the session secret | it generates one, or keeps the one the file holds |
+| whether to set the console password, and whether to invite somebody — both default yes, both at the end of a terminal run | the password hash and one invitation (§2.7), each made by its own command in the same terminal |
 
 A value the deployment already holds is offered as the default, so a second run over a configured
 deployment changes only what it was told to; secrets are kept unless `--new-secrets` is passed.
 Nothing is written until the whole `.env` it composes is complete and the directory is valid, so a
-refusal costs nothing.
+refusal costs nothing. The private hostname's default is the name this machine already answers at on
+the tailnet (`tailscale status --json`'s `Self.DNSName`), so a machine that is on a tailnet is not
+asked to type it again; a machine with no Tailscale is asked the same question, worded so the
+answer is knowable without either, and the run says the private address is your people's phones'
+way in.
 
 ```bash
 sudo scripts/install.sh --answers /root/answers.json   # every answer from one JSON file
 sudo scripts/install.sh --browser                      # the wizard's browser front end instead of the terminal
+sudo scripts/install.sh --tailscale-authkey tskey-auth-…   # join the tailnet without a browser login (private, §2.8.1)
 ```
 
 `--answers` is passed straight to the wizard, whose `--answers <file>` takes the same keys it does
@@ -180,6 +192,12 @@ what to pass and writes nothing: a wizard that cannot answer its own questions m
 than write a `.env` it cannot complete, and the same refusal is what `--no-ask` is for at the
 wizard level.
 
+The console password and the first invitation are asked only where there is a terminal to ask, and
+run in that same terminal: with `--answers`, `--browser` or `--no-ask` there is nobody to type a
+password or read a one-time token, so neither runs and the summary leaves the two commands as the
+next steps. `--password` and `--invite` answer them without asking, but still run only with a
+terminal.
+
 Then the front door, for exactly the modes the wizard set up:
 
 - **public** — the installer installs Caddy (`apt install caddy`, §2.8), writes the
@@ -188,12 +206,18 @@ Then the front door, for exactly the modes the wizard set up:
   address. It does **not** start Caddy: public mode's shaper unit does, on every start while
   public mode is in force (§2.5). A step that fails stops the install with the reason — a public
   deployment with no door is the one thing worse than one that refused.
-- **private** — nothing is installed. `tailscale serve` is run by the private shaper unit, and the
-  login behind it is a browser flow a person does; the installer says so and moves on.
+- **private** — Tailscale itself is installed if it is not already (`tailscale.com/install.sh`,
+  which adds its own `apt` repository — the vendor script, so a host on any supported distribution
+  works), and `tailscaled` is enabled and started. The **login** is the one part that is a
+  person's: a browser approval. Pass `--tailscale-authkey <key>` and it is done for them — the key
+  goes to `tailscale up` through `TS_AUTHKEY` (never argv, so it is in no transcript and no process
+  list) and the machine's own tailnet name is read back and checked against the private block the
+  wizard wrote. With no key the installer says plainly that `sudo tailscale up` is the one step
+  left and why it cannot be done for it (§2.8.1).
 
 `--no-setup` turns the phase off and installs exactly what this script did before there was a
 wizard: `.env` is a template you edit by hand (§2.3), the directory file has to exist already
-(§2.4), and nothing touches Caddy.
+(§2.4), and nothing touches Caddy or Tailscale.
 
 ### 2.3 `.env`
 
@@ -368,6 +392,11 @@ node src/admin.js password                 # the console's password, prompted tw
 node src/admin.js enroll --user abdullah   # a one-time invitation, printed once
 ```
 
+A wizard run at a terminal asks both of these at the end — "set the console password now?" and
+"invite somebody now?", each defaulting to yes — and runs the command in that same terminal, so a
+finished install usually leaves neither to type by hand. The commands above are what it runs, and
+what to run when either was skipped, or when there was no terminal (an `--answers`/`--browser` run).
+
 The invitation prints the JSON and the token; the token exists nowhere else, so the output is
 the one chance to hand it over. The console is at `/admin` on the server's own origin, and
 its password is what makes it reachable from a browser that has enrolled no device key.
@@ -425,6 +454,36 @@ DNS (§8.1) and the port forwards and firewall (§8.2) are host facts the softwa
 Install the `Caddyfile` at `/etc/caddy/Caddyfile` and check it with `caddy validate
 --config /etc/caddy/Caddyfile` before restarting Caddy.
 
+### 2.8.1 Private mode: Tailscale
+
+**The installer does the mechanical half of this for a private deployment** (§2.2.1). If
+`tailscale` is not on the host it installs it with the vendor's own script
+(`curl -fsSL https://tailscale.com/install.sh | sh`, which adds Tailscale's `apt` repository), then
+`systemctl enable --now tailscaled` so the daemon survives a reboot. `tailscale serve` is run by
+the private shaper unit on every start (§2.5), so the route itself needs nothing installed by hand.
+
+The **login** is the one part a browser owns. With `--tailscale-authkey <key>` it is done for the
+person: the key is handed to `tailscale up` through `TS_AUTHKEY` — so it is in neither the process
+list nor the transcript, and `--dry-run` prints `TS_AUTHKEY=<hidden>` — and afterwards the
+installer reads the machine's tailnet name back (`tailscale status --json`'s `Self.DNSName`, with
+the trailing dot dropped) and warns if it differs from `NETWORK_MODE_PRIVATE_HOSTNAME` in `.env`.
+Without a key the installer says plainly that this is the one step left and names it:
+
+```bash
+sudo tailscale up            # prints the approval URL; this machine joins as whoever approves it
+```
+
+An auth key comes from the Tailscale admin console's *Settings → Keys* (`tskey-auth-…`); make it
+pre-authorized (so it needs no browser approval) and non-ephemeral for a machine that must stay in
+the tailnet. It is a credential — keep it out of shell history and out of the answers file if that
+file is shared.
+
+Once the machine is logged in, `tailscale status` prints the name the private block wants: the
+wizard's private hostname question offers that name as its default when it can read it, and asks
+the same question with the field explained when Tailscale is not there yet. A private hostname that
+disagrees with the name the machine actually answers at is a tailnet address nobody can dial, which
+is why the installer compares the two.
+
 ### 2.9 Installing the relay (optional)
 
 `coturn.conf` is a template and coturn cannot read it: coturn's configuration format has no
@@ -468,8 +527,11 @@ have run:
    `systemctl cat caddy` shows the `crossbar-env.conf` drop-in with `EnvironmentFile=` pointing at
    this `.env`. With the install finished, `systemctl status caddy` is active when public mode is
    in force — the shaper unit started it on the restart — and not running when private mode is,
-   which is the door the tailnet provides instead. `sudo tailscale up` is the one step here that
-   is a person's, and nothing on a workstation can do it.
+   which is the door the tailnet provides instead.
+   Tailscale, for a private deployment: `systemctl status tailscaled` is active, `tailscale
+   status` names the machine, and that name matches `NETWORK_MODE_PRIVATE_HOSTNAME`. With no
+   `--tailscale-authkey`, `sudo tailscale up` is the one step here that is a person's, and nothing
+   on a workstation can do it; with a key, the installer has already done it and checked the name.
 4. `systemctl status crossbar crossbar-backup.timer` — the service **active (running)**, the timer
    **active (waiting)** with a next elapse. A timer that is not waiting is a backup that never runs.
 5. `systemctl list-timers crossbar-backup.timer`, then `sudo systemctl start crossbar-backup.service`
@@ -1021,7 +1083,7 @@ rendering of §2.5 — and executes none:
 | Command | What it is |
 | --- | --- |
 | `scripts/release.sh [--out DIR]` | builds `crossbar-server-<version>.tar.gz` and the `.sha256` beside it, from a clean tree |
-| `scripts/install.sh [--prefix DIR] [--user NAME] [--source DIR] [--with-relay] [--answers FILE] [--browser] [--no-setup]` | §2.2–§2.6 as one command (§2.2), with the setup wizard (§2.2.1) |
+| `scripts/install.sh [--prefix DIR] [--user NAME] [--source DIR] [--with-relay] [--answers FILE] [--browser] [--tailscale-authkey KEY] [--no-setup]` | §2.2–§2.6 as one command (§2.2), with the setup wizard (§2.2.1) and the private front door's Tailscale install and login (§2.8.1) |
 | `scripts/upgrade.sh --from <tarball>` | stop, snapshot, unpack, install, start, verify, roll back (§5.3) |
 | `scripts/uninstall.sh [--prefix DIR] [--user NAME] [--purge-data]` | stop and remove the units; `--purge-data` for the data directory and `.env` (§5.6) |
 
@@ -1032,8 +1094,10 @@ deployment take their defaults from `CROSSBAR_HOME` (`/home/admin/crossbar`) and
 
 What they deliberately do not do: nothing here knows how a tarball reaches a host — no remote, no
 `git push`, no SSH — so the transport (a bundle, `rsync`, `scp`, a USB stick) is still the
-operator's; nothing configures Caddy, DNS, port forwards, the firewall or the relay (§2.8, §2.9,
-§8); nothing carries backups off the box (§4.7); and nothing commits anything. `release.sh`
+operator's; the installer's onboarding phase installs Caddy and Tailscale and validates the former
+(§2.2.1, §2.8.1), but DNS, the port forwards and the firewall, the Tailscale login itself when
+there is no key, and the relay's own configuration are still the operator's (§2.8, §2.9, §8);
+nothing carries backups off the box (§4.7); and nothing commits anything. `release.sh`
 refuses a tree with uncommitted changes, because an artefact that cannot be reproduced from a
 commit cannot be returned to; `--allow-dirty` builds one anyway, which is for a rehearsal.
 

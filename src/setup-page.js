@@ -229,17 +229,17 @@ th { font-weight: 600; font-size: 0.78rem; text-transform: uppercase; letter-spa
     <form id="setup">
         <fieldset>
             <legend>Modes</legend>
-            <label>Which modes is this deployment reached in?
-                <span>private, public, or both</span>
+            <label>How will people reach this deployment?
+                <span>over your Tailscale network only, over the open internet, or both</span>
                 <select data-answer="mode" required>
                     <option value="" disabled selected>choose one</option>
-                    <option value="private">private — the tailnet only</option>
-                    <option value="public">public — the open internet</option>
+                    <option value="private">Tailscale only (private)</option>
+                    <option value="public">Open internet (public)</option>
                     <option value="both">both</option>
                 </select>
             </label>
-            <label>Which of them is in force?
-                <span>blank keeps the one the file already says</span>
+            <label>Which one should this deployment use now?
+                <span>"in force" — the mode the server and its front door start in; blank keeps the one the file already says</span>
                 <select data-answer="inForce">
                     <option value="" selected>keep what the file says</option>
                     <option value="private">private</option>
@@ -250,26 +250,28 @@ th { font-weight: 600; font-size: 0.78rem; text-transform: uppercase; letter-spa
 
         <fieldset>
             <legend>Private (tailnet)</legend>
-            <label>The tailnet name this deployment is reached at
+            <label>The address your people's phones dial over the tailnet
+                <span>Tailscale gives this machine one; <code>tailscale status</code> prints it — e.g. crossbar.tailnet-name.ts.net</span>
                 <input data-answer="privateHostname" autocomplete="off" spellcheck="false">
             </label>
-            <label>The origin invitations carry
-                <span>blank derives it from the hostname</span>
+            <label>The web address an invitation opens
+                <span>the same tailnet address with https:// in front; blank derives it — e.g. https://crossbar.tailnet-name.ts.net</span>
                 <input data-answer="privateOrigin" autocomplete="off" spellcheck="false">
             </label>
         </fieldset>
 
         <fieldset>
             <legend>Public (open internet)</legend>
-            <label>The name Caddy serves for this deployment
+            <label>The public address people reach this deployment at
+                <span>a name you own whose DNS points at this server — e.g. calls.example.com</span>
                 <input data-answer="publicHostname" autocomplete="off" spellcheck="false">
             </label>
-            <label>The origin invitations carry
-                <span>blank derives it from the hostname</span>
+            <label>The web address an invitation opens
+                <span>the same public name with https:// in front; blank derives it — e.g. https://calls.example.com</span>
                 <input data-answer="publicOrigin" autocomplete="off" spellcheck="false">
             </label>
-            <label>The address Caddy binds
-                <span>the one address this box is reached at — never 0.0.0.0, which tailscaled already holds</span>
+            <label>The one local address Caddy listens on
+                <span>this server's own address — never 0.0.0.0, which tailscaled already holds — e.g. 203.0.113.10</span>
                 <input data-answer="publicBindAddress" autocomplete="off" spellcheck="false">
             </label>
         </fieldset>
@@ -277,7 +279,7 @@ th { font-weight: 600; font-size: 0.78rem; text-transform: uppercase; letter-spa
         <fieldset>
             <legend>The directory</legend>
             <label>One person per line: "id, display name, login, admin"
-                <span>the login and the administrator word may be left blank</span>
+                <span>the id is a short username and the display name is what the app shows; the login and the word "admin" may be left blank</span>
                 <textarea data-answer="people" rows="5" autocomplete="off" spellcheck="false"></textarea>
             </label>
             <label>Or a directory file to use as the people
@@ -288,36 +290,40 @@ th { font-weight: 600; font-size: 0.78rem; text-transform: uppercase; letter-spa
 
         <fieldset>
             <legend>Relay and push</legend>
-            <label>The TURN host media that cannot go direct is relayed through
-                <span>blank for no relay</span>
+            <label>A TURN server, for calls that cannot connect directly
+                <span>its hostname, e.g. relay.example.com; blank for no relay</span>
                 <input data-answer="turnHost" autocomplete="off" spellcheck="false">
             </label>
             <label>Its shared secret
                 <span>blank generates one</span>
                 <input data-answer="turnSecret" autocomplete="off" spellcheck="false">
             </label>
-            <label>APNs key id, for ringing a phone whose screen is off
-                <span>blank skips APNs</span>
+            <label>An Apple push key id, for ringing an iPhone whose screen is off
+                <span>from your Apple developer account, e.g. ABC123DE45; blank skips APNs</span>
                 <input data-answer="apnsKeyId" autocomplete="off" spellcheck="false">
             </label>
             <label>APNs team id
+                <span>e.g. TEAM123456</span>
                 <input data-answer="apnsTeamId" autocomplete="off" spellcheck="false">
             </label>
-            <label>The .p8 key file on this host
+            <label>The .p8 key file on this server
+                <span>e.g. /etc/crossbar/apns.p8</span>
                 <input data-answer="apnsKeyPath" autocomplete="off" spellcheck="false">
             </label>
-            <label>The app bundle id
+            <label>The app's bundle id
+                <span>e.g. com.example.crossbar</span>
                 <input data-answer="apnsTopic" autocomplete="off" spellcheck="false">
             </label>
-            <label>Web Push VAPID public key, for browser clients
+            <label>A VAPID public key, for waking a browser tab that is closed
                 <span>blank skips Web Push</span>
                 <input data-answer="vapidPublicKey" autocomplete="off" spellcheck="false">
             </label>
             <label>The VAPID private key
+                <span>a long base64 string</span>
                 <input data-answer="vapidPrivateKey" autocomplete="off" spellcheck="false">
             </label>
             <label>The VAPID contact subject
-                <span>a mailto: or a URL</span>
+                <span>a mailto: or a URL, e.g. mailto:you@example.com</span>
                 <input data-answer="vapidSubject" autocomplete="off" spellcheck="false">
             </label>
         </fieldset>
@@ -336,8 +342,14 @@ th { font-weight: 600; font-size: 0.78rem; text-transform: uppercase; letter-spa
             </div>
             <div class="inline">
                 <input type="checkbox" id="password" data-answer="password">
-                <label for="password">Set the console password afterwards
-                    <span>it is asked for at the terminal this command is running in, never here</span>
+                <label for="password">Set the console password at the terminal afterwards
+                    <span>it is asked for where this command is running, never here</span>
+                </label>
+            </div>
+            <div class="inline">
+                <input type="checkbox" id="invite" data-answer="invite">
+                <label for="invite">Invite somebody at the terminal afterwards
+                    <span>a one-time code is printed there for their phone, never here</span>
                 </label>
             </div>
         </fieldset>

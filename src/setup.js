@@ -54,6 +54,9 @@ const prompts = require('./prompt');
 /** The default `loadConfig` falls back to, so the probe reports on the server the same address. */
 const DEFAULT_STUN = 'stun:stun.l.google.com:19302';
 
+/** As long as a local command deserves: `tailscale status` answers from the daemon or not at all. */
+const TAILSCALE_TIMEOUT_MS = 4000;
+
 /** A refusal this wizard makes before it writes anything, as a sentence for the operator. */
 class SetupRefusal extends Error {}
 
@@ -62,6 +65,30 @@ const SECRET_BYTES = 32;
 
 function generateSecret() {
     return crypto.randomBytes(SECRET_BYTES).toString('hex');
+}
+
+/**
+ * The tailnet name this machine is already reachable at, or `''` — `tailscale status --json`'s
+ * `Self.DNSName` with the trailing dot dropped, which is the same value the front door will serve
+ * and the same one `diagnostics`' private check reasons about.
+ *
+ * Empty is an ordinary answer, not a failure: Tailscale may not be installed, may not be running,
+ * or the daemon may not be logged in yet — the wizard runs before the installer's front-door phase
+ * on a fresh host, so on a first install there is usually nothing to ask. The question's own
+ * wording says what the field is for in that case, which is why this returns a value rather than
+ * throwing. `command` is the injectable seam, as in `checkTailscale`: a test hands it a fixture
+ * and a real run leaves it as `tailscale` on `PATH`.
+ */
+function tailnetName(command = 'tailscale') {
+    const result = spawnSync(command, ['status', '--json'], { encoding: 'utf8', timeout: TAILSCALE_TIMEOUT_MS });
+    if (result.error || result.status !== 0 || !result.stdout) return '';
+    try {
+        const dnsName = JSON.parse(result.stdout)?.Self?.DNSName;
+        return dnsName ? String(dnsName).replace(/\.$/, '') : '';
+    } catch {
+        // A daemon that answered something other than JSON has not answered this question.
+        return '';
+    }
 }
 
 // ── The answers, from flags and from a file ─────────────────────────────────────
@@ -78,7 +105,7 @@ const ANSWER_KEYS = Object.freeze([
     'turnHost', 'turnSecret',
     'apnsKeyId', 'apnsTeamId', 'apnsKeyPath', 'apnsTopic',
     'vapidPublicKey', 'vapidPrivateKey', 'vapidSubject',
-    'sessionSecret', 'newSecrets', 'password',
+    'sessionSecret', 'newSecrets', 'password', 'invite',
 ]);
 
 /** `publicBindAddress` is set by `--public-bind-address`, so the two spellings cannot drift. */
@@ -263,13 +290,38 @@ function readState(dir) {
  */
 const ADDRESS_QUESTIONS = Object.freeze({
     private: Object.freeze([
-        { key: 'privateHostname', name: 'HOSTNAME', prompt: 'the tailnet name this deployment is reached at' },
-        { key: 'privateOrigin', name: 'ORIGIN', prompt: 'the origin invitations carry' },
+        {
+            key: 'privateHostname',
+            name: 'HOSTNAME',
+            prompt: 'the address your people\'s phones dial over the tailnet — Tailscale gives this machine one,'
+                + ' and `tailscale status` prints it (for example: crossbar.tailnet-name.ts.net)',
+        },
+        {
+            key: 'privateOrigin',
+            name: 'ORIGIN',
+            prompt: 'the web address an invitation opens — the same tailnet address with https:// in front'
+                + ' (for example: https://crossbar.tailnet-name.ts.net)',
+        },
     ]),
     public: Object.freeze([
-        { key: 'publicHostname', name: 'HOSTNAME', prompt: 'the name Caddy serves for this deployment' },
-        { key: 'publicOrigin', name: 'ORIGIN', prompt: 'the origin invitations carry' },
-        { key: 'publicBindAddress', name: 'BIND_ADDRESS', prompt: 'the address Caddy binds (never 0.0.0.0)' },
+        {
+            key: 'publicHostname',
+            name: 'HOSTNAME',
+            prompt: 'the public address people reach this deployment at — a name you own whose DNS points at'
+                + ' this server (for example: calls.example.com)',
+        },
+        {
+            key: 'publicOrigin',
+            name: 'ORIGIN',
+            prompt: 'the web address an invitation opens — the same public name with https:// in front'
+                + ' (for example: https://calls.example.com)',
+        },
+        {
+            key: 'publicBindAddress',
+            name: 'BIND_ADDRESS',
+            prompt: 'the one local address Caddy listens on — this server\'s own address, never 0.0.0.0'
+                + ' (for example: 203.0.113.10)',
+        },
     ]),
 });
 
@@ -301,12 +353,13 @@ function bindAddressProblem(mode, address) {
 }
 
 /** The one question that decides every other one, as a menu and as a line. */
-const MODE_QUESTION = 'Which modes is this deployment reached in — private, public, or both?';
+const MODE_QUESTION = 'How will your people reach this deployment — over your Tailscale network only,'
+    + ' over the open internet, or both?';
 
 /** The three answers `--mode` takes, as the menu they are chosen from, with what each one costs. */
 const MODE_OPTIONS = Object.freeze([
-    { value: 'private', label: 'Private (tailnet)', hint: 'reached over Tailscale, from anywhere on it' },
-    { value: 'public', label: 'Public (open internet)', hint: 'Caddy, a certificate, and a name that points here' },
+    { value: 'private', label: 'Tailscale only (private)', hint: 'reachable from anywhere on your tailnet, nowhere else' },
+    { value: 'public', label: 'Open internet (public)', hint: 'needs a domain name that points here, and an open port' },
     { value: 'both', label: 'Both', hint: 'private now, public once its name points here' },
 ]);
 
@@ -314,9 +367,9 @@ const MODE_OPTIONS = Object.freeze([
 const OPTIONAL_NOTE = `A deployment works without any of these, and the summary says what it went
 without:
 
-  Relay     a TURN host, for media that cannot go direct
-  APNs      a key from the developer account, for ringing a phone whose screen is off
-  Web Push  a VAPID key pair, for waking a browser that is closed
+  Relay     a TURN server, for calls that cannot connect directly
+  APNs      an Apple push key, for ringing an iPhone whose screen is off
+  Web Push  a VAPID key pair, for waking a browser tab that is closed
 
 Blank at any of them skips it.`;
 
@@ -422,20 +475,25 @@ async function askPeopleByFields(terminal, state) {
         const first = people.length === 0;
         const someone = {
             id: await terminal.text({
-                message: `${first ? 'The first person' : 'Another person'}: the id the console knows them by`,
+                message: `${first ? 'The first person' : 'Another person'}: the short id the console knows'
+                    + ' them by (for example: abdullah)`,
                 placeholder: 'abdullah',
                 validate: (value) => (value ? undefined : 'An id is how everybody else names them.'),
             }),
             name: await terminal.text({
-                message: 'their display name',
+                message: 'their display name — what the app shows the other person (for example: Abdullah)',
                 placeholder: 'Abdullah',
                 validate: (value) => (value ? undefined : 'A name is what the console shows.'),
             }),
             login: await terminal.text({
-                message: 'their tailscale login, if the tailnet names them — blank when it does not',
+                message: 'their tailscale login, if your tailnet names them — this is how they are recognised'
+                    + ' when they call; leave blank if it does not (for example: abdullah@dev)',
                 placeholder: 'abdullah@dev',
             }),
-            admin: await terminal.confirm({ message: 'an administrator?', initialValue: first }),
+            admin: await terminal.confirm({
+                message: 'an administrator? — admins can invite people and change settings',
+                initialValue: first,
+            }),
         };
         people.push(someone);
         if (!await terminal.confirm({ message: 'another person?', initialValue: false })) return people;
@@ -450,7 +508,8 @@ async function askPeopleByFields(terminal, state) {
 async function askPeopleByLines(ask, report, state) {
     report.note(`One person per line, as "id, display name, login, admin", and a blank line to`
         + ` ${state.directory ? `keep the ${peopleCount(state.directory.users.length)} already there` : 'say you are done'}.`
-        + ' The login and the administrator flag may be left blank.', 'The directory');
+        + ' The id and the display name are what the line needs; the login (how the tailnet names them)'
+        + ' and the word "admin" may be left blank.', 'The directory');
     const people = [];
     for (;;) {
         const named = await ask('Person', '');
@@ -467,7 +526,9 @@ async function askPeopleByLines(ask, report, state) {
  * Only a value that none of the three can produce is missing, which is what makes a second run
  * over a configured deployment a no-op and an unattended run of a file that does not exist a
  * refusal rather than a guess. A default is derived only where it changes nothing — the origin is
- * the hostname with `https://` in front, the mode in force is the mode the file already says.
+ * the hostname with `https://` in front, the mode in force is the mode the file already says, and
+ * the private address is the tailnet name this machine already has (`tailnet` below), which the
+ * deployment cannot invent for itself and does not have to be asked for.
  *
  * Where the questions go is two things, because they are not the same thing: `terminal` is the
  * prompter `src/prompt.js` builds, which draws a menu and a field and a confirmation, and `asker`
@@ -476,8 +537,12 @@ async function askPeopleByLines(ask, report, state) {
  * prompter would have drawn are then asked as lines — the same questions, and the same answers
  * written from them. `report` is wherever the wizard is allowed to say something, which is the
  * same prompter, or `src/prompt.js`'s frames written plainly into the log.
+ *
+ * `tailnet` is a function returning this machine's tailnet name or `''`, asked only when the
+ * private hostname has to be offered as a default and nothing already answers it. It is a
+ * function rather than a value so a public-only run never spawns Tailscale at all.
  */
-async function collectAnswers({ answers, state, asker, terminal, report, generate }) {
+async function collectAnswers({ answers, state, asker, terminal, report, generate, tailnet = null }) {
     const misses = [];
     const supplied = (key) => {
         const value = answers[key];
@@ -539,7 +604,14 @@ async function collectAnswers({ answers, state, asker, terminal, report, generat
     for (const mode of modes) {
         for (const question of ADDRESS_QUESTIONS[mode]) {
             const held = state.block[mode][question.name];
-            const derived = question.name === 'ORIGIN' && blocks[mode].HOSTNAME ? `https://${blocks[mode].HOSTNAME}` : '';
+            // Two defaults that change nothing, and cost nothing to offer: the origin is the
+            // address with `https://` in front, and a private address nothing else answers is the
+            // tailnet name this machine is already on. `tailnet` is asked only there, and only
+            // when it can help — Tailscale not being installed is an ordinary state, and the
+            // question's own wording says what the field is for when it has no answer.
+            const derived = question.name === 'ORIGIN'
+                ? (blocks[mode].HOSTNAME ? `https://${blocks[mode].HOSTNAME}` : '')
+                : (question.name === 'HOSTNAME' && mode === 'private' && !held && tailnet ? String(tailnet() || '') : '');
             const bindProblem = question.name === 'BIND_ADDRESS' ? (address) => bindAddressProblem(mode, address) : null;
             const asking = {
                 key: question.key,
@@ -603,31 +675,36 @@ async function collectAnswers({ answers, state, asker, terminal, report, generat
     if (asker || terminal) report.note(OPTIONAL_NOTE, 'Optional material');
     const turnHost = await line({
         key: 'turnHost',
-        message: 'Relay: the TURN host media which cannot go direct is relayed through — blank for no relay',
+        message: 'If a call cannot connect directly, the server relays it through a TURN server:'
+            + ' that server\'s hostname (for example: relay.example.com). Blank for no relay — calls'
+            + ' still work, but some networks will fail',
         held: state.turnHost,
     });
     const pushAnswered = ['apnsKeyId', 'apnsTeamId', 'apnsKeyPath', 'apnsTopic'].some((key) => supplied(key) !== null);
     const apnsKeyId = await line({
         key: 'apnsKeyId',
-        message: 'APNs, for ringing a phone whose screen is off: the key id from the developer account — blank to skip',
+        message: 'To ring an iPhone whose screen is off, an Apple push key is needed: its key id from'
+            + ' your Apple developer account (for example: ABC123DE45). Blank to skip — a locked'
+            + ' iPhone will not ring',
         held: state.apns.keyId,
     });
     const apns = { keyId: apnsKeyId, teamId: state.apns.teamId, keyPath: state.apns.keyPath, topic: state.apns.topic };
     if (apnsKeyId || pushAnswered) {
-        apns.teamId = await line({ key: 'apnsTeamId', message: 'APNs: the team id', held: state.apns.teamId });
-        apns.keyPath = await line({ key: 'apnsKeyPath', message: 'APNs: the .p8 key file on this host', held: state.apns.keyPath });
-        apns.topic = await line({ key: 'apnsTopic', message: 'APNs: the app bundle id', held: state.apns.topic });
+        apns.teamId = await line({ key: 'apnsTeamId', message: 'APNs: your Apple developer team id (for example: TEAM123456)', held: state.apns.teamId });
+        apns.keyPath = await line({ key: 'apnsKeyPath', message: 'APNs: the .p8 key file on this server (for example: /etc/crossbar/apns.p8)', held: state.apns.keyPath });
+        apns.topic = await line({ key: 'apnsTopic', message: 'APNs: the app\'s bundle id (for example: com.example.crossbar)', held: state.apns.topic });
     }
     const webPushAnswered = ['vapidPublicKey', 'vapidPrivateKey', 'vapidSubject'].some((key) => supplied(key) !== null);
     const vapidPublicKey = await line({
         key: 'vapidPublicKey',
-        message: 'Web Push for browser clients: the VAPID public key — blank to skip',
+        message: 'To wake a browser tab that is closed, Web Push is needed: its VAPID public key.'
+            + ' Blank to skip — a closed browser cannot be woken',
         held: state.vapid.publicKey,
     });
     const vapid = { publicKey: vapidPublicKey, privateKey: state.vapid.privateKey, subject: state.vapid.subject };
     if (vapidPublicKey || webPushAnswered) {
-        vapid.privateKey = await line({ key: 'vapidPrivateKey', message: 'Web Push: the VAPID private key', held: state.vapid.privateKey });
-        vapid.subject = await line({ key: 'vapidSubject', message: 'Web Push: the contact subject (mailto: or a URL)', held: state.vapid.subject });
+        vapid.privateKey = await line({ key: 'vapidPrivateKey', message: 'Web Push: the VAPID private key (a long base64 string)', held: state.vapid.privateKey });
+        vapid.subject = await line({ key: 'vapidSubject', message: 'Web Push: a contact for the push service, a mailto: or a URL (for example: mailto:you@example.com)', held: state.vapid.subject });
     }
 
     // 5. What can be generated. A secret the file already holds is kept, because replacing the
@@ -669,7 +746,6 @@ async function collectAnswers({ answers, state, asker, terminal, report, generat
         turnHost,
         vapid,
         apns,
-        password: Boolean(answers.password),
         secrets: {
             session,
             turn,
@@ -695,13 +771,13 @@ function noTerminalMessage(misses, asked) {
 /** What one missing answer is for, in the refusal above. */
 function answerHelp(key) {
     return {
-        mode: 'private, public, or both',
-        privateHostname: 'the tailnet name this deployment is reached at',
-        privateOrigin: 'the origin invitations carry',
-        publicHostname: 'the name Caddy serves',
-        publicOrigin: 'the origin invitations carry',
-        publicBindAddress: 'the address Caddy binds, never a wildcard',
-        people: 'the directory: a JSON array of { id, name, login, admin }, or @file',
+        mode: 'how people reach this deployment: private (Tailscale), public (open internet), or both',
+        privateHostname: 'the address your people\'s phones dial over the tailnet, e.g. crossbar.tailnet-name.ts.net',
+        privateOrigin: 'the web address invitations open, e.g. https://crossbar.tailnet-name.ts.net',
+        publicHostname: 'the public name people reach this deployment at, e.g. calls.example.com',
+        publicOrigin: 'the web address invitations open, e.g. https://calls.example.com',
+        publicBindAddress: 'this server\'s own address that Caddy listens on, never 0.0.0.0, e.g. 203.0.113.10',
+        people: 'the directory: a JSON array of { id, name, login, admin }, or @file naming one',
     }[key] || 'an answer this deployment needs';
 }
 
@@ -1009,27 +1085,30 @@ const checkLines = (checks, width) => checks.flatMap((check) => prompts.frames
     .wrap(check.detail, Math.max(width - 22, 24))
     .map((part, index) => `${index ? ' '.repeat(22) : `${CHECK_MARK[check.verdict]} ${check.name.padEnd(20)}`}${part}`));
 
-/** What is left for a person, which is exactly what a prompt and a one-time token need. */
-function nextSteps(state, resolved) {
+/**
+ * What is left for a person after the run: the restart, and whichever of the two interactive
+ * steps did not happen — it was answered no, or there was no terminal to ask. A step that ran is
+ * not repeated here; `install.sh` still prints its own list after this.
+ */
+function nextSteps(state, resolved, done) {
     const admins = (resolved.directory?.users || state.directory?.users || [])
         .filter((user) => user.admin && user.enabled !== false);
-    return [
-        ['Then', 'systemctl restart crossbar'],
-        ['', 'node src/admin.js password'],
-        ['', `node src/admin.js enroll --user ${admins[0] ? admins[0].id : '<id>'}`],
-    ];
+    const steps = [['Then', 'systemctl restart crossbar']];
+    if (!done.password) steps.push(['', 'node src/admin.js password   # the console\'s password, at /admin']);
+    if (!done.invite) steps.push(['', `node src/admin.js enroll --user ${admins[0] ? admins[0].id : '<id>'}   # one invitation, printed once`]);
+    return steps;
 }
 
 /**
- * The box the wizard ends with: what was chosen, what was written, and which of the checks could
- * be made — plus the three commands this process deliberately does not run. It is one note because
- * it is one thing to read, and it is the last thing on the screen.
+ * The box the wizard ends with: what was chosen, what was written, which of the checks could be
+ * made, and what is left for a person. It is one note because it is one thing to read, and it is
+ * the last thing on the screen.
  *
  * The checks are reports and not gates, so a run that could not make one says which, in the same
  * place as the ones it could: `--skip-checks` and a box with no `node_modules` on it are both
  * ordinary, and neither is a failure.
  */
-function reportSummary(report, state, resolved, { verified, checks, checked, wroteDirectory }) {
+function reportSummary(report, state, resolved, { verified, checks, checked, wroteDirectory, done }) {
     const made = checked ? checkLines(checks, report.width) : ['not made: --skip-checks was passed'];
     if (checked) {
         made.push('', 'These are reports, not gates. The front door, its certificate and the DNS record'
@@ -1042,9 +1121,76 @@ function reportSummary(report, state, resolved, { verified, checks, checked, wro
         '',
         made.join('\n'),
         '',
-        columns(nextSteps(state, resolved), report.width),
+        columns(nextSteps(state, resolved, done), report.width),
     ].join('\n'), 'Crossbar setup');
     report.outro('Set up. `systemctl restart crossbar` when you are ready.');
+}
+
+// ── The last two questions, which run a command rather than write a file ────────
+//
+// The console's password and the first invitation are the two things a first install still needs
+// a person for: one is a secret typed twice, and the other is a one-time code carried to a phone.
+// Both used to be printed as next steps, which left the two states that look finished but are not
+// — a console nobody can open, and no phone able to join. So they are asked here through the same
+// prompter as every other question, and the command runs in this terminal so its own prompt and
+// the token land where the person is looking.
+//
+// Neither runs unattended. With no terminal there is nobody to answer the question and nobody to
+// read the code, so the step is left in the summary rather than guessed at. `--password` and
+// `--invite` answer them from `--answers` or from a flag, and an explicit false skips one without
+// asking.
+
+/**
+ * Ask, and run, the two finishing steps. Returns which of them ran to completion, so the summary
+ * says what is left rather than repeating what was done.
+ */
+async function finishByHand({ answers, terminal, report, state, resolved, spawn }) {
+    /** `true`/`false` when an answer or a flag decided it, `null` when nobody has yet. */
+    const answered = (key) => {
+        const value = answers[key];
+        return value === undefined || value === '' ? null : Boolean(value);
+    };
+    /** Yes or no, defaulted to yes — and `false` with no terminal, which never runs the command. */
+    const askNow = async (message) => (terminal
+        ? Boolean(await terminal.confirm({ message, initialValue: true }))
+        : false);
+    const runInTerminal = (args, title, note) => {
+        report.note(note, title);
+        const status = spawn(process.execPath, [path.join(__dirname, 'admin.js'), ...args], { cwd: state.dir, stdio: 'inherit' });
+        return status === 0;
+    };
+
+    let password = false;
+    if (answered('password') ?? (await askNow('Set the console password now? It guards the web console at /admin.'))) {
+        if (terminal && spawn) {
+            password = runInTerminal(['password'], 'The console password',
+                'It is asked for and hashed by the command that owns the prompt, and never passes'
+                + ' through this one.');
+            if (!password) report.note('Run `node src/admin.js password` when you are ready.', 'The password was not set');
+        } else {
+            report.note('Setting it asks a person for something, and there is no terminal here.'
+                + ' Run `node src/admin.js password`.', 'The console password was not set');
+        }
+    }
+
+    let invite = false;
+    if (answered('invite') ?? (await askNow('Invite somebody now? It prints a one-time code for their phone.'))) {
+        const admin = (resolved.directory?.users || state.directory?.users || [])
+            .find((user) => user.admin && user.enabled !== false) || null;
+        if (!admin) {
+            report.note('There is no administrator in the directory to invite, so nobody was.'
+                + ' Run `node src/admin.js enroll --user <id>`.', 'Nobody was invited');
+        } else if (terminal && spawn) {
+            invite = runInTerminal(['enroll', '--user', admin.id], 'The first invitation',
+                `Give this to ${admin.id}'s phone: the code is printed once and stored nowhere.`);
+            if (!invite) report.note(`Run \`node src/admin.js enroll --user ${admin.id}\` when you are ready.`, 'Nobody was invited');
+        } else {
+            report.note('An invitation is a code a person carries to a phone, and there is no terminal'
+                + ` here. Run \`node src/admin.js enroll --user ${admin.id}\`.`, 'Nobody was invited');
+        }
+    }
+
+    return { password, invite };
 }
 
 // ── The command ─────────────────────────────────────────────────────────────────
@@ -1061,7 +1207,8 @@ const defaultSpawn = (command, args, options) => spawnSync(command, args, option
  * null means no terminal, and the answers then have to come from the flags or from `--answers`.
  * `check` false skips the probes at the end, which is what a caller with no network — or a test —
  * wants; the probes report rather than decide, so nothing they find changes the outcome or the
- * exit code.
+ * exit code. `tailscale` is the command the private address's default is derived from, `''` to
+ * skip the derivation; a test hands it a fixture, as `checkTailscale` takes one.
  */
 async function runSetup({
     dir = process.cwd(),
@@ -1072,13 +1219,19 @@ async function runSetup({
     generate = generateSecret,
     spawn = defaultSpawn,
     stunUrl = null,
+    tailscale = 'tailscale',
     locals = hostAddresses(),
 } = {}) {
     const state = readState(dir);
     const { asker, terminal } = askLayer(ask);
     const report = makeReport(terminal, log);
     report.intro(`Crossbar setup${state.hasEnv ? ' — this deployment already has a .env' : ''}`);
-    const resolved = await collectAnswers({ answers, state, asker, terminal, report, generate });
+    // Asked lazily, and only the private address question asks: a public-only run never spawns
+    // Tailscale, and neither does one whose private hostname the file already holds.
+    const resolved = await collectAnswers({
+        answers, state, asker, terminal, report, generate,
+        tailnet: tailscale ? () => tailnetName(tailscale) : null,
+    });
     const env = composeEnv(state, resolved);
 
     const short = shortfall(resolved, env);
@@ -1116,23 +1269,16 @@ async function runSetup({
         if (probing) probing.stop('the checks are in the summary below');
     }
 
-    if (resolved.password) {
-        if (spawn && ask) {
-            report.note('It is asked for and hashed by the command that owns the prompt, and never'
-                + ' passes through this one.', 'The console password');
-            const status = spawn(process.execPath, [path.join(__dirname, 'admin.js'), 'password'], { cwd: state.dir, stdio: 'inherit' });
-            if (status !== 0) report.note('Run `node src/admin.js password` when you are ready.', 'The password was not set');
-        } else {
-            report.note('Setting it asks a person for something, and there is no terminal here.'
-                + ' Run `node src/admin.js password`.', 'The console password was not set');
-        }
-    }
+    // The two steps only a person can do, asked and run rather than left as next steps. With no
+    // terminal the questions are not asked and the commands are not run; the summary says so.
+    const done = await finishByHand({ answers, terminal, report, state, resolved, spawn });
 
     reportSummary(report, state, resolved, {
         verified,
         checks,
         checked: check,
         wroteDirectory: Boolean(resolved.directory),
+        done,
     });
 
     return {
@@ -1143,6 +1289,7 @@ async function runSetup({
         secrets: { sessionFrom: resolved.secrets.sessionFrom, turnFrom: resolved.secrets.turnFrom },
         verify: verified,
         checks,
+        done,
     };
 }
 
@@ -1156,6 +1303,7 @@ module.exports = {
     hostnameVerdict,
     hostAddresses,
     generateSecret,
+    tailnetName,
     parsePeople,
     parsePersonLine,
 };
