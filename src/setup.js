@@ -91,6 +91,99 @@ function tailnetName(command = 'tailscale') {
     }
 }
 
+/**
+ * The name the login gives this machine in the tailnet — the first label of the address an
+ * invitation carries, which is why `install.sh` defaults it to the deployment's own name rather
+ * than letting the host keep the one its provider assigned it. The installer's choice arrives in
+ * `TAILSCALE_HOSTNAME` (`--tailscale-hostname` overrides it, and it is validated there); a run of
+ * `setup` nobody wrapped derives the same default from the deployment's own directory name,
+ * reduced to a DNS label for the reason `deployment_tailscale_hostname` reduces it: a directory
+ * name is not a hostname, and `My_Box.v2` is a name Tailscale cannot answer at.
+ */
+function tailnetHostname(dir) {
+    const spelled = String(process.env.TAILSCALE_HOSTNAME || '').trim();
+    if (spelled) return spelled;
+    const label = path.basename(path.resolve(dir)).toLowerCase()
+        .replace(/[^a-z0-9]+/g, '-')
+        .replace(/^-+/, '')
+        .slice(0, 63)
+        .replace(/-+$/, '');
+    return label || 'crossbar';
+}
+
+/**
+ * What is left when this machine could not be joined from here: the one command, what it does, and
+ * that the installer finishes the job by itself on the next run. Short rather than a reference to
+ * deploy/README.md §2.8.1 — the person reading it is mid-install, and the address this run is about
+ * to write is the one the command makes true.
+ */
+const tailnetJoinInstructions = (hostname, lead) => [
+    lead,
+    '',
+    `    tailscale up --hostname ${hostname}`,
+    'It prints a link; approving this machine there gives it a tailnet name.',
+    'Then re-run this install and the private address is set from that name',
+    'rather than typed.',
+].join('\n');
+
+/**
+ * Join this machine to the tailnet, here, before the address that depends on it is asked for.
+ *
+ * This is the difference between asking a person for the private address and knowing it. That
+ * address is the name Tailscale gives this machine; the machine can be joined from the same
+ * process that is about to ask the question, because that process runs as the deployment's account
+ * and `install.sh` has already named that account the daemon's operator (and started the daemon);
+ * and `tailscale up` is the whole of the joining — it prints a link and waits for the approval
+ * that gives the machine its name. So it is run here, in the foreground, where the link and the
+ * person both are, and the name is read back afterwards to offer as the answer.
+ *
+ * It runs when there is a terminal to show the link in, and — since a key needs no approval —
+ * whenever a key was carried, which is what `--tailscale-authkey` buys an unattended install. With
+ * neither it is not attempted: there would be nobody to approve the machine and no name to read
+ * back, so the address is asked for and the instructions to join go with the question.
+ *
+ * Nothing here fails the run. A machine that cannot be joined is an ordinary state — a fresh host,
+ * a declined link, a tailnet that is not up — and the wizard is the wrong place to stop over it:
+ * `install.sh`'s front door makes the same attempt again at the end of the install, with the
+ * install's own instructions. What this returns is the name if there is one now, and `''` if not,
+ * which is what the private address is derived from.
+ */
+function joinTailnet({ command, dir, report, terminal, authkey, spawn }) {
+    const before = String(tailnetName(command) || '');
+    if (before) {
+        report.note(`This machine is already on your tailnet as ${before}. The private address below`
+            + ' is that name, so Enter keeps it.', 'Tailscale');
+        return before;
+    }
+    const hostname = tailnetHostname(dir);
+    if (!spawn || (!terminal && !authkey)) {
+        report.note(tailnetJoinInstructions(hostname,
+            'This machine is not on your tailnet yet, and there is nowhere here to show the link'
+            + ' its login prints: this machine has to be joined from a terminal, or with a key.'
+            + ' The private address below has to be typed from what you expect it to be.'),
+        'Tailscale');
+        return '';
+    }
+    // In the foreground, on this terminal, so Tailscale's own link is what the person reads — and
+    // with the key in the environment, which is where `tailscale up` reads it from, so it appears
+    // in neither the process list nor the transcript.
+    const options = authkey
+        ? { stdio: 'inherit', env: { ...process.env, TS_AUTHKEY: authkey } }
+        : { stdio: 'inherit' };
+    const status = spawn(command, ['up', '--hostname', hostname], options);
+    const after = String(tailnetName(command) || '');
+    if (status === 0 && after) {
+        report.note(`This machine joined your tailnet as ${after}. The private address below is that`
+            + ' name, so Enter keeps it.', 'Tailscale');
+        return after;
+    }
+    report.note(tailnetJoinInstructions(hostname,
+        'The login was run here and did not finish — declined, or it timed out — so this machine'
+        + ' still has no tailnet name and the private address below has to be typed from what you'
+        + ' expect it to be.'), 'Tailscale');
+    return after;
+}
+
 // ── The answers, from flags and from a file ─────────────────────────────────────
 //
 // One vocabulary for both, so the two cannot drift apart: a key, the flag that sets it, and the
@@ -296,6 +389,14 @@ const ADDRESS_QUESTIONS = Object.freeze({
             prompt: 'the address your people\'s phones dial over the tailnet — Tailscale gives this machine one,'
                 + ' and the installer sets it from the machine\'s own tailnet name once you approve the'
                 + ' machine on the link Tailscale shows (for example: crossbar.tailnet-name.ts.net)',
+            // Asked only when Tailscale answered with this machine's own name, which is the case the
+            // join above exists for: then there is nothing to guess and the field already holds the
+            // address, so the question says what the value is rather than what it is for. That is
+            // the whole of "shown as a derived value to confirm" — the answer is offered, and Enter
+            // keeping it is the confirmation.
+            settled: 'the address your people\'s phones dial over the tailnet — Tailscale gives this machine one,'
+                + ' and this machine is on your tailnet already: the field holds the name it answers at,'
+                + ' so press Enter to keep it (for example: crossbar.tailnet-name.ts.net)',
         },
         {
             key: 'privateOrigin',
@@ -539,11 +640,13 @@ async function askPeopleByLines(ask, report, state) {
  * written from them. `report` is wherever the wizard is allowed to say something, which is the
  * same prompter, or `src/prompt.js`'s frames written plainly into the log.
  *
- * `tailnet` is a function returning this machine's tailnet name or `''`, asked only when the
- * private hostname has to be offered as a default and nothing already answers it. It is a
- * function rather than a value so a public-only run never spawns Tailscale at all.
+ * `tailscale` is the command the tailnet is read and joined through, `''` to skip both — the same
+ * injectable seam `runSetup` takes, so a test needs no Tailscale. `authkey` joins the machine
+ * without anybody approving it, and `spawn` is what runs the login. The join is attempted only for
+ * a mode set that includes private, and only where it can be answered, so a public-only run never
+ * spawns Tailscale at all and neither does one that cannot be joined from here.
  */
-async function collectAnswers({ answers, state, asker, terminal, report, generate, tailnet = null }) {
+async function collectAnswers({ answers, state, asker, terminal, report, generate, tailscale = '', authkey = '', spawn = null }) {
     const misses = [];
     const supplied = (key) => {
         const value = answers[key];
@@ -600,23 +703,40 @@ async function collectAnswers({ answers, state, asker, terminal, report, generat
     if (!modeAnswer) throw new SetupRefusal(noTerminalMessage(['mode'], Boolean(asker || terminal)));
     const modes = parseModes(modeAnswer);
 
-    // 2. The addresses each chosen mode is reached at.
+    // 2. The tailnet, before the address that names it. The private address is this machine's own
+    //    tailnet name, and a machine with no name has to be asked blind — so the joining happens
+    //    here, where the mode is known and the person is looking, and the name it produces is what
+    //    the question below offers. Nothing when the mode set cannot include a private address:
+    //    Tailscale is not spawned for a public-only deployment, and this is the only place in the
+    //    wizard that runs it as anything but a read.
+    let joinedName = '';
+    if (modes.includes('private') && tailscale) {
+        joinedName = joinTailnet({ command: tailscale, dir: state.dir, report, terminal, authkey, spawn });
+    }
+
+    // 3. The addresses each chosen mode is reached at.
     const blocks = Object.fromEntries(MODES.map((mode) => [mode, { HOSTNAME: '', ORIGIN: '', BIND_ADDRESS: '' }]));
     for (const mode of modes) {
         for (const question of ADDRESS_QUESTIONS[mode]) {
-            const held = state.block[mode][question.name];
-            // Two defaults that change nothing, and cost nothing to offer: the origin is the
-            // address with `https://` in front, and a private address nothing else answers is the
-            // tailnet name this machine is already on. `tailnet` is asked only there, and only
-            // when it can help — Tailscale not being installed is an ordinary state, and the
-            // question's own wording says what the field is for when it has no answer.
-            const derived = question.name === 'ORIGIN'
-                ? (blocks[mode].HOSTNAME ? `https://${blocks[mode].HOSTNAME}` : '')
-                : (question.name === 'HOSTNAME' && mode === 'private' && !held && tailnet ? String(tailnet() || '') : '');
+            const stored = state.block[mode][question.name];
+            // The name the tailnet gave the machine above is the private address — it is what an
+            // invitation carries, and the login is what made it true — so it is what the field
+            // holds, in place of a value `.env` was given before the machine had a name at all.
+            // The origin follows it, because the two are one address in two spellings. Nothing is
+            // answered *for* the person: the value is offered, and Enter keeping it is the
+            // confirmation. `''` when Tailscale answered nothing, which is what leaves today's
+            // question — and today's reading of `.env` — exactly as they were.
+            const known = mode === 'private' ? joinedName : '';
+            const held = known ? '' : stored;
+            const derived = known
+                ? (question.name === 'ORIGIN' ? `https://${known}` : known)
+                : (question.name === 'ORIGIN'
+                    ? (blocks[mode].HOSTNAME ? `https://${blocks[mode].HOSTNAME}` : '')
+                    : '');
             const bindProblem = question.name === 'BIND_ADDRESS' ? (address) => bindAddressProblem(mode, address) : null;
             const asking = {
                 key: question.key,
-                message: `${modeLabel(mode)}: ${question.prompt}`,
+                message: `${modeLabel(mode)}: ${known && question.settled ? question.settled : question.prompt}`,
                 held: held || derived,
                 validate: bindProblem,
             };
@@ -629,7 +749,7 @@ async function collectAnswers({ answers, state, asker, terminal, report, generat
         }
     }
 
-    // 3. The directory of people, their logins, and who administers. A directory file already in
+    // 4. The directory of people, their logins, and who administers. A directory file already in
     //    place is kept unless the answers or the terminal name people, which is what makes
     //    re-running over a live deployment a no-op.
     let directory = null;
@@ -670,7 +790,7 @@ async function collectAnswers({ answers, state, asker, terminal, report, generat
         misses.push('people');
     }
 
-    // 4. The optional material. Every one of these is skippable, and a deployment that skips one
+    // 5. The optional material. Every one of these is skippable, and a deployment that skips one
     //    says so in the report rather than failing later. The note is said once, and only when
     //    somebody is there to answer it: a run of nothing but flags is answering, not being asked.
     if (asker || terminal) report.note(OPTIONAL_NOTE, 'Optional material');
@@ -708,7 +828,7 @@ async function collectAnswers({ answers, state, asker, terminal, report, generat
         vapid.subject = await line({ key: 'vapidSubject', message: 'Web Push: a contact for the push service, a mailto: or a URL (for example: mailto:you@example.com)', held: state.vapid.subject });
     }
 
-    // 5. What can be generated. A secret the file already holds is kept, because replacing the
+    // 6. What can be generated. A secret the file already holds is kept, because replacing the
     //    session secret signs every device out; `--new-secrets` is how somebody asks for that.
     const fresh = Boolean(answers.newSecrets);
     const sessionGiven = supplied('sessionSecret');
@@ -1208,8 +1328,11 @@ const defaultSpawn = (command, args, options) => spawnSync(command, args, option
  * null means no terminal, and the answers then have to come from the flags or from `--answers`.
  * `check` false skips the probes at the end, which is what a caller with no network — or a test —
  * wants; the probes report rather than decide, so nothing they find changes the outcome or the
- * exit code. `tailscale` is the command the private address's default is derived from, `''` to
- * skip the derivation; a test hands it a fixture, as `checkTailscale` takes one.
+ * exit code. `tailscale` is the command this machine is joined through and the private address's
+ * default is read from, `''` to skip both; a test hands it a fixture, as `checkTailscale` takes
+ * one. `authkey` is a Tailscale auth key to join with when the installer carried one — it arrives
+ * in `TS_AUTHKEY` from the installer, which is the variable `tailscale up` reads itself — and
+ * `spawn` is what runs the login, in this terminal, like the two finishing steps below.
  */
 async function runSetup({
     dir = process.cwd(),
@@ -1221,17 +1344,17 @@ async function runSetup({
     spawn = defaultSpawn,
     stunUrl = null,
     tailscale = 'tailscale',
+    authkey = process.env.TS_AUTHKEY || '',
     locals = hostAddresses(),
 } = {}) {
     const state = readState(dir);
     const { asker, terminal } = askLayer(ask);
     const report = makeReport(terminal, log);
     report.intro(`Crossbar setup${state.hasEnv ? ' — this deployment already has a .env' : ''}`);
-    // Asked lazily, and only the private address question asks: a public-only run never spawns
-    // Tailscale, and neither does one whose private hostname the file already holds.
+    // The join happens inside, and only for a mode set that includes private: a public-only run
+    // never spawns Tailscale.
     const resolved = await collectAnswers({
-        answers, state, asker, terminal, report, generate,
-        tailnet: tailscale ? () => tailnetName(tailscale) : null,
+        answers, state, asker, terminal, report, generate, tailscale, authkey, spawn,
     });
     const env = composeEnv(state, resolved);
 

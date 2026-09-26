@@ -1,23 +1,27 @@
 'use strict';
 
-// The installer's private front door: where the login runs, and what lands in `.env`.
+// The installer's Tailscale work: what is done before the wizard asks anything, what the wizard
+// itself does with it, and what is left for the front door afterwards.
 //
-// The *mode* question belongs to the wizard, so the installer cannot know whether Tailscale is
-// wanted until the wizard has run — which puts the private door after it. The private address is
-// the one answer already on the machine (it is the name Tailscale gives this host), but there is no
-// name until a login has happened, so on a fresh box the wizard's answer is a guess. The front door
-// is what closes that gap: it installs Tailscale, **runs** the login itself (`tailscale up`, whose
-// approval link appears in this terminal when there is one, and with `TS_AUTHKEY` when a key was
-// given), reads `Self.DNSName` back, and corrects the address the wizard wrote through the wizard
-// itself.
+// The join is the **wizard's**, because the wizard is the process that runs as the deployment's
+// account and the private address is the name that account's login gives the machine. So the
+// installer's part is the preparation — Tailscale installed, `tailscaled` started, and the account
+// named the daemon's **operator**, without which the account cannot join anything — done before the
+// mode question, since nothing can install as root from inside the wizard. The mode question then
+// decides: a mode set that includes private makes the wizard run `tailscale up --hostname <the
+// deployment's name>` (whose approval link appears in this terminal when there is one, and with
+// `TS_AUTHKEY` when a key was given), read `Self.DNSName` back, and offer that name as the private
+// address.
 //
-// The login also *gives* the name the address is built from: `--hostname`, which the installer
-// defaults to the deployment's own name (the basename of `--prefix`) and `--tailscale-hostname`
-// overrides. A login that named nothing would join under whatever the host is called where it is
-// hosted — `srv2011992` on a VPS — and that provider's name is what an invitation would carry.
+// What is left for the front door is the safety net: the same login attempted once more for a run
+// the wizard could not join from, and the machine's own name read back to correct `.env` through
+// the wizard when the two disagree. `--hostname` — the deployment's own name, the basename of
+// `--prefix`, unless `--tailscale-hostname` says otherwise — is what keeps a login from joining
+// under whatever the host is called where it is hosted (`srv2011992` on a VPS), since that
+// provider's name is what an invitation would otherwise carry.
 //
-// A login the installer cannot finish must never stop the install: with no terminal it is not
-// attempted at all, and the person is handed the exact command with what it will do.
+// A run that cannot join must never stop the install: with no terminal it is not attempted at all,
+// and the person is handed the exact command with what it will do.
 //
 // Everything here is driven through the `TAILSCALE_BIN` seam `scripts/lib/deploy.sh` takes instead
 // of reaching for `tailscale` itself — so this needs no Tailscale and no systemd, which is what lets
@@ -145,39 +149,57 @@ function frontDoor(t, { tailnetName = '', upOk = false, authkey = 'tskey-auth-te
     return { ...run, text: `${run.stdout}${run.stderr}`, files };
 }
 
-test('the front door follows the wizard: Tailscale is installed and enabled after the questions', (t) => {
+test('Tailscale is prepared before the questions: installed, started, and the account made its operator', (t) => {
     const text = dryRun(scratch(t), '');
     const wizard = lineOf(text, 'src/admin.js setup --answers');
     const enable = lineOf(text, 'systemctl enable --now tailscaled');
+    const operator = lineOf(text, 'set --operator=admin');
     assert.ok(wizard >= 0, `no wizard step in:\n${text}`);
     assert.ok(enable >= 0, `no tailscaled step in:\n${text}`);
-    assert.ok(wizard < enable, `the private door runs before the mode is known (wizard ${wizard}, tailscaled ${enable})`);
+    assert.ok(operator >= 0, `the account is not named the daemon's operator:\n${text}`);
+    // The wizard joins the tailnet itself, and it can only do that as the operator, so all three
+    // are done before the question that decides whether any of it is used.
+    assert.ok(enable < wizard, `tailscaled is started after the mode is known (${enable}, ${wizard})`);
+    assert.ok(operator < wizard, `the operator is named after the mode is known (${operator}, ${wizard})`);
+
+    // And the installation itself, when Tailscale is not on the host: the same step, from its own
+    // script, still before the wizard.
+    const missing = dryRun({ ...scratch(t), tailscale: '/nonexistent/tailscale' }, '');
+    const install = lineOf(missing, 'curl -fsSL https://tailscale.com/install.sh | sh');
+    assert.ok(install >= 0, `Tailscale would not be installed:\n${missing}`);
+    assert.ok(install < lineOf(missing, 'src/admin.js setup --answers'),
+        `Tailscale is installed after the mode is known:\n${missing}`);
 });
 
-test('with an auth key and no login yet, the login is run after the wizard and names the node', (t) => {
+test('with an auth key, the key travels with the wizard — which is where the login runs', (t) => {
     const text = dryRun(scratch(t, 'crossbar-dev'), '', ['--tailscale-authkey', 'tskey-auth-test']);
-    const login = commandLines(text, 'TS_AUTHKEY=<hidden>')[0] ?? '';
-    assert.match(login, /up --operator=\S+/, 'the deployment account is not named the tailnet operator');
-    assert.match(login, /--hostname crossbar-dev$/, `the login does not name the node after the deployment:\n${login}`);
+    const logins = commandLines(text, 'TS_AUTHKEY=<hidden>');
+    assert.match(logins[0] ?? '', /src\/admin\.js setup --answers/,
+        `the key does not reach the wizard's own join:\n${text}`);
+    assert.match(logins[0] ?? '', /TAILSCALE_HOSTNAME=crossbar-dev/, 'the join is not told what to name the node');
     assert.ok(!text.includes('tskey-auth-test'), 'the auth key is in the transcript');
-    assert.ok(lineOf(text, 'TS_AUTHKEY=<hidden>') > lineOf(text, 'src/admin.js setup --answers'),
-        'the login ran before the wizard, which does not know the mode yet');
+    // The front door is the safety net behind it, and keeps naming the node — for a run whose join
+    // could not finish.
+    assert.match(logins[1] ?? '', /up --operator=\S+/, 'the fallback login is not run as the operator');
+    assert.match(logins[1] ?? '', /--hostname crossbar-dev$/, `the fallback login does not name the node:\n${logins[1]}`);
 });
 
-test('--tailscale-hostname is the name the login uses instead', (t) => {
+test('--tailscale-hostname is the name the join uses instead', (t) => {
     const text = dryRun(scratch(t, 'crossbar-dev'), '',
         ['--tailscale-authkey', 'tskey-auth-test', '--tailscale-hostname', 'gateway']);
-    const login = commandLines(text, 'TS_AUTHKEY=<hidden>')[0] ?? '';
-    assert.match(login, /--hostname gateway$/, `the override did not reach the login:\n${login}`);
-    assert.ok(!login.includes('crossbar-dev'), `the deployment's own name is still on the login:\n${login}`);
+    const logins = commandLines(text, 'TS_AUTHKEY=<hidden>');
+    assert.match(logins[0] ?? '', /TAILSCALE_HOSTNAME=gateway\b/, `the override did not reach the wizard:\n${logins[0]}`);
+    assert.match(logins[1] ?? '', /--hostname gateway$/, `the override did not reach the login:\n${logins[1]}`);
+    assert.ok(!text.includes('TAILSCALE_HOSTNAME=crossbar-dev'),
+        `the deployment's own name is still on the join:\n${text}`);
 });
 
 test('a prefix whose own name is not a hostname is derived into one', (t) => {
     // `require_path` allows capitals, `_` and `.` in a directory name, and none of those is what
     // Tailscale answers at, so this default is reduced to a DNS label rather than joined raw.
     const text = dryRun(scratch(t, 'Crossbar_Dev.v2'), '', ['--tailscale-authkey', 'tskey-auth-test']);
-    const login = commandLines(text, 'TS_AUTHKEY=<hidden>')[0] ?? '';
-    assert.match(login, /--hostname crossbar-dev-v2$/, `the prefix was not derived into a hostname:\n${login}`);
+    assert.match(commandLines(text, 'TS_AUTHKEY=<hidden>')[0] ?? '', /TAILSCALE_HOSTNAME=crossbar-dev-v2\b/,
+        `the prefix was not derived into a hostname:\n${text}`);
 });
 
 test('a --tailscale-hostname that is not a hostname is refused, not reduced', (t) => {

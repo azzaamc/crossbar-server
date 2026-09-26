@@ -39,31 +39,53 @@ step-by-step for installing a second household.
 >   the verdict (`/api/health` over loopback, the version field, and the failure direction) were
 >   exercised against a stub. **No install, upgrade or uninstall has been run on a Linux host**:
 >   that is the rehearsal host, and §2.10 and §5.1 list what to check there;
-> - the installer's **onboarding phase** — the setup wizard and the front door it installs
->   (§2.2.1, `scripts/lib/deploy.sh`). `bash -n` is clean on both files; `--dry-run` was read on
->   macOS against a scratch prefix and prints the whole phase (the wizard command, the directory
->   file it writes, and the front door plan for the mode the answers file names) while creating
->   nothing. The phase's own functions were then driven against two scratch prefixes with a real
->   Node 22: with `--answers` they wrote a complete tree — the private block in `.env`, a
->   generated 64-hex session secret, `DATA_DIR`/`DIRECTORY_CONFIG_PATH` rendered for the scratch
->   prefix, and `data/directory.json` with one administrator — a second run kept the session
+> - the installer's **onboarding phase** — the Tailscale preparation, the setup wizard and the front
+>   door it installs (§2.2.1, `scripts/lib/deploy.sh`). `bash -n` is clean on both the script and the
+>   library; `--dry-run` was read on macOS against a scratch prefix and prints the whole phase (the
+>   Tailscale step before the wizard — the vendor install line when the binary is absent,
+>   `systemctl enable --now tailscaled`, `tailscale set --operator=<account>` — then the wizard
+>   command with `TAILSCALE_HOSTNAME=<name>` in its environment and `TS_AUTHKEY=<hidden>` when a key
+>   was given, the directory file it writes, and the front door plan for the mode the answers file
+>   names) while creating nothing. The phase's own functions were then driven against scratch
+>   prefixes with a real Node 22: with `--answers` they wrote a complete tree — the private block in
+>   `.env`, a generated 64-hex session secret, `DATA_DIR`/`DIRECTORY_CONFIG_PATH` rendered for the
+>   scratch prefix, and `data/directory.json` with one administrator — a second run kept the session
 >   secret and rewrote the same directory file, and with no answers and no terminal the phase
->   refused, named `--answers`, and wrote no directory file. `--dry-run` also prints the private
->   front door now that there is one to install (the Tailscale install, `systemctl enable --now
->   tailscaled`, the login it runs itself — `TS_AUTHKEY=<hidden> tailscale up …` when a key is
->   given, `tailscale up …` in the terminal when none was — and the instruction block it leaves
->   when it cannot), and the wizard's derived private address, its reworded questions and the two
->   finishing questions were read as pty frames and covered by `test/setup-finish.test.js` —
->   including that neither finishing command runs with no terminal. The private front door was
->   driven for real on this Mac too (no systemd, no Tailscale installed) with `TAILSCALE_BIN` and
->   `PATH` handed stand-ins, and is covered by `test/install-order.test.js`: the login follows the
->   wizard that decides the mode, it is attempted with a terminal or a key and not with neither, a
->   login that fails leaves the install standing and prints the instruction block, a finished login
->   reads the machine's own name back and corrects `.env` through the one `--no-ask` wizard run, and
->   an agreeing name prints neither.
->   **What that does not cover is the real thing**: no Linux host,
->   so `npm ci`, the units, `/api/health`, the Caddy install and `caddy validate`, and the
->   Tailscale install and login were never run — §2.10 is the list;
+>   refused, named `--answers`, and wrote no directory file.
+> - **the wizard's join**, which is the part of this the owner asked for, and the one thing here
+>   that is exercised inside a real pseudo-terminal: with `tailscale` on `PATH` as a stand-in whose
+>   daemon has no `Self.DNSName` until its own `up` is run, the real wizard under a pty showed the
+>   mode question (answered *Both*) → the join running in the foreground and printing its approval
+>   link → the machine's own name read back → the private `HOSTNAME` field holding
+>   `crossbar-dev.tailea67b0.ts.net` as a value to confirm, with `ORIGIN` derived from it, and the
+>   file written from those answers. `test/setup-finish.test.js` covers both directions of it: the
+>   join runs before the address question and the name it got is what is offered and written, and a
+>   join that does not finish leaves the question reading as it always did — the address typed, not
+>   invented — with the command, what it does and what to do after printed beside it. The library's
+>   own invocation was driven **for real** as well, not only printed: `run_setup_wizard` against a
+>   scratch prefix with a stand-in `tailscale` on `PATH` and a key, which ran the child as
+>   `TS_AUTHKEY=<hidden> env TAILSCALE_HOSTNAME=crossbar-dev <node> src/admin.js setup …`, joined
+>   through the stand-in (`up --hostname crossbar-dev`, then `status --json` to read the name back),
+>   and wrote `NETWORK_MODE_PRIVATE_HOSTNAME=crossbar-dev.tailea67b0.ts.net` into `.env`. That run
+>   is also what shows the child's argv is executable rather than merely printed: `--dry-run` prints
+>   a composed line, not the argv. `test/install-order.test.js` covers the phase end to end through
+>   `scripts/install.sh`: Tailscale installed,
+>   started and its operator named before the wizard, the key and the node's name travelling to the
+>   wizard in its environment and nowhere else, the front door's login attempted with a terminal or
+>   a key and not with neither, a login that fails leaving the install standing with the instruction
+>   block printed, a finished login reading the machine's own name back and correcting `.env`
+>   through the one `--no-ask` wizard run, and an agreeing name printing neither.
+> - **the dev VPS** (`crossbar-dev-vps`, a real Debian host with a real `tailscaled`), driven over
+>   ssh for the one claim the whole design rests on: `sudo -u admin tailscale status --json` answers
+>   the deployment account with `BackendState: NeedsLogin` and no `DNSName`, and `sudo -u admin
+>   timeout 15 tailscale up --hostname crossbar-join-probe` — the wizard's own command, as that
+>   account — printed a real `https://login.tailscale.com/a/…` link and was killed by the timeout
+>   (exit 124) with the daemon left in `NeedsLogin`, no CLI process left running, and nothing
+>   approved. Also checked there: `setup --operator=admin` is idempotent on a daemon already in that
+>   state, which is what the installer's step runs every time.
+>   **What that does not cover is the real thing end to end**: no full Linux install, so `npm ci`,
+>   the units, `/api/health`, the Caddy install and `caddy validate`, and an *approved* Tailscale
+>   login were never run — §2.10 is the list;
 > - ~~the full server test suite on the merged tree~~ — 177 tests, 177 pass, 0 fail, 0 skipped,
 >   the operator path's five and the `doctor` checks' five included.
 >
@@ -143,13 +165,15 @@ sudo scripts/install.sh --tailscale-authkey tskey-auth-…    # a private deploy
 sudo scripts/install.sh --no-setup                          # today's behaviour: write .env and the directory file by hand first
 ```
 
-It renders the unit files' hardcoded paths for this host (§2.5), runs the setup wizard to write
-the mode blocks, the session secret and the directory file (§2.2.1), creates the data directory,
-installs dependencies as the account that owns the tree, enables the service **and the backup
-timer**, and finishes by waiting for `/api/health` — so "installed" means answering rather than
-"the files are in `/etc`". It also refuses on a host without systemd rather than reporting
-success with no service; on macOS, where this was written, that refusal is the whole of a real
-run.
+It renders the unit files' hardcoded paths for this host (§2.5), prepares Tailscale before anything
+is asked — installed if it is absent, `tailscaled` started, and the deployment's account named the
+daemon's operator, which is what lets the wizard join the tailnet itself (§2.8.1) — runs the setup
+wizard to write the mode blocks, the session secret and the directory file (§2.2.1), creates the
+data directory, installs dependencies as the account that owns the tree, enables the service **and
+the backup timer**, and finishes by waiting for `/api/health` — so "installed" means answering
+rather than "the files are in `/etc`". It also refuses on a host without systemd rather than
+reporting success with no service; on macOS, where this was written, that refusal is the whole of a
+real run.
 
 Everything below is what it is doing, and what to do by hand if you would rather — or if a step
 fails and you want to see it.
@@ -168,7 +192,7 @@ What it asks, and where each answer lands:
 | it asks | it writes |
 | --- | --- |
 | which modes this deployment is reached in (`--mode private`, `public` or `both`) | one block per mode, `NETWORK_MODE_<MODE>_*` in `.env` |
-| the hostname and origin of each mode, and the public bind address | the same block (§2.3) |
+| the hostname and origin of each mode, and the public bind address — the private one offered as this machine's own tailnet name, which the wizard joins the tailnet to get (§2.8.1) | the same block (§2.3) |
 | who is in the directory — `id, display name, login, admin` per person | the directory file (§2.4) |
 | the relay host and secret, APNs, Web Push — each optional, each skippable | the names in `.env` |
 | nothing about the session secret | it generates one, or keeps the one the file holds |
@@ -177,27 +201,35 @@ What it asks, and where each answer lands:
 A value the deployment already holds is offered as the default, so a second run over a configured
 deployment changes only what it was told to; secrets are kept unless `--new-secrets` is passed.
 Nothing is written until the whole `.env` it composes is complete and the directory is valid, so a
-refusal costs nothing. The private hostname's default is the name this machine already answers at on
-the tailnet (`tailscale status --json`'s `Self.DNSName`), so a machine that is on a tailnet is not
-asked to type it again; a machine with no Tailscale is asked the same question, worded so the
-answer is knowable without either, and the run says the private address is your people's phones'
-way in.
+refusal costs nothing. The private hostname's default is the name this machine answers at on the
+tailnet (`tailscale status --json`'s `Self.DNSName`), so a machine that is on a tailnet is not asked
+to type it again; a machine with no Tailscale is asked the same question, worded so the answer is
+knowable without either, and the run says the private address is your people's phones' way in.
 
-**The wizard's mode question decides whether there is a private door at all, so the door follows
-the wizard — and its private address is a guess on a fresh box.** There is no tailnet name until a
-login has happened, and the login is now the installer's own: the front-door step afterwards runs
-`tailscale up` (in the terminal, so its approval link is where the person is looking; through
-`TS_AUTHKEY` when a key was given, so no terminal is needed), then reads `tailscale status --json`
-as root and compares `Self.DNSName` with the private block the wizard wrote. When the two differ it
-says what `.env` holds and what the machine is called now, and runs the wizard once more with the
-discovered name (`--no-ask --private-hostname <name> --private-origin https://<name>`). The wizard
-keeps the mode, every other address, the people and every secret from the files it wrote, so this is
-one call and not a second `.env` writer; an invitation's origin is built from that address, which is
-why a guess is corrected rather than reported. Nothing is said when the two agree — or when Tailscale
-cannot answer, because a machine that is not logged in has no name to correct to: the login is then
-what is left, and the front door says so and prints the one command (§2.8.1). The login never fails
-the install: a declined or timed-out one leaves everything else installed, and the report says which
-it was.
+**The wizard's mode question decides whether there is a private door at all, and the wizard is
+where the join happens — immediately after that question, before the private address it answers is
+asked for.** The private address is the name Tailscale gives this machine, so the wizard joins the
+machine itself: `tailscale up --hostname <the deployment's name>`, run as the deployment's own
+account (which the installer makes the daemon's operator before the wizard starts, §2.8.1) and in
+the terminal, where its approval link is. It then reads `tailscale status --json`'s `Self.DNSName`
+back and puts that name in the private `HOSTNAME` field — with `https://` in front of it in
+`ORIGIN` — as a value to confirm rather than a question to answer from expectation. With
+`--tailscale-authkey` the key reaches that login through `TS_AUTHKEY` and no approval is needed;
+with no terminal to show a link in and no key, the join is not attempted and the address is asked
+for with brief instructions beside it.
+
+The installer's front door afterwards is the **safety net** for the run that could not join there:
+it makes the same login attempt once more and reads the name back as root, and when that name and
+the private block the wizard wrote disagree it says what `.env` holds and what the machine is
+called now, then runs the wizard once more with the discovered name
+(`--no-ask --private-hostname <name> --private-origin https://<name>`). The wizard keeps the mode,
+every other address, the people and every secret from the files it wrote, so this is one call and
+not a second `.env` writer; an invitation's origin is built from that address, which is why a
+disagreement is corrected rather than reported. Nothing is said when the two agree — which is the
+ordinary case now that the wizard derives the address itself — or when Tailscale cannot answer,
+because a machine that is not logged in has no name to correct to: the login is then what is left,
+and the front door says so and prints the one command (§2.8.1). The login never fails the install:
+a declined or timed-out one leaves everything else installed, and the report says which it was.
 
 ```bash
 sudo scripts/install.sh --answers /root/answers.json   # every answer from one JSON file
@@ -210,6 +242,14 @@ sudo scripts/install.sh --tailscale-authkey tskey-auth-…   # join the tailnet 
 that is who the wizard runs as; a file only root can read is refused before anything runs. Every
 question is also answerable by flag, and the installer passes none of those through — put them in
 the file.
+
+**Two shapes of run do not join from inside the wizard**, and the front door is what covers them
+either way: `--browser`, whose page is not a terminal, and an unattended run (`--answers` with no
+terminal on stdin), which has nobody to approve a machine. Both get the address asked for as they
+always did; the front door then makes the login attempt itself — in the installer's own terminal,
+where there is one — and corrects `.env` with the name it reads back (§2.8.1). Passing
+`--tailscale-authkey` removes the difference: a key needs no approval, so the wizard joins in those
+runs too and the address is derived like any other.
 
 **With no `--answers`, no `--browser` and no terminal on stdin, the installer refuses.** It names
 what to pass and writes nothing: a wizard that cannot answer its own questions must stop rather
@@ -230,22 +270,24 @@ Then the front door, for exactly the modes the wizard set up:
   address. It does **not** start Caddy: public mode's shaper unit does, on every start while
   public mode is in force (§2.5). A step that fails stops the install with the reason — a public
   deployment with no door is the one thing worse than one that refused.
-- **private** — Tailscale itself is installed if it is not already (`tailscale.com/install.sh`,
-  which adds its own `apt` repository — the vendor script, so a host on any supported distribution
-  works), and `tailscaled` is enabled and started. Then the **login**, which the installer runs
-  itself (§2.8.1): `tailscale up`, naming the deployment's account the tailnet operator
-  (`--operator=<account>`) so the wizard and `doctor` can read this machine's name — on Linux the
-  daemon is root's and answers nobody else until an operator is named — and naming the **node
-  itself** after the deployment (`--hostname`, the basename of `--prefix` unless
+- **private** — Tailscale has already been prepared *before* the wizard asked anything, because the
+  wizard's own join needs it: installed if it is not already (`tailscale.com/install.sh`, which adds
+  its own `apt` repository — the vendor script, so a host on any supported distribution works),
+  `tailscaled` enabled and started, and the deployment's own account named the daemon's **operator**
+  with `tailscale set --operator=<account>` — on Linux the daemon is root's and answers nobody else
+  until an operator is named, which is what lets the wizard, running as that account, join at all.
+  No login happens there. What the front door adds is the **safety net** (§2.8.1): it makes the same
+  login attempt once more — `tailscale up`, naming the deployment's account the operator and naming
+  the **node itself** after the deployment (`--hostname`, the basename of `--prefix` unless
   `--tailscale-hostname` says otherwise), so the private address is the one the person chose rather
-  than the one the host's provider assigned. With `--tailscale-authkey` the key goes to `tailscale
-  up` through `TS_AUTHKEY` (never argv, so it is in no transcript and no process list); without one
-  the command runs in the terminal, so its approval link is where the person is looking, and where
-  there is **no terminal** to show it in the login is not attempted at all and the installer prints
-  the exact command instead. Either way the machine's own tailnet name is then read back (as root)
-  and compared with the private block the wizard wrote; a disagreement re-runs the wizard with the
-  name the machine answers at, and a machine with no name yet (the login not done) ends its report
-  saying so. The login never fails the install — a declined or timed-out one leaves everything else
+  than the one the host's provider assigned — and then reads the machine's own tailnet name back (as
+  root) and compares it with the private block the wizard wrote; a disagreement re-runs the wizard
+  with the name the machine answers at, and a machine with no name yet (the login not done) ends its
+  report saying so. With `--tailscale-authkey` the key goes to `tailscale up` through `TS_AUTHKEY`
+  (never argv, so it is in no transcript and no process list); without one the command runs in the
+  terminal, so its approval link is where the person is looking, and where there is **no terminal**
+  to show it in the login is not attempted at all and the installer prints the exact command
+  instead. The login never fails the install — a declined or timed-out one leaves everything else
   installed, and the report says which it was.
 
 `--no-setup` turns the phase off and installs exactly what this script did before there was a
@@ -489,61 +531,85 @@ Install the `Caddyfile` at `/etc/caddy/Caddyfile` and check it with `caddy valid
 
 ### 2.8.1 Private mode: Tailscale
 
-**The installer does the mechanical half of this for a private deployment** (§2.2.1). If
-`tailscale` is not on the host it installs it with the vendor's own script
-(`curl -fsSL https://tailscale.com/install.sh | sh`, which adds Tailscale's `apt` repository), then
-`systemctl enable --now tailscaled` so the daemon survives a reboot. `tailscale serve` is run by
-the private shaper unit on every start (§2.5), so the route itself needs nothing installed by hand.
+**The installer does the mechanical half of this before the wizard asks anything** (§2.2.1), because
+the wizard's own join needs it. If `tailscale` is not on the host it installs it with the vendor's
+own script (`curl -fsSL https://tailscale.com/install.sh | sh`, which adds Tailscale's `apt`
+repository), then `systemctl enable --now tailscaled` so the daemon survives a reboot, and then
+`tailscale set --operator=<account>` — naming the deployment's own account the daemon's **operator**,
+which is the line that makes the next step possible: on Linux the daemon is root's and answers
+nobody else until an operator is named, so without it the account that runs the wizard cannot run
+`tailscale up` or read the machine's name. Nothing is logged in at this point. `tailscale serve` is
+run by the private shaper unit on every start (§2.5), so the route itself needs nothing installed by
+hand.
 
-The **login is run by the installer**, not left to the person. It is the step *after* the wizard,
-because the wizard's mode question is what decides whether a private door is wanted at all — and so
-the private address the wizard asked for was answered before the machine had a tailnet name. The
-installer runs `tailscale up` and, when it finished, reads the name back and corrects `.env` (below),
-which is what makes the order cost nothing. With `--tailscale-authkey <key>` the key is handed over
+Because it happens before the mode question, an install that turns out to be public-only keeps
+Tailscale installed and unlogged — a daemon in `NeedsLogin` serves nothing and holds nothing — and
+none of it can fail the install: a host that cannot install it says so, the wizard falls back to
+asking for the address, and the front door refuses later when a private deployment has no Tailscale
+at all.
+
+**The login is run by the wizard**, between the mode question and the private address that comes
+from it. That is the point of preparing Tailscale first: the wizard runs as the deployment's own
+account, which the step above has just made the daemon's operator, so `tailscale up --hostname <the
+deployment's name>` is that account's own command — and `tailscale up` prints an approval link and
+waits for the machine to be approved, which is the whole of what a person has to do. It runs **in
+the foreground, on this terminal**, so the link is where the person is looking: they answered the
+mode question a moment before. That is the difference between being asked for an address the machine
+can learn and being handed a command to run later.
+
+An auth key removes the approval step: with `--tailscale-authkey <key>` the key reaches the login
 through `TS_AUTHKEY` — so it is in neither the process list nor the transcript, and `--dry-run`
-prints `TS_AUTHKEY=<hidden>` — and no terminal is needed. Without a key the command runs in the
-terminal, where Tailscale's approval link appears; with **no terminal to show it in** the login is
-not attempted at all, and the installer prints the exact command instead. The command names the
-deployment's own account the tailnet **operator** (`--operator=<account>`): on Linux only root
-manages the daemon until a user is named the operator, and the two things that ask are the wizard,
-which derives the private address while running as that account, and `doctor`, which runs `tailscale
-serve status` as it. Without the operator the machine can be joined and that account still cannot
-see the name.
+prints `TS_AUTHKEY=<hidden>` — and a keyed join needs no terminal at all. With **no terminal to show
+a link in** and no key, the join is not attempted: the address is asked for, and the instructions
+below are printed next to the question.
+
+**Then the name is read back and offered, not asked for.** `tailscale status --json`'s
+`Self.DNSName` (with the trailing dot dropped) is the address `<name>.<tailnet>.ts.net` the login
+just gave the machine, and the wizard puts it in the private `HOSTNAME` field — and `https://` in
+front of it in `ORIGIN` — which Enter keeps. What is read is a value to confirm, with the box above
+it saying what this machine is called now. The field holds that name whatever `.env` held before,
+because the machine's own name is the one an invitation has to carry. When the join did not finish
+there is no name to offer, so the field is empty as it always was, the question is the one that
+reads, and the instructions below are beside it.
 
 **That login names the node**, and the name *is* the address. `tailscale up --hostname <name>` makes
 the machine answer at `<name>.<tailnet>.ts.net`, which is what `Self.DNSName` reports, what the
-installer reads back immediately afterwards and corrects `NETWORK_MODE_PRIVATE_HOSTNAME` to, and
-therefore what `NETWORK_MODE_PRIVATE_ORIGIN` and every invitation built from it hold. The installer
-passes **the deployment's own name** — the basename of `--prefix`, so `crossbar-dev` for
-`/home/admin/crossbar-dev` and `crossbar` for the default `/home/admin/crossbar` — because that is
-the name the person chose and the one their phones should dial; `--tailscale-hostname <name>`
-replaces it. Naming nothing is what leaves the provider's name in place: an install on a VPS that
-named nothing would otherwise join as `srv2011992.tailea67b0.ts.net` — assigned by the provider,
-chosen by nobody — and that is the address an invitation would carry.
+wizard reads back and writes into `NETWORK_MODE_PRIVATE_HOSTNAME`, and therefore what
+`NETWORK_MODE_PRIVATE_ORIGIN` and every invitation built from it hold. The name is **the
+deployment's own name** — the basename of `--prefix`, so `crossbar-dev` for
+`/home/admin/crossbar-dev` and `crossbar` for the default `/home/admin/crossbar` — which the
+installer derives and hands to the wizard, because that is the name the person chose and the one
+their phones should dial; `--tailscale-hostname <name>` replaces it. Naming nothing is what leaves
+the provider's name in place: an install on a VPS that named nothing would otherwise join as
+`srv2011992.tailea67b0.ts.net` — assigned by the provider, chosen by nobody — and that is the
+address an invitation would carry.
 
 A prefix whose own name is not a hostname is reduced to one, because a directory name and a hostname
 are not the same language: `/home/admin/My_Box.v2` joins as `my-box-v2`. The reduction is on the
-login line of `--dry-run`, where it can be read before anything runs. A `--tailscale-hostname` that
-is not a hostname, by contrast, is **refused** rather than reduced: that one was spelled by a person,
-and answering with a different name is how an address nobody asked for ends up in `.env`.
+line of `--dry-run` that the wizard is given the name on, where it can be read before anything runs.
+A `--tailscale-hostname` that is not a hostname, by contrast, is **refused** rather than reduced:
+that one was spelled by a person, and answering with a different name is how an address nobody asked
+for ends up in `.env`.
 
-When the installer cannot finish the login — no terminal, or the approval declined or timed out — it
-says which, and leaves **brief instructions** rather than a runbook reference: the exact command,
-what it will do, and that re-running the installer is what finishes the job. It is the same command
-the installer would have run, `--hostname` included, so a person who runs it joins under the
+When the join could not be finished — no terminal, or the approval declined or timed out — the
+install says which, and leaves **brief instructions** rather than a runbook reference: the exact
+command, what it will do, and that re-running the installer is what finishes the job. It is the same
+command the installer would have run, `--hostname` included, so a person who runs it joins under the
 deployment's own name:
 
 ```bash
 sudo tailscale up --operator=<account> --hostname crossbar-dev   # prints the approval URL; approve the machine, then re-run the installer
 ```
 
-Once `tailscale status --json` answers, the installer reads `Self.DNSName` (with the trailing dot
-dropped) and compares it with `NETWORK_MODE_PRIVATE_HOSTNAME` in `.env`. That address is what
-`NETWORK_MODE_PRIVATE_ORIGIN` is built from and what an invitation carries, so a disagreement is an
-address nobody can dial, not a cosmetic slip — including the case where the wizard left the hostname
-blank, because on a fresh box there was no name to offer. When the two differ the installer says what
-`.env` holds and what the machine is called now, and runs the wizard once more with the discovered
-name:
+**The front door afterwards is the safety net for exactly that run.** Once `tailscale status --json`
+answers, it reads `Self.DNSName` (trailing dot dropped) and compares it with
+`NETWORK_MODE_PRIVATE_HOSTNAME` in `.env`. Because the wizard derives that address from the same
+field before it writes, this normally finds the two agreeing and says nothing; what it is there for
+is the run whose join did not finish, where the address came from what the person expected or was
+left blank. That address is what `NETWORK_MODE_PRIVATE_ORIGIN` is built from and what an invitation
+carries, so a disagreement is an address nobody can dial, not a cosmetic slip. When the two differ
+the installer says what `.env` holds and what the machine is called now, and runs the wizard once
+more with the discovered name:
 
 ```bash
 node src/admin.js setup --no-ask --private-hostname <name> --private-origin https://<name>
@@ -562,12 +628,15 @@ the tailnet. It is a credential — keep it out of shell history and out of the 
 file is shared.
 
 A machine that is already logged in — from an earlier run, or the host's own Tailscale — is not
-logged in again: the installer reads the name, and the comparison and the correction are the same.
-The wizard's private hostname question says what will happen instead of promising a name it cannot
-print: it offers the machine's own tailnet name as its default when there is one to read, and
-otherwise says the installer sets it from the machine's own name once the machine is approved on the
-link Tailscale shows. That read is the account's, which is why the login names it the operator;
-where it cannot ask, the comparison still corrects the file afterwards.
+logged in again: the wizard reads the name, offers it as the address, and writes it; the front door
+reads it once more and has nothing to correct.
+
+The private hostname question has two readings, and which one is shown is whether this machine has a
+name. **With one** the field holds it, and the question says Tailscale gives this machine one and
+that it is on the tailnet already, so Enter keeps the name it answers at. **Without one** — the join
+did not finish, or was not attempted for want of a terminal and a key — it is the question that says
+the installer sets the address from the machine's own tailnet name once the machine is approved on
+the link Tailscale shows. Neither promises a name that does not exist yet.
 
 ### 2.9 Installing the relay (optional)
 
@@ -614,14 +683,17 @@ have run:
    in force — the shaper unit started it on the restart — and not running when private mode is,
    which is the door the tailnet provides instead.
    Tailscale, for a private deployment: `systemctl status tailscaled` is active, `tailscale
-   status` names the machine, and that name matches `NETWORK_MODE_PRIVATE_HOSTNAME`. The installer
-   runs the login itself: it attempts it with a terminal (or with `TS_AUTHKEY` when a key was given)
-   and, when it finished, reads the name back, so a name that disagreed with the wizard's guess is
-   corrected on the spot by a second, `--no-ask` wizard run (§2.8.1). Where it could not — no
-   terminal, or the approval was declined — the run ends by printing the exact command and what it
-   does; run it, approve the machine, then re-run the installer and check `.env`. The rehearsal is
-   what proves the account can read the name at all (`tailscale status` as the deployment account,
-   not as root).
+   status` names the machine, and that name matches `NETWORK_MODE_PRIVATE_HOSTNAME`. The wizard
+   joins the machine itself — right after the mode question and before it asks for the private
+   address, which it then offers as the name the login produced — and the installer's front door
+   afterwards makes the same attempt once more and reads the name back, so a disagreement with
+   `.env` is corrected on the spot by a second, `--no-ask` wizard run (§2.8.1). Where it could not —
+   no terminal, or the approval was declined — the run ends by printing the exact command and what
+   it does; run it, approve the machine, then re-run the installer and check `.env`. The rehearsal
+   is what proves the account can run `tailscale up` and read the name at all (`tailscale status`
+   as the deployment account, not as root): the operator line in the installer's Tailscale step is
+   what allows it, and a host where it is refused is a host where the wizard will ask for the
+   address instead.
 4. `systemctl status crossbar crossbar-backup.timer` — the service **active (running)**, the timer
    **active (waiting)** with a next elapse. A timer that is not waiting is a backup that never runs.
 5. `systemctl list-timers crossbar-backup.timer`, then `sudo systemctl start crossbar-backup.service`
@@ -1173,7 +1245,7 @@ rendering of §2.5 — and executes none:
 | Command | What it is |
 | --- | --- |
 | `scripts/release.sh [--out DIR]` | builds `crossbar-server-<version>.tar.gz` and the `.sha256` beside it, from a clean tree |
-| `scripts/install.sh [--prefix DIR] [--user NAME] [--source DIR] [--with-relay] [--answers FILE] [--browser] [--tailscale-authkey KEY] [--tailscale-hostname NAME] [--no-setup]` | §2.2–§2.6 as one command (§2.2), with the setup wizard (§2.2.1) and the private front door's Tailscale install and login (§2.8.1) |
+| `scripts/install.sh [--prefix DIR] [--user NAME] [--source DIR] [--with-relay] [--answers FILE] [--browser] [--tailscale-authkey KEY] [--tailscale-hostname NAME] [--no-setup]` | §2.2–§2.6 as one command (§2.2), with the setup wizard — including the tailnet join it makes itself (§2.2.1) — and the private front door's Tailscale preparation and safety-net login (§2.8.1) |
 | `scripts/upgrade.sh --from <tarball>` | stop, snapshot, unpack, install, start, verify, roll back (§5.3) |
 | `scripts/uninstall.sh [--prefix DIR] [--user NAME] [--purge-data]` | stop and remove the units; `--purge-data` for the data directory and `.env` (§5.6) |
 
@@ -1184,9 +1256,10 @@ deployment take their defaults from `CROSSBAR_HOME` (`/home/admin/crossbar`) and
 
 What they deliberately do not do: nothing here knows how a tarball reaches a host — no remote, no
 `git push`, no SSH — so the transport (a bundle, `rsync`, `scp`, a USB stick) is still the
-operator's; the installer's onboarding phase installs Caddy and Tailscale and validates the former
-(§2.2.1, §2.8.1), but DNS, the port forwards and the firewall, the Tailscale login itself when
-there is no key, and the relay's own configuration are still the operator's (§2.8, §2.9, §8);
+operator's; the installer prepares Tailscale before the wizard and the wizard joins the tailnet
+itself, and Caddy is installed and its Caddyfile validated (§2.2.1, §2.8.1), but DNS, the port
+forwards and the firewall, the tailnet approval itself when there is no key, and the relay's own
+configuration are still the operator's (§2.8, §2.9, §8);
 nothing carries backups off the box (§4.7); and nothing commits anything. `release.sh`
 refuses a tree with uncommitted changes, because an artefact that cannot be reproduced from a
 commit cannot be returned to; `--allow-dirty` builds one anyway, which is for a rehearsal.
@@ -1604,7 +1677,7 @@ going to `/etc`:
 
 | File | What it is |
 | --- | --- |
-| `install.sh` | §2.2–§2.6 as one command, the setup wizard and front door included (§2.2, §2.2.1) |
+| `install.sh` | §2.2–§2.6 as one command, with Tailscale prepared before the wizard and the front door after it (§2.2, §2.2.1, §2.8.1) |
 | `release.sh` | the versioned tarball and its checksum (§5.1) |
 | `upgrade.sh` | stop, snapshot, unpack, install, verify, roll back (§5.3, §5.5) |
 | `uninstall.sh` | stop and remove the units; `--purge-data` for the data (§5.6) |

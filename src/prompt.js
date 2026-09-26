@@ -83,6 +83,21 @@ class NoTerminal extends Error {
 /** How wide a line is on a screen: whatever draws it — an escape sequence — occupies nothing. */
 const visibleWidth = (text) => String(text).replace(/\u001b\[[0-9;]*m/g, '').length;
 
+/**
+ * How many rows a frame takes on a screen: one for each line, and one more for every time a line
+ * runs past the last column and the terminal wraps it onto the next. A line ending exactly at the
+ * last column has not wrapped yet — the terminal wraps when the next character arrives — so a
+ * screen's worth of text is one row, not two.
+ *
+ * Counting lines instead of rows is what walked the prompt down the screen: the `◆  <question>` line
+ * of an ordinary wizard question is wider than eighty columns, so it draws two rows, and a redraw
+ * that moved up by `lines - 1` began a row lower every time.
+ */
+const rows = (lines, columns) => lines.reduce(
+    (total, line) => total + Math.max(1, Math.ceil(visibleWidth(line) / Math.max(columns, 1))),
+    0,
+);
+
 /** One line of the box, as wide as it needs to be: this is where padding is decided, not the eye. */
 const pad = (line, width) => line + ' '.repeat(Math.max(0, width - visibleWidth(line)));
 
@@ -316,7 +331,7 @@ function confirmStep(state, pressed) {
  * The cursor is deliberately left where the last frame ended — the line under it is the next
  * question's — so a question that has not settled redraws over itself instead of scrolling.
  */
-function converse({ input, output, draw, step, state }) {
+function converse({ input, output, draw, step, state, columns }) {
     return new Promise((resolve) => {
         readline.emitKeypressEvents(input);
         const wasRaw = Boolean(input.isRaw);
@@ -324,20 +339,31 @@ function converse({ input, output, draw, step, state }) {
         input.resume();
         output.write(HIDE_CURSOR);
 
-        let showing = 0;
+        let drawn = null;
         let current = state;
 
+        /**
+         * A frame over the one before it, which is measured in rows and not in lines: a line the
+         * terminal wrapped draws on two of them, and moving up by the number of lines leaves the
+         * frame that many rows lower each time it is redrawn — the rows it walks past are above the
+         * cursor `ERASE_DOWN` clears below, so nothing ever takes them back.
+         *
+         * The width is read here rather than kept from the prompter's making: a terminal rewraps its
+         * screen when it is resized, so the frame already drawn is measured at the width the next
+         * one will be drawn at.
+         */
         const render = (next) => {
             current = next;
             const lines = draw(next);
-            if (showing) {
-                if (showing > 1) output.write(`\u001b[${showing - 1}A`);
+            if (drawn) {
+                const above = rows(drawn, columns()) - 1;
+                if (above > 0) output.write(`\u001b[${above}A`);
                 output.write(`\r${ERASE_DOWN}`);
             }
             // From column zero, always: the cursor may have been left anywhere — hiding it does not
             // move it — and a guide line that starts mid-row is a frame that does not line up.
             output.write(`\r${lines.join('\r\n')}`);
-            showing = lines.length;
+            drawn = lines;
         };
         render(current);
 
@@ -392,9 +418,11 @@ function createPrompter({ input = process.stdin, output = process.stdout, paint 
 
     // A terminal that has not been told how wide it is reports zero columns — which is what a
     // pseudo-terminal without a window size looks like — and a box drawn to no width is not a box.
-    const width = columns ?? (output.columns > 0 ? output.columns : 80);
+    // Read again for every frame, because a resize between two of them moves the wrap points.
+    const columnsNow = () => (columns ?? (output.columns > 0 ? output.columns : 80));
+    const width = columnsNow();
     const say = (line) => output.write(`${line}\n`);
-    const ask = (draw, step, state) => converse({ input, output, draw, step, state });
+    const ask = (draw, step, state) => converse({ input, output, draw, step, state, columns: columnsNow });
 
     return {
         present: true,
@@ -424,19 +452,24 @@ function createPrompter({ input = process.stdin, output = process.stdout, paint 
         /** Work that takes long enough to have to say it is still going. */
         spinner: () => {
             let running = false;
-            let drawn = false;
+            let drawn = 0;
             let turn = 0;
             let said = '';
             let timer = null;
+            // One line, but as many rows as the terminal wraps it onto: a spinner message longer
+            // than the screen is drawn on two, and erased as one it leaves the first of them behind
+            // for the next turn to land under — a new row of them for every tick.
             const erase = () => {
                 if (!drawn) return;
+                if (drawn > 1) output.write(`\u001b[${drawn - 1}A`);
                 output.write(`\r${ERASE_DOWN}`);
-                drawn = false;
+                drawn = 0;
             };
             const draw = () => {
                 erase();
-                output.write(`${paint.magenta(CYCLING[turn])}  ${said}`);
-                drawn = true;
+                const line = `${paint.magenta(CYCLING[turn])}  ${said}`;
+                output.write(line);
+                drawn = rows([line], columnsNow());
             };
             return {
                 start: (message) => {
@@ -470,7 +503,7 @@ module.exports = {
     SYMBOL,
     PAINT,
     PLAIN,
-    frames: { opening, closing, boxed, textFrame, selectFrame, confirmFrame, wrap, visibleWidth },
+    frames: { opening, closing, boxed, textFrame, selectFrame, confirmFrame, wrap, rows, visibleWidth },
     stroke,
     steps: { selectStep, textStep, confirmStep },
 };

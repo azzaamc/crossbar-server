@@ -4,10 +4,17 @@
 // are pure enough to compare character for character, and the keys, which are driven through a
 // scripted stream standing in for a person.
 //
-// What is *not* here is the look. Whether the arrow keys move the pointer on a real screen, whether
-// the cursor lands where the next question starts, whether a spinner animates: none of that is
-// visible from inside a pipe, and a test that claimed to check it would be checking the escape
-// sequences it happens to emit. That is what a PTY is for.
+// What is *not* here is the look: whether the arrow keys move the pointer on a real screen, whether
+// a spinner animates. A test that claimed to check those from inside a pipe would be checking the
+// escape sequences it happens to emit.
+//
+// One thing about a real screen *is* here, because a pipe can be held to it: `screenOf` replays what
+// was written the way a terminal would — a cursor, a row per line, and a character written past the
+// last column going on to the next row — so a frame is asserted against the screen it leaves rather
+// than against the sequences that drew it. That is the failure a wrapped question caused: it draws on
+// more rows than its lines, a redraw that moved up by the lines then began a row lower every time,
+// and the sequences alone look exactly as intended. The measurement itself was made in tmux, which is
+// the instrument for it.
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
@@ -18,14 +25,14 @@ const {
 } = require('../src/prompt');
 
 /** A stream that is a terminal as far as the renderer is concerned, and a person who types. */
-function terminal(t) {
+function terminal(t, columns = 80) {
     const input = new PassThrough();
     input.isTTY = true;
     input.isRaw = false;
     input.setRawMode = (raw) => { input.isRaw = raw; };
     const output = new PassThrough();
     output.isTTY = true;
-    output.columns = 80;
+    output.columns = columns;
     let written = '';
     output.on('data', (chunk) => { written += chunk; });
     t.after(() => { input.destroy(); output.destroy(); });
@@ -53,6 +60,47 @@ async function answer(where, question, ...keys) {
     const [settled] = await Promise.all([question(where.ui), press(where.input, ...keys)]);
     return settled;
 }
+
+/**
+ * The screen a terminal would be holding, given everything that was written to it: a cursor, a row
+ * per line, and the four things this renderer writes — carriage return, line feed, a cursor moved up,
+ * and the erase below it. A character written past the last column goes on to the next row, which is
+ * the whole point of modelling it: the terminal wraps a line the renderer counted as one.
+ */
+function screenOf(written, columns) {
+    const rows = [[]];
+    let row = 0;
+    let col = 0;
+    const at = (index) => { while (rows.length <= index) rows.push([]); return rows[index]; };
+    const escape = /\u001b\[([0-9;?]*)([A-Za-z])/y;
+    for (let cursor = 0; cursor < written.length;) {
+        escape.lastIndex = cursor;
+        const found = escape.exec(written);
+        if (found) {
+            const [, numbers, letter] = found;
+            if (letter === 'A') row = Math.max(0, row - (Number(numbers) || 1));
+            if (letter === 'J' && (numbers === '0' || numbers === '')) {
+                at(row).length = col;
+                rows.length = row + 1;
+            }
+            cursor = escape.lastIndex;
+            continue;
+        }
+        const char = written[cursor];
+        cursor += 1;
+        if (char === '\r') { col = 0; continue; }
+        if (char === '\n') { row += 1; continue; }
+        at(row)[col] = char;
+        col += 1;
+        if (col >= columns) { col = 0; row += 1; }
+    }
+    const lines = rows.map((line) => line.join('').trimEnd());
+    while (lines.length > 1 && lines.at(-1) === '') lines.pop();
+    return lines;
+}
+
+/** The question the report was made at: wider than a screen once the `◆` is put in front of it. */
+const QUESTION = 'The first person: the short id the console knows them by (for example: abdullah)';
 
 const MENU = {
     message: 'Which modes is this deployment reached in?',
@@ -146,6 +194,30 @@ test('the box is square, whatever it is asked to hold', () => {
     assert.ok(lines[1].length <= 40, lines[1].length);
 });
 
+test('a frame occupies as many rows as the screen wraps it onto', () => {
+    // A row per line, and a row more for every line too wide for the screen. Counting lines instead
+    // is what walked the prompt down the screen: the question below draws on two rows at eighty
+    // columns and three at forty, so a redraw that moved up by the four lines it counted rather than
+    // the five or six rows it drew began lower on the screen every time.
+    assert.equal(frames.rows(['│', '◆  a', '│  b', '└'], 80), 4);
+    assert.equal(frames.rows(['', 'a'], 40), 2);
+    // A line ending exactly at the last column has not wrapped yet — the terminal wraps when the
+    // next character arrives — so a screen's worth of text is one row and not two. Measured in tmux:
+    // a question of exactly forty columns stays on one row and the frame does not move off it.
+    assert.equal(frames.rows(['x'.repeat(80)], 80), 1);
+    assert.equal(frames.rows(['x'.repeat(40)], 40), 1);
+    assert.equal(frames.rows(['x'.repeat(41)], 40), 2);
+    assert.equal(frames.rows(['x'.repeat(80)], 40), 2);
+
+    const frame = frames.textFrame(
+        { value: 'ab', caret: 2, problem: '', settled: null },
+        { message: QUESTION, placeholder: 'abdullah', paint: PLAIN },
+    );
+    assert.equal(frame.length, 4);
+    assert.equal(frames.rows(frame, 80), 5);
+    assert.equal(frames.rows(frame, 40), 6);
+});
+
 test('a menu wraps at both ends, and settles on the option the pointer is on', async (t) => {
     const up = terminal(t);
     // One press up from the first option: the pointer leaves the top and arrives at the bottom.
@@ -159,6 +231,77 @@ test('a menu wraps at both ends, and settles on the option the pointer is on', a
     const around = await answer(down, (ui) => ui.select({ ...MENU, initial: 'both' }), '\x1b[B', '\r');
     assert.equal(around, 'private');
     assert.match(down.seen(), /│  ● Private \(the tailnet\)\n│  ○ Public\n│  ○ Both/);
+});
+
+test('a question wider than the screen redraws in place instead of walking down it', async (t) => {
+    // Forty columns, where the question wraps onto three rows: the frame is six rows of screen.
+    // Before the fix the redraw moved up by the four *lines* it counted and left two of the six
+    // behind, so three keypresses put the frame six rows down the screen with a `│` and a half
+    // question stranded above it — the report, exactly.
+    const where = terminal(t, 40);
+    const asked = where.ui.text({ message: QUESTION, placeholder: 'abdullah' });
+
+    await press(where.input, 'a', 'b', 'c');
+    assert.deepEqual(screenOf(where.written(), 40), [
+        '│',
+        '◆  The first person: the short id the co',
+        'nsole knows them by (for example: abdull',
+        'ah)',
+        '│  abc',
+        '└',
+    ]);
+
+    // And it is still the question, not a frame that settled over itself: the same screen holds what
+    // is typed next.
+    await press(where.input, 'd', '\r');
+    assert.equal(await asked, 'abcd');
+});
+
+test('a resize mid-question is measured at the width the screen was left at', async (t) => {
+    const where = terminal(t);
+    const asked = where.ui.text({ message: QUESTION, placeholder: 'abdullah' });
+
+    // Eighty columns: the question wraps onto two rows, so the frame is five and the cursor it left
+    // comes back up four.
+    await press(where.input, 'a');
+    assert.ok(where.written().includes('\u001b[4A'), where.seen());
+
+    // Narrowed to forty, the terminal rewraps what is already drawn — the frame is six rows on the
+    // screen now — so the next redraw has to come up five. tmux, resized mid-question from eighty to
+    // thirty-four, holds one frame in place after every further keypress at the new width.
+    where.output.columns = 40;
+    const mark = where.written().length;
+    await press(where.input, 'b');
+    assert.ok(where.written().slice(mark).includes('\u001b[5A'), where.written().slice(mark));
+    // The redraw that follows is one frame and nothing else: the six rows it erased, drawn again at
+    // the width it erased them at.
+    assert.deepEqual(screenOf(where.written().slice(mark), 40), [
+        '│',
+        '◆  The first person: the short id the co',
+        'nsole knows them by (for example: abdull',
+        'ah)',
+        '│  ab',
+        '└',
+    ]);
+
+    await press(where.input, '\r');
+    assert.equal(await asked, 'ab');
+});
+
+test('a spinner line the screen wraps is erased as the rows it drew on', (t) => {
+    const where = terminal(t, 40);
+    const spinning = where.ui.spinner();
+    // The message does not fit in forty columns, so the spinner is drawn on two rows — and erased as
+    // the one it was, the first of them stayed behind and every turn of the cycle added another. tmux
+    // at thirty-four columns: a row per tick.
+    spinning.start('Checking what this box looks like from outside');
+    spinning.message('Checking what this box looks like from outside again');
+    assert.deepEqual(screenOf(where.written(), 40), [
+        '│',
+        '◒  Checking what this box looks like fro',
+        'm outside again',
+    ]);
+    spinning.stop('the checks are in the summary below');
 });
 
 test('a field that refuses asks again, with what was typed still in it', async (t) => {

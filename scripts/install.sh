@@ -8,26 +8,38 @@
 #      `--source` copied to `--prefix`;
 #   2. the data directory, and the `.env` the server reads (seeded from `.env.example`, with the
 #      template's production paths rendered for this host);
-#   3. **onboarding** — `node src/admin.js setup` (§2.2.1, §2.3–§2.4), run in `$PREFIX` as the
+#   3. **Tailscale**, before anything is asked (§2.8.1): installed if it is absent, `tailscaled`
+#      enabled and started, and the deployment's own account named the daemon's **operator**. That
+#      last line is the load-bearing one — the daemon answers only root's calls until a user is the
+#      operator, so it is what lets the wizard, which runs as that account, join the tailnet itself
+#      a moment later. Nothing is logged in here. It happens before the mode question because that
+#      question belongs to the wizard and the join that follows it needs root work done first; a
+#      public-only install ends up with Tailscale installed and never logged in, which serves
+#      nothing and holds nothing;
+#   4. **onboarding** — `node src/admin.js setup` (§2.2.1, §2.3–§2.4), run in `$PREFIX` as the
 #      deployment's own account: it writes the mode blocks, the secrets and the **directory file**
-#      in one pass. Then the front door the chosen modes need (§2.8) — Caddy for a public block, and
-#      Tailscale for a private one, installed and enabled there and **logged in by the installer
-#      itself**: `tailscale up` is run, naming the node with `--hostname` (the deployment's own name
-#      unless `--tailscale-hostname` says otherwise, because that address is what a person's phones
-#      dial and what an invitation carries), with a key in `TS_AUTHKEY` when one was given and with
-#      Tailscale's approval link shown in the terminal when none was. The private address the wizard
-#      asked for was a guess on a fresh box — there was no login when it asked — so the installer
-#      reads the machine's own tailnet name back afterwards and corrects `.env` through the wizard.
-#      The login never fails the install: with no terminal it is not attempted, and a declined or
-#      timed-out one leaves everything else installed and says which it was. `--no-setup` turns the
-#      phase off and reproduces what this script did before: the directory file has to exist
-#      already, and it says exactly what to write when it does not;
-#   4. `npm ci --omit=dev` in the deployment's own account;
-#   5. the units, rendered for this host's paths and installed, `daemon-reload`, the service
+#      in one pass. When the mode set includes private it also **joins the tailnet there**, between
+#      the mode question and the private address that comes from it: `tailscale up --hostname <the
+#      deployment's name>` (the deployment's own name unless `--tailscale-hostname` says otherwise,
+#      because that address is what a person's phones dial and what an invitation carries), in the
+#      foreground, showing Tailscale's approval link — with a key in `TS_AUTHKEY` when one was
+#      given, which needs no approval. The machine's own tailnet name is then read back and offered
+#      as the private address, to confirm, instead of being asked for blind. The person who chose
+#      the mode is the person the link is shown to, which is the whole point of the join being
+#      there. Then the front door the chosen modes need (§2.8) — Caddy for a public block, and for
+#      a private one the **safety net**: the same login attempted once more for a run the wizard
+#      could not join from (no terminal, a declined link, a key that did not work), the machine's
+#      own name read back, and `.env` corrected through the wizard if the two disagree. The login
+#      never fails the install: with no terminal it is not attempted, and a declined or timed-out
+#      one leaves everything else installed and says which it was. `--no-setup` turns the phase off
+#      and reproduces what this script did before: the directory file has to exist already, and it
+#      says exactly what to write when it does not;
+#   5. `npm ci --omit=dev` in the deployment's own account;
+#   6. the units, rendered for this host's paths and installed, `daemon-reload`, the service
 #      enabled and started, and the backup **timer** enabled — the backup service has no
 #      `[Install]` on purpose, so enabling the timer *is* the install step and forgetting it is a
 #      backup that never runs;
-#   6. `/api/health`, so "installed" means "answering" rather than "the files are in /etc".
+#   7. `/api/health`, so "installed" means "answering" rather than "the files are in /etc".
 #
 # It runs as root on a host with systemd, and refuses rather than half-installing. On a host
 # without systemd — a Mac, a container — it says so and stops: an install that reports success and
@@ -51,21 +63,23 @@
 #                  a Tailscale auth key, for a private deployment: it joins this machine to the
 #                  tailnet without the browser approval a person would otherwise do. The key is
 #                  handed to `tailscale up` through TS_AUTHKEY, so it appears in no transcript and
-#                  no process list. Without it the installer runs the same login and shows the
-#                  approval link in the terminal; where there is no terminal to show it in, it does
-#                  as much as it can and leaves the exact command — with what it will do, and that
+#                  no process list. Without it the wizard runs the same login and shows the
+#                  approval link in the terminal — the join happens inside the onboarding phase,
+#                  before the private address is asked for, so that address is the name the login
+#                  gives this machine; where there is no terminal to show the link in, it does as
+#                  much as it can and leaves the exact command — with what it will do, and that
 #                  re-running the installer afterwards picks the address up by itself.
 #   --tailscale-hostname NAME
-#                  the name the login gives this machine in the tailnet. The private address is
-#                  `<NAME>.<tailnet>.ts.net`, and that address is what a person's phones dial and
-#                  what an invitation carries — so the name should be the one they chose, not the
-#                  one their VPS provider assigned the host. It defaults to the deployment's own
-#                  name, the basename of `--prefix` (`crossbar-dev` for /home/admin/crossbar-dev,
-#                  `crossbar` for the default /home/admin/crossbar), so a private install produces
-#                  a good address with no extra flag; a basename that is not a hostname (`My_Box.v2`)
-#                  is reduced to one (`my-box-v2`), because a directory name may hold characters a
-#                  hostname cannot. A NAME spelled here is used as spelled and refused if it is not
-#                  a hostname.
+#                  the name the login gives this machine in the tailnet, and therefore what the
+#                  private address is. The private address is `<NAME>.<tailnet>.ts.net`, and that
+#                  address is what a person's phones dial and what an invitation carries — so the
+#                  name should be the one they chose, not the one their VPS provider assigned the
+#                  host. It defaults to the deployment's own name, the basename of `--prefix`
+#                  (`crossbar-dev` for /home/admin/crossbar-dev, `crossbar` for the default
+#                  /home/admin/crossbar), so a private install produces a good address with no
+#                  extra flag; a basename that is not a hostname (`My_Box.v2`) is reduced to one
+#                  (`my-box-v2`), because a directory name may hold characters a hostname cannot.
+#                  A NAME spelled here is used as spelled and refused if it is not a hostname.
 #   --dry-run      print every command and change nothing
 #
 # Idempotent: every step either already holds or is re-applied, so a second run is how a unit that
@@ -293,7 +307,30 @@ if [ "$DRY_RUN" != '1' ]; then
     done
 fi
 
-# ── 4. Onboarding: the wizard, the directory file, and the front door ──────────
+# ── 4. Tailscale, before the questions that decide whether it is used ──────────
+# The wizard joins the tailnet itself, and it can only do that as the daemon's operator. On Linux
+# the daemon belongs to root and Tailscale answers nobody else until a user is named the operator,
+# so `prepare_tailscale` — install it if it is absent, start `tailscaled`, `tailscale set
+# --operator=<account>` — runs here, before the phase that asks anything, and nothing about it is
+# a login.
+#
+# Before rather than inside the onboarding phase because inside it there is no root: the question
+# that decides whether Tailscale is wanted at all belongs to the wizard, which runs as the
+# deployment's account, and the join that answers with the private address is the same account's
+# command. An install that turns out to be public-only ends the run with Tailscale installed and
+# never logged in — a daemon in `NeedsLogin` serves nothing and holds nothing — and that is the
+# price of the answer being available at the moment it is asked for.
+#
+# Not fatal: `prepare_tailscale` warns and carries on, so a host that cannot reach Tailscale's
+# repository still installs. The wizard's fallback is today's behaviour (ask, and hand over the
+# instructions), and the front door refuses there instead when a private deployment has no
+# Tailscale at all.
+if [ -z "$NO_SETUP" ]; then
+    step 'tailscale'
+    prepare_tailscale
+fi
+
+# ── 5. Onboarding: the wizard, the directory file, and the front door ──────────
 # The server refuses to start without a directory file, so this phase is where that file comes
 # from: `node src/admin.js setup` (deploy/README.md §2.2.1) is the wizard, it needs nothing but
 # the standard library and the tree copied above, and it writes the mode blocks, the session
@@ -303,14 +340,20 @@ fi
 #
 # The wizard goes first because the *mode* it asks for is what decides whether a private door is
 # wanted at all (`onboard_deployment` in the library, §2.8.1). The private address is the one
-# answer already on the machine — it is the name Tailscale gives this host — but there is no name
-# until a login has happened, and the login is the front-door step *after* the wizard, so the
-# wizard's answer is a guess on a fresh box. That is what the front door's report is for: it reads
-# the machine's own tailnet name back, and when `.env` disagrees it runs the wizard once more with
-# that name — the same file, every other answer and every secret kept — so the address ends up right
-# by construction rather than by the person guessing it.
+# answer already on the machine — it is the name Tailscale gives this host — and as of the step
+# above the machine can be made to have that name from inside the wizard, as the deployment's own
+# account, before the address is asked for: the wizard runs `tailscale up --hostname <the
+# deployment's name>`, shows Tailscale's approval link in this terminal, reads `Self.DNSName` back
+# and offers it as the private address to confirm rather than asking blind. No key is needed for
+# that; `--tailscale-authkey` only removes the approval step.
 #
-# The login also *names* the node (`TAILSCALE_HOSTNAME`, the deployment's own name unless
+# The front door after the wizard is the safety net for a run that could not join there: the same
+# login attempted once more (no terminal for the link, a declined approval, a key that did not
+# work), the machine's own name read back, and the wizard re-run with that name when `.env`
+# disagrees — the same file, every other answer and every secret kept — so the address ends up
+# right by construction even on a host nothing could join from here.
+#
+# The login *names* the node (`TAILSCALE_HOSTNAME`, the deployment's own name unless
 # `--tailscale-hostname` says otherwise): the name is not decoration, it is the first label of the
 # address an invitation carries, and a login that names nothing leaves the provider's name
 # (`srv2011992`) in `.env` and in every invitation built from it. A login the installer could not
@@ -383,7 +426,7 @@ else
     fi
 fi
 
-# ── 5. Dependencies ─────────────────────────────────────────────────────────────
+# ── 6. Dependencies ─────────────────────────────────────────────────────────────
 # `--prefix` so the printed command is the one that runs: `npm ci` deletes `node_modules` and
 # rebuilds it from `package-lock.json`, which is the only way to get the tree the artefact was
 # tested with. It needs the registry or a warm npm cache; there is no build step and `node:sqlite`
@@ -394,7 +437,7 @@ fi
 step 'dependencies'
 run_as_user "$NPM_BIN" ci --prefix "$PREFIX" --omit=dev --no-audit --no-fund
 
-# ── 6. The units ────────────────────────────────────────────────────────────────
+# ── 7. The units ────────────────────────────────────────────────────────────────
 # Rendered for this host's prefix, account and node binary (§`render_unit` in the library) and
 # never edited in the repository: the repository's copies stay a working example of a default
 # deployment, and the file systemd reads is the file a person can read back from /etc.
@@ -431,7 +474,7 @@ if [ -n "$WITH_RELAY" ] || relay_is_present; then
     fi
 fi
 
-# ── 7. Enable, and start ────────────────────────────────────────────────────────
+# ── 8. Enable, and start ────────────────────────────────────────────────────────
 step 'enable, and start'
 # Enable without `--now`: the start is the `restart` below, which is one code path whether this is
 # a first install or a second run over a running deployment.
@@ -458,7 +501,7 @@ else
     say "version: $(json_field "$HEALTH" version)   mode: $(json_field "$HEALTH" mode)   origin: $(json_field "$HEALTH" origin)"
 fi
 
-# ── 8. What is left for a person ────────────────────────────────────────────────
+# ── 9. What is left for a person ────────────────────────────────────────────────
 step 'next steps'
 say "  cd $PREFIX"
 say "  sudo -u $CROSSBAR_USER node src/admin.js mode       # which mode the file is in, and that it loads"
