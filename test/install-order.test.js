@@ -9,6 +9,13 @@
 // `.env` once a login has happened. Both halves write `NETWORK_MODE_PRIVATE_ORIGIN`, which is what
 // an invitation carries, so getting this wrong is an invitation that opens nowhere.
 //
+// That login also *gives* the name the address is built from: `--hostname`, which the installer
+// defaults to the deployment's own name (the basename of `--prefix`) and `--tailscale-hostname`
+// overrides. A keyed install that named nothing would join under whatever the host is called where
+// it is hosted — `srv2011992` on a VPS — and that provider's name is what an invitation would
+// carry. The tests below hold the naming, its default, the override, and that the no-key path is
+// untouched: there the login is the person's, and the flag reaches the command they are handed.
+//
 // Everything here is a real `--dry-run` of `scripts/install.sh` against a scratch prefix: reads
 // are made and changes are printed, never executed. The tailscale command is injected through
 // `TAILSCALE_BIN`, the seam `scripts/lib/deploy.sh` takes instead of reaching for `tailscale`
@@ -44,15 +51,20 @@ if [ "$1" = 'status' ] && [ "$2" = '--json' ]; then
 fi
 `;
 
-/** A scratch deployment holding the guess, and the two files the dry run reads. */
-function scratch(t) {
+/**
+ * A scratch deployment holding the guess, and the two files the dry run reads. `name` is the
+ * prefix's own directory name, which is what a keyed login names the node after unless it is told
+ * otherwise; `hostname` is the private address `.env` already holds, which on a first install with
+ * no login behind it is a guess rather than the name the machine answers at.
+ */
+function scratch(t, name = 'prefix', hostname = GUESS) {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'crossbar-install-order-'));
     t.after(() => fs.rmSync(root, { recursive: true, force: true }));
-    const prefix = path.join(root, 'prefix');
+    const prefix = path.join(root, name);
     fs.mkdirSync(path.join(prefix, 'data'), { recursive: true });
     fs.copyFileSync(EXAMPLE, path.join(prefix, '.env'));
     fs.appendFileSync(path.join(prefix, '.env'),
-        `NETWORK_MODE_PRIVATE_HOSTNAME=${GUESS}\nNETWORK_MODE_PRIVATE_ORIGIN=https://${GUESS}\n`);
+        `NETWORK_MODE_PRIVATE_HOSTNAME=${hostname}\nNETWORK_MODE_PRIVATE_ORIGIN=https://${hostname}\n`);
     const answers = path.join(root, 'answers.json');
     fs.writeFileSync(answers, JSON.stringify({ mode: 'private' }));
     const tailscale = path.join(root, 'tailscale');
@@ -77,6 +89,9 @@ const lineOf = (text, needle) => text.split('\n').findIndex((line) => line.inclu
 /** Every wizard run in a transcript: the one that writes the files, and a correction after it. */
 const wizardRuns = (text) => text.split('\n').filter((line) => line.includes('src/admin.js setup'));
 
+/** The keyed login's own line, or `''` when there is no login in the transcript. */
+const loginLine = (text) => text.split('\n')[lineOf(text, 'TS_AUTHKEY=<hidden>')] ?? '';
+
 test('with an auth key, the login is printed before the wizard asks anything', (t) => {
     const text = dryRun(scratch(t), REAL, ['--tailscale-authkey', 'tskey-auth-test']);
     const login = lineOf(text, 'TS_AUTHKEY=<hidden>');
@@ -89,6 +104,54 @@ test('with an auth key, the login is printed before the wizard asks anything', (
     assert.ok(!text.includes('tskey-auth-test'), 'the auth key is in the transcript');
     assert.match(text.split('\n')[login], /up --operator=\S+/,
         'the deployment account is not named the tailnet operator, so the account cannot read the name');
+});
+
+test('with an auth key, the login names the node after the deployment, and the wizard derives that name', (t) => {
+    // `/home/admin/crossbar-dev` is called `crossbar-dev`, and that is the address a person's
+    // phones should dial — not `srv2011992`, which is what a VPS provider called the host. The
+    // wizard derives `Self.DNSName` straight after this login, so the name the login gives is the
+    // one that lands in NETWORK_MODE_PRIVATE_HOSTNAME: modelled here by a stub that answers the
+    // address that name produces, which is what Tailscale would answer at.
+    const chosen = 'crossbar-dev.tail1234.ts.net';
+    const files = scratch(t, 'crossbar-dev', chosen);
+    const text = dryRun(files, chosen, ['--tailscale-authkey', 'tskey-auth-test']);
+    assert.match(loginLine(text), /--hostname crossbar-dev$/,
+        `the login does not name the node after the deployment:\n${loginLine(text)}`);
+    assert.ok(text.includes(`this machine is on the tailnet as ${chosen}`),
+        `the machine is not reported at the name the login gave it:\n${text}`);
+    // Coherent with the wizard's answer: the derived address *is* that name, so `.env` agrees with
+    // the machine and the front door has nothing to correct.
+    assert.ok(!text.includes('Running the wizard again'),
+        `the installer corrected the address the login had just named:\n${text}`);
+});
+
+test('--tailscale-hostname is the name the keyed login uses instead', (t) => {
+    const text = dryRun(scratch(t, 'crossbar-dev'), REAL,
+        ['--tailscale-authkey', 'tskey-auth-test', '--tailscale-hostname', 'gateway']);
+    assert.match(loginLine(text), /--hostname gateway$/,
+        `the override did not reach the login:\n${loginLine(text)}`);
+    assert.ok(!loginLine(text).includes('crossbar-dev'),
+        `the deployment's own name is still on the login:\n${loginLine(text)}`);
+});
+
+test('a prefix whose own name is not a hostname is derived into one', (t) => {
+    // `require_path` allows capitals, `_` and `.` in a directory name, and none of those is what
+    // Tailscale answers at, so this default is reduced to a DNS label rather than joined raw.
+    const text = dryRun(scratch(t, 'Crossbar_Dev.v2'), REAL, ['--tailscale-authkey', 'tskey-auth-test']);
+    assert.match(loginLine(text), /--hostname crossbar-dev-v2$/,
+        `the prefix was not derived into a hostname:\n${loginLine(text)}`);
+});
+
+test('a --tailscale-hostname that is not a hostname is refused, not reduced', (t) => {
+    const files = scratch(t);
+    const run = spawnSync('bash', [INSTALL, '--dry-run', '--prefix', files.prefix, '--answers',
+        files.answers, '--tailscale-authkey', 'tskey-auth-test', '--tailscale-hostname', 'Gate_way'], {
+        encoding: 'utf8',
+        env: { ...process.env, TAILSCALE_BIN: files.tailscale, TAILNET_NAME: REAL },
+    });
+    assert.notEqual(run.status, 0, `a name that is not a hostname was accepted:\n${run.stdout}`);
+    assert.match(run.stderr, /--tailscale-hostname must be a hostname/);
+    assert.ok(!run.stdout.includes('TS_AUTHKEY'), `something ran before the refusal:\n${run.stdout}`);
 });
 
 test('without a key, a name that disagrees is offered and corrected through the wizard', (t) => {
@@ -121,4 +184,27 @@ test('without a key and not logged in, the report names the one command left', (
     assert.ok(text.includes('but this machine is not logged in yet'), `the final report is silent:\n${text}`);
     assert.ok(text.includes('The one command left is:'), 'the final report does not name the one command');
     assert.ok(text.includes('Re-run this installer afterwards'), 'the final report does not say how it is fixed');
+});
+
+test('without a key the login is the person\'s, and the command left for them is what it always was', (t) => {
+    const files = scratch(t, 'crossbar-dev');
+    const text = dryRun(files, '');
+    // Both places that name the one command left — the front door's report and the install's final
+    // report. The default is not put on it: the installer cannot name a node it has not logged in,
+    // and the front door corrects `.env` to the name the machine answers at once the person's own
+    // login has happened, so nothing here needs to guess.
+    const commands = text.split('\n').filter((line) => line.includes(' up --operator='));
+    assert.ok(commands.length >= 1, `the person's login is not named at all:\n${text}`);
+    for (const command of commands) {
+        assert.ok(!command.includes('--hostname'), `a flag the person did not ask for:\n${command}`);
+    }
+});
+
+test('without a key, a name the person set is the one their own login gives', (t) => {
+    const files = scratch(t, 'crossbar-dev');
+    const text = dryRun(files, '', ['--tailscale-hostname', 'gateway']);
+    // Their login is the one that joins the machine, so the flag has to reach the command they are
+    // handed: otherwise their login joins under the provider's name and the flag means nothing.
+    assert.ok(text.includes(`    sudo ${files.tailscale} up --operator=admin --hostname gateway`),
+        `the person's login does not name the node:\n${text}`);
 });

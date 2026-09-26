@@ -21,8 +21,10 @@
 #     exists for: every command it would run is printed by `--dry-run`, and it can be driven
 #     against a scratch prefix on a machine with no systemd. The order inside it is part of that
 #     contract — a key moves the Tailscale login before the wizard's questions, because the private
-#     address defaults to the name that login gives the machine — and the command that name is read
-#     through is the variable `TAILSCALE_BIN`, so the decision is testable without Tailscale.
+#     address defaults to the name that login gives the machine, so that login has to *give* the
+#     name a person would choose (`--hostname`, defaulted from `--prefix` by
+#     `deployment_tailscale_hostname`) — and the command that name is read through is the variable
+#     `TAILSCALE_BIN`, so the decision is testable without Tailscale.
 #
 # Written against bash 3.2 on purpose: the tarball is built on a Mac and installed on Debian, and
 # both machines have to be able to read these scripts. No arrays, no `${var,,}`, no `local -n`.
@@ -136,6 +138,22 @@ require_account_name() { # require_account_name <value>
     esac
     if [ "${#1}" -gt 32 ]; then
         die "the account name '$1' is longer than 32 characters, which is more than Linux will create"
+    fi
+}
+
+# A tailnet name is not decoration: it is the first label of the private address
+# (`<name>.<tailnet>.ts.net`), which is what `.env` holds and what an invitation carries, so it has
+# to be a hostname — lowercase letters, digits and '-', and not starting or ending with one. A name
+# the person spelled is *refused* rather than reduced: they have a name in mind, and answering with
+# a different one is how an address nobody chose ends up in `.env`. (The name derived from a prefix
+# is reduced instead, because a directory name is not something anybody spelled as a hostname —
+# see `deployment_tailscale_hostname`.)
+require_tailscale_hostname() { # require_tailscale_hostname <value>
+    case "$1" in
+        ''|[!a-z0-9]*|*-|*[!a-z0-9-]*) die "--tailscale-hostname must be a hostname — lowercase letters and digits, with '-' inside but not at either end — and '$1' is not: this name becomes the first label of the private address, which is the address an invitation carries" ;;
+    esac
+    if [ "${#1}" -gt 63 ]; then
+        die "--tailscale-hostname is longer than 63 characters, which is more than one DNS label can be, and the private address is built from it"
     fi
 }
 
@@ -528,6 +546,33 @@ install_public_front_door() { # install_public_front_door
 # command)` take as a parameter rather than reaching for `tailscale` themselves.
 TAILSCALE_BIN="${TAILSCALE_BIN:-tailscale}"
 
+# The name the keyed login gives this machine in the tailnet, and whether the person named it
+# themselves. `install.sh` sets both — it derives the default from `--prefix`, and
+# `--tailscale-hostname` overrides it — and the library reads them the way it reads `PREFIX` and
+# `CROSSBAR_USER`. Empty means "do not name the node", which is what a caller that gave none gets:
+# `tailscale up` then keeps whatever name the host already had. The name is not cosmetic — the
+# wizard derives the private address from it right after the login, and that address is what an
+# invitation carries — which is why the default is the deployment's own name rather than the
+# host's.
+TAILSCALE_HOSTNAME=''
+TAILSCALE_HOSTNAME_GIVEN=''
+
+# The deployment's own name, as a tailnet name: the basename of the prefix, because a person who
+# installs at `/home/admin/crossbar-dev` calls it `crossbar-dev`, and that is the address their
+# phones should dial — not `srv2011992`, which is what a VPS provider happened to call the host.
+#
+# Reduced to a DNS label rather than used raw, because a directory name and a hostname are not the
+# same language: `require_path` allows capitals, `_` and `.`, and none of those is what Tailscale
+# answers at — a `.` would make the address `my.box.<tailnet>.ts.net`, a name nobody asked for, and
+# `_` is not in a hostname at all. So every run of anything else becomes one `-`, the ends are
+# trimmed (a label may not start or end with one) and 63 characters is as long as a label can be.
+deployment_tailscale_hostname() { # deployment_tailscale_hostname <prefix>
+    local name=''
+    name="$(basename "$1" | tr '[:upper:]' '[:lower:]' \
+        | sed 's/[^a-z0-9][^a-z0-9]*/-/g; s/^-*//; s/-*$//' | cut -c1-63 | sed 's/-*$//')"
+    printf '%s' "${name:-crossbar}"
+}
+
 # This machine's tailnet name, from the same field the wizard derives the private address from:
 # `tailscale status --json`'s `Self.DNSName`, with the trailing dot dropped. Empty when Tailscale
 # cannot answer — not installed, not running, or not logged in — which is an ordinary state here
@@ -579,13 +624,44 @@ install_tailscale() {
 # running as the deployment's account, and `doctor`, which runs `tailscale serve status` as it.
 # Without the operator the machine joins the tailnet and that account still cannot see the name
 # the private block has to hold.
+#
+# `--hostname` is the other half of what this login is for. `--tailscale-authkey` does not merely
+# avoid the browser flow: the login happens *before* the wizard's private-hostname question, so
+# whatever it names this machine is what `Self.DNSName` answers and what the wizard derives the
+# private address from. A login that names nothing joins under the host's own name — on a VPS
+# `srv2011992`, assigned by the provider — and that is the name an invitation would carry: the one
+# nobody chose. So the name goes on the command, from `TAILSCALE_HOSTNAME` (defaulted by
+# `install.sh` to the deployment's own name):
+#
+#     tailscale up --operator=admin --hostname crossbar-dev
+#     → crossbar-dev.tailea67b0.ts.net, the name this deployment is known by.
 install_private_front_door() { # install_private_front_door <authkey-or-''>
     local authkey="$1"
     install_tailscale
     if [ -n "$authkey" ]; then
-        if ! run_secret TS_AUTHKEY "$authkey" "$TAILSCALE_BIN" up "--operator=$CROSSBAR_USER"; then
+        set -- "$TAILSCALE_BIN" up "--operator=$CROSSBAR_USER"
+        if [ -n "$TAILSCALE_HOSTNAME" ]; then
+            set -- "$@" --hostname "$TAILSCALE_HOSTNAME"
+        fi
+        if ! run_secret TS_AUTHKEY "$authkey" "$@"; then
             die "tailscale up did not finish with the key given to --tailscale-authkey. Check that the key is valid and has not expired, then run this again — or run 'sudo tailscale up --operator=$CROSSBAR_USER' by hand, which is the same approval in a browser. Nothing else about the deployment needs redoing."
         fi
+    fi
+}
+
+# The login a person runs themselves, when no key was given: the one command left, written once so
+# the front door's report and the install's final report cannot drift apart.
+#
+# `--hostname` is on it when the person named the node with `--tailscale-hostname`. Their login is
+# the one that joins the machine, so a flag that did not reach this command would leave the address
+# as the provider's name and mean nothing. Without the flag the command is what it has always been:
+# the installer cannot name a node it has not logged in, and the front door corrects `.env` to the
+# name the machine answers at once this login has happened (`offer_private_hostname_correction`).
+tailnet_login_command() {
+    if [ -n "$TAILSCALE_HOSTNAME_GIVEN" ]; then
+        printf '%s' "$TAILSCALE_BIN up --operator=$CROSSBAR_USER --hostname $TAILSCALE_HOSTNAME"
+    else
+        printf '%s' "$TAILSCALE_BIN up --operator=$CROSSBAR_USER"
     fi
 }
 
@@ -611,7 +687,7 @@ report_private_front_door() { # report_private_front_door <authkey-or-''>
         fi
     elif [ -z "$name" ]; then
         say 'One step here is still a person'\''s: the login, which approves this machine in a browser.'
-        say "    sudo $TAILSCALE_BIN up --operator=$CROSSBAR_USER"
+        say "    sudo $(tailnet_login_command)"
         say "That names $CROSSBAR_USER the tailnet operator, which is what lets the wizard and doctor"
         say 'read this machine'\''s name; both run as that account. Nothing else about the'
         say 'deployment needs it. Pass --tailscale-authkey <key> to a later run (or to this one) to'

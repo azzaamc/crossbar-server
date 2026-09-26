@@ -234,8 +234,11 @@ Then the front door, for exactly the modes the wizard set up:
   (never argv, so it is in no transcript and no process list), and the login also names the
   deployment's account the tailnet operator (`--operator=<account>`) so the wizard and `doctor` can
   read this machine's name — on Linux the daemon is root's and answers nobody else until an operator
-  is named. The machine's own tailnet name is then read back (as root) and compared with the private
-  block the wizard wrote; a disagreement re-runs the wizard with the name the machine answers at.
+  is named — and names the **node itself** after the deployment (`--hostname`, the basename of
+  `--prefix` unless `--tailscale-hostname` says otherwise, §2.8.1), so the private address is the one
+  the person chose rather than the one the host's provider assigned. The machine's own tailnet name
+  is then read back (as root) and compared with the private block the wizard wrote; a disagreement
+  re-runs the wizard with the name the machine answers at.
   Without a key the **login** is the one part that is a person's: the installer says so plainly,
   names `sudo tailscale up --operator=<account>` as the step left, and makes the same comparison —
   and the same correction — once the login has happened. A private deployment with no login yet
@@ -498,11 +501,33 @@ until a user is named the operator, and the two things that ask are the wizard, 
 private address while running as that account, and `doctor`, which runs `tailscale serve status` as
 it. Without the operator the machine can be joined and that account still cannot see the name.
 
+**That login names the node**, and the name *is* the address. `tailscale up --hostname <name>` makes
+the machine answer at `<name>.<tailnet>.ts.net`, which is what `Self.DNSName` reports, what the
+wizard derives `NETWORK_MODE_PRIVATE_HOSTNAME` from immediately afterwards, and therefore what
+`NETWORK_MODE_PRIVATE_ORIGIN` and every invitation built from it hold. The installer passes **the
+deployment's own name** — the basename of `--prefix`, so `crossbar-dev` for
+`/home/admin/crossbar-dev` and `crossbar` for the default `/home/admin/crossbar` — because that is
+the name the person chose and the one their phones should dial; `--tailscale-hostname <name>`
+replaces it. Naming nothing is what leaves the provider's name in place: a keyed install on a VPS
+would otherwise join as `srv2011992.tailea67b0.ts.net` — assigned by the provider, chosen by nobody —
+and that is the address an invitation would carry.
+
+A prefix whose own name is not a hostname is reduced to one, because a directory name and a hostname
+are not the same language: `/home/admin/My_Box.v2` joins as `my-box-v2`. The reduction is on the
+login line of `--dry-run`, where it can be read before anything runs. A `--tailscale-hostname` that
+is not a hostname, by contrast, is **refused** rather than reduced: that one was spelled by a person,
+and answering with a different name is how an address nobody asked for ends up in `.env`.
+
 Without a key the login is the person's, and it is the one step the installer cannot do — so it
-says plainly that this is what is left and names it:
+says plainly that this is what is left and names it. `--tailscale-hostname <name>` puts
+`--hostname <name>` on that command, because that login is the one that joins the machine and a flag
+that never reached it would mean nothing. Without the flag the command is what it has always been:
+the installer cannot name a node it has not logged in, and the correction below fixes `.env` to the
+name the machine answers at once this login has happened.
 
 ```bash
-sudo tailscale up --operator=<account>   # prints the approval URL; the machine joins as whoever approves it
+sudo tailscale up --operator=<account>                           # prints the approval URL; the machine joins as whoever approves it
+sudo tailscale up --operator=<account> --hostname crossbar-dev   # …and answers at crossbar-dev.<tailnet>.ts.net, the address an invitation carries
 ```
 
 Either way, once `tailscale status --json` answers, the installer reads `Self.DNSName` (with the
@@ -1139,7 +1164,7 @@ rendering of §2.5 — and executes none:
 | Command | What it is |
 | --- | --- |
 | `scripts/release.sh [--out DIR]` | builds `crossbar-server-<version>.tar.gz` and the `.sha256` beside it, from a clean tree |
-| `scripts/install.sh [--prefix DIR] [--user NAME] [--source DIR] [--with-relay] [--answers FILE] [--browser] [--tailscale-authkey KEY] [--no-setup]` | §2.2–§2.6 as one command (§2.2), with the setup wizard (§2.2.1) and the private front door's Tailscale install and login (§2.8.1) |
+| `scripts/install.sh [--prefix DIR] [--user NAME] [--source DIR] [--with-relay] [--answers FILE] [--browser] [--tailscale-authkey KEY] [--tailscale-hostname NAME] [--no-setup]` | §2.2–§2.6 as one command (§2.2), with the setup wizard (§2.2.1) and the private front door's Tailscale install and login (§2.8.1) |
 | `scripts/upgrade.sh --from <tarball>` | stop, snapshot, unpack, install, start, verify, roll back (§5.3) |
 | `scripts/uninstall.sh [--prefix DIR] [--user NAME] [--purge-data]` | stop and remove the units; `--purge-data` for the data directory and `.env` (§5.6) |
 

@@ -11,15 +11,18 @@
 #   3. **onboarding** — with `--tailscale-authkey`, Tailscale is installed, `tailscaled` is enabled
 #      and started, and the login happens **first**, before any question: the private address the
 #      wizard asks for is derived from this machine's own tailnet name, and there is no name until
-#      a login has happened (§2.8.1). Then `node src/admin.js setup` (§2.2.1, §2.3–§2.4), run in
-#      `$PREFIX` as the deployment's own account: it writes the mode blocks, the secrets and the
-#      **directory file** in one pass, and then the front door the chosen modes need — Caddy for a
-#      public block, and Tailscale itself for a private one, installed and enabled here when no key
-#      was given (§2.8). Without a key the login is the person's, so the questions keep their
-#      place; afterwards, a private block that disagrees with the name the machine now answers at
-#      is corrected by running the wizard once more with that name. `--no-setup` turns the phase
-#      off and reproduces what this script did before: the directory file has to exist already,
-#      and it says exactly what to write when it does not;
+#      a login has happened (§2.8.1) — so the login also *names* the node (`--hostname`, the
+#      deployment's own name unless `--tailscale-hostname` says otherwise), because that address is
+#      what a person's phones dial and what an invitation carries, and it should be the name they
+#      chose rather than the one the host's provider assigned it. Then `node src/admin.js setup`
+#      (§2.2.1, §2.3–§2.4), run in `$PREFIX` as the deployment's own account: it writes the mode
+#      blocks, the secrets and the **directory file** in one pass, and then the front door the
+#      chosen modes need — Caddy for a public block, and Tailscale itself for a private one,
+#      installed and enabled here when no key was given (§2.8). Without a key the login is the
+#      person's, so the questions keep their place; afterwards, a private block that disagrees with
+#      the name the machine now answers at is corrected by running the wizard once more with that
+#      name. `--no-setup` turns the phase off and reproduces what this script did before: the
+#      directory file has to exist already, and it says exactly what to write when it does not;
 #   4. `npm ci --omit=dev` in the deployment's own account;
 #   5. the units, rendered for this host's paths and installed, `daemon-reload`, the service
 #      enabled and started, and the backup **timer** enabled — the backup service has no
@@ -35,7 +38,7 @@
 # Usage:
 #   sudo scripts/install.sh [--prefix DIR] [--user NAME] [--source DIR] [--with-relay]
 #                           [--answers FILE] [--browser] [--tailscale-authkey KEY]
-#                           [--no-setup] [--dry-run]
+#                           [--tailscale-hostname NAME] [--no-setup] [--dry-run]
 #
 #   --prefix DIR   where the deployment runs        (env CROSSBAR_HOME, default /home/admin/crossbar)
 #   --user NAME    the account that runs it         (env CROSSBAR_USER, default admin)
@@ -54,6 +57,19 @@
 #                  list. Without it, `sudo tailscale up --operator=<account>` is the one step left;
 #                  the installer says so when it finishes, and offers to correct the private
 #                  address if the machine turns out to answer at another name.
+#   --tailscale-hostname NAME
+#                  the name the keyed login gives this machine in the tailnet. The private address
+#                  is `<NAME>.<tailnet>.ts.net`, and that address is what a person's phones dial and
+#                  what an invitation carries — so the name should be the one they chose, not the
+#                  one their VPS provider assigned the host. It defaults to the deployment's own
+#                  name, the basename of `--prefix` (`crossbar-dev` for /home/admin/crossbar-dev,
+#                  `crossbar` for the default /home/admin/crossbar), so a keyed install produces a
+#                  good address with no extra flag; a basename that is not a hostname (`My_Box.v2`)
+#                  is reduced to one (`my-box-v2`), because a directory name may hold characters a
+#                  hostname cannot. A NAME spelled here is used as spelled and refused if it is not
+#                  a hostname. Without `--tailscale-authkey` there is no login for this installer to
+#                  name the node at, so the flag goes on the login command the report leaves for the
+#                  person instead (`sudo tailscale up --operator=<account> --hostname <NAME>`).
 #   --dry-run      print every command and change nothing
 #
 # Idempotent: every step either already holds or is re-applied, so a second run is how a unit that
@@ -76,6 +92,11 @@ ANSWERS=''
 BROWSER=''
 NO_SETUP=''
 TAILSCALE_AUTHKEY=''
+# The name the keyed login gives this machine; empty means the person did not name it. The library
+# reads both (`TAILSCALE_HOSTNAME`, `TAILSCALE_HOSTNAME_GIVEN`), and `--tailscale-hostname` sets
+# them; the default is derived below, once `--prefix` is known.
+TAILSCALE_HOSTNAME=''
+TAILSCALE_HOSTNAME_GIVEN=''
 
 usage() {
     usage_from "$0"
@@ -96,23 +117,43 @@ while [ "$#" -gt 0 ]; do
         # A secret, and validated as one: an empty key is a typo that would otherwise reach
         # `tailscale up` as "no key at all" and leave the login to a browser without saying so.
         --tailscale-authkey) [ "$#" -ge 2 ] || die '--tailscale-authkey needs a key'; [ -n "$2" ] || die '--tailscale-authkey needs a non-empty key'; TAILSCALE_AUTHKEY="$2"; shift 2 ;;
+        # A name a person spelled, so it is refused rather than reduced when it is not a hostname
+        # (§`require_tailscale_hostname`): it becomes the first label of the private address, which
+        # is what an invitation carries. `TAILSCALE_HOSTNAME_GIVEN` is what keeps this apart from
+        # the default derived from `--prefix` below — the login command a person is handed names
+        # the node only when they asked for a name themselves.
+        --tailscale-hostname) [ "$#" -ge 2 ] || die '--tailscale-hostname needs a name'; require_tailscale_hostname "$2"; TAILSCALE_HOSTNAME="$2"; TAILSCALE_HOSTNAME_GIVEN=1; shift 2 ;;
         --dry-run) DRY_RUN=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) die "unknown argument: $1 (try --help)" ;;
     esac
 done
 
-# `--answers`, `--browser` and `--tailscale-authkey` are all answers to, or work of, the wizard
-# and the front door it installs; this flag says there is no onboarding phase, so together they
-# are a typo that would otherwise install nothing and say nothing about why.
-if [ -n "$NO_SETUP" ] && { [ -n "$ANSWERS" ] || [ -n "$BROWSER" ] || [ -n "$TAILSCALE_AUTHKEY" ]; }; then
-    die '--no-setup turns the onboarding phase off, so --answers, --browser and --tailscale-authkey have nothing to run: pass one or the other'
+# `--answers`, `--browser`, `--tailscale-authkey` and `--tailscale-hostname` are all answers to, or
+# work of, the wizard and the front door it installs; this flag says there is no onboarding phase,
+# so together they are a typo that would otherwise install nothing and say nothing about why.
+if [ -n "$NO_SETUP" ] && { [ -n "$ANSWERS" ] || [ -n "$BROWSER" ] || [ -n "$TAILSCALE_AUTHKEY" ] || [ -n "$TAILSCALE_HOSTNAME" ]; }; then
+    die '--no-setup turns the onboarding phase off, so --answers, --browser, --tailscale-authkey and --tailscale-hostname have nothing to run: pass one or the other'
 fi
 
 # The two values that end up inside a unit file, refused unless they are shaped like what they are
 # (§`require_path` in the library). Checked before anything runs, so a typo costs nothing.
 require_path 'prefix' "$PREFIX"
 require_account_name "$CROSSBAR_USER"
+
+# The name the keyed login gives this machine in the tailnet, when the person did not name it. The
+# private address is `<name>.<tailnet>.ts.net` — the address their phones dial and the one an
+# invitation carries — and the deployment's own name is the one a person would choose, so a keyed
+# install needs no extra flag to produce a good address: `/home/admin/crossbar-dev` joins as
+# `crossbar-dev`, not as whatever the host's provider called it (`srv2011992` on a VPS).
+#
+# Defaulted here, and reduced to a hostname rather than used raw
+# (§`deployment_tailscale_hostname`), because a directory name is not a hostname and this is the
+# one place that knows the prefix was accepted without a name of its own. A name that was spelled
+# is already validated and is left alone.
+if [ -z "$TAILSCALE_HOSTNAME" ]; then
+    TAILSCALE_HOSTNAME="$(deployment_tailscale_hostname "$PREFIX")"
+fi
 
 step 'preconditions'
 if [ ! -d "$SOURCE" ]; then
@@ -270,9 +311,14 @@ fi
 # The order inside this phase is not free. The private address is the one answer already on the
 # machine — it is the name Tailscale gives this host — and with `--tailscale-authkey` the login
 # that gives it happens here, before the wizard (`onboard_deployment` in the library, §2.8.1); a
-# login after the question is a `.env` holding a guess, and an invitation carries that guess.
+# login after the question is a `.env` holding a guess, and an invitation carries that guess. That
+# is also why the login *names* the node (`TAILSCALE_HOSTNAME`, the deployment's own name unless
+# `--tailscale-hostname` says otherwise): the name is not decoration, it is the first label of the
+# address the wizard derives from the login, so a login that names nothing leaves the provider's
+# name (`srv2011992`) in `.env` and in every invitation built from it.
 # Without a key there is nothing to read before the person logs in, so the question keeps its
-# place and the front door's report corrects the file once there is a name to compare it with.
+# place, their own login keeps its own command — with `--hostname` on it if they set a name — and
+# the front door's report corrects the file once there is a name to compare it with.
 #
 # `--no-setup` turns it off and reproduces what this install did before there was a wizard: the
 # directory file has to be there already, and the refusal below says exactly what to write. That
@@ -449,7 +495,7 @@ if [ -n "$TAILSCALE_READY" ] && [ -n "$(env_value NETWORK_MODE_PRIVATE_HOSTNAME)
     say 'gives it, and a name that is not this machine'"'"'s own is an invitation nobody can open.'
     say 'The one command left is:'
     say ''
-    say "    sudo $TAILSCALE_BIN up --operator=$CROSSBAR_USER"
+    say "    sudo $(tailnet_login_command)"
     say ''
     say 'Re-run this installer afterwards: it reads the name this machine answers at, and runs the'
     say 'wizard once more with it if .env disagrees (deploy/README.md §2.8.1).'
