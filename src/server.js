@@ -22,6 +22,15 @@ const { createSignalServer } = require('./signal');
 
 const EXPIRY_SWEEP_MS = 10000;
 
+/**
+ * How often the owed relay deletions are retried.
+ *
+ * Independent of the claim's expiry sweep because it is not about calls at all, and half a
+ * minute because the schedule the queue keeps is measured in tens of seconds: a relay that
+ * comes back is caught within one interval of its first due attempt.
+ */
+const RELAY_DELETION_SWEEP_MS = 30000;
+
 function createCrossbarServer({ config = loadConfig(), log } = {}) {
     const logger = log || createLogger({ level: config.nodeEnv === 'production' ? 'info' : 'debug' });
 
@@ -83,6 +92,17 @@ function createCrossbarServer({ config = loadConfig(), log } = {}) {
     }, EXPIRY_SWEEP_MS);
     expiryTimer.unref?.();
 
+    // The relay removals this server still owes, retried until the relay confirms them. Not
+    // swept once at startup: a deployment coming back from a relay outage has them due
+    // immediately anyway, and a process that is restarted in a loop should not open with a
+    // burst of requests.
+    const relayDeletionTimer = setInterval(() => {
+        lifecycle.retryPendingRelayDeletions().catch((error) => {
+            logger.error('relay_deletion_sweep_failed', { message: String(error && error.message).slice(0, 200) });
+        });
+    }, RELAY_DELETION_SWEEP_MS);
+    relayDeletionTimer.unref?.();
+
     let listening = null;
 
     function listen() {
@@ -115,6 +135,7 @@ function createCrossbarServer({ config = loadConfig(), log } = {}) {
 
     function close() {
         clearInterval(expiryTimer);
+        clearInterval(relayDeletionTimer);
 
         // Every device still in a call is closed out before the store goes away, so
         // a restart does not leave rows claiming people are in calls they have left.

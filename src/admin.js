@@ -293,6 +293,48 @@ const NEEDS_STORE = new Set([
 ]);
 
 /**
+ * The relay's half of taking a device out of use, for the commands that do it.
+ *
+ * The HTTP admin routes forgot a device at the relay; these commands wrote the row and told
+ * nobody, so a phone revoked from the shell kept a live registration at the relay owning its
+ * PushKit token — and after `remove-device` the row was gone, so nothing could ever clear it
+ * and the phone could not be rung by whichever server it enrolled with next (SEC-RELAY-03).
+ *
+ * The queue is the lifecycle's, and it is the same one the routes and the app's own unpair go
+ * through: attempted now, and written down as an intent when the relay refuses so the running
+ * server's sweep retries until the relay says the device is gone. Required here rather than at
+ * the top of the file because `lifecycle` reaches `./push`, which needs `web-push` from
+ * `node_modules` — and `setup` runs on a fresh host before `npm ci`.
+ *
+ * The local action has already happened and is not turned into an error by any of this; what
+ * the relay answered is said, because a registration left behind is silent otherwise.
+ */
+async function releaseAtRelay(config, store, deviceId) {
+    const { createRelayDeletions } = require('./lifecycle');
+    const { createPushRelayClient } = require('./pushrelay');
+    // A refusal and the reason for it are what whoever ran this needs to see. The client never
+    // logs the credential, the PushKit token or a body, so this stream is safe to be a console.
+    const log = {
+        warn: (event, fields) => console.error(`  ${event} ${JSON.stringify(fields)}`),
+        info() {},
+        error() {},
+    };
+    const relay = createPushRelayClient({ config, log });
+    if (!relay.enabled) return;
+
+    const { queued, outcome } = await createRelayDeletions({ store, relay, log })
+        .forgetDeviceAtRelay(deviceId);
+    if (!queued) {
+        console.log(outcome?.status === 404
+            ? '  Relay: it had no registration for this device.'
+            : '  Relay: the registration is gone.');
+        return;
+    }
+    console.error('  Relay: it still holds this device, so the removal is queued and this server'
+        + ' keeps retrying until it does not.');
+}
+
+/**
  * The headers every request this CLI makes to the running server carries.
  *
  * The CLI asks the live process over the loopback it already treats as its proxy, and in
@@ -483,6 +525,10 @@ async function main(argv) {
                 console.log(revoked
                     ? `Revoked ${deviceId} (${device.label || 'unlabelled'}). They keep their other devices.`
                     : `${deviceId} was already revoked.`);
+                // Told either way: an earlier revocation may predate this command, or its relay
+                // call may never have got there, and a registration left behind is what stops the
+                // phone being rung by whichever server it enrols with next.
+                await releaseAtRelay(config, store, deviceId);
                 return revoked ? 0 : 1;
             }
 
@@ -501,6 +547,9 @@ async function main(argv) {
                 console.log(removed
                     ? `Removed ${deviceId} (${device.label || 'unlabelled'}) from the records.`
                     : `No device ${deviceId}.`);
+                // Last, because the row this command just deleted is the only record of the
+                // device, and the registration it left at the relay outlives it.
+                await releaseAtRelay(config, store, deviceId);
                 return removed ? 0 : 1;
             }
 

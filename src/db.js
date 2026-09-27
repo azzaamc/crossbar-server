@@ -108,6 +108,23 @@ CREATE INDEX IF NOT EXISTS idx_push_subscriptions_user ON push_subscriptions(use
 const ID_PATTERN = /^[a-z0-9][a-z0-9_-]{0,63}$/i;
 const DEVICE_ID_PATTERN = /^[A-Za-z0-9_-]{8,64}$/;
 
+/**
+ * A device id that already belongs to somebody else.
+ *
+ * Its own type because the route answers it differently from a malformed id: a `409` rather
+ * than a `400`, and the caller is told the id is taken rather than that the request was
+ * wrong. It carries the id so whoever logs the refusal can name the device without the
+ * message having to.
+ */
+class DeviceOwnershipError extends Error {
+    constructor(deviceId) {
+        super('That device id belongs to another device.');
+        this.name = 'DeviceOwnershipError';
+        this.code = 'DEVICE_OWNED';
+        this.deviceId = deviceId;
+    }
+}
+
 function addColumnIfMissing(db, table, column, definition) {
     const columns = db.prepare(`PRAGMA table_info(${table})`).all().map((row) => row.name);
     if (columns.includes(column)) return false;
@@ -288,6 +305,43 @@ const MIGRATIONS = [
                 db.exec('DROP TABLE groups');
             }
             db.exec('ALTER TABLE family_groups RENAME TO groups');
+        },
+    },
+    {
+        version: 7,
+        apply(db) {
+            // A relay removal is two facts, and only one of them is on this machine. Deleting
+            // the local row is immediate and certain; the relay's copy is a request that can
+            // time out, and a timeout leaves the relay's row owning the phone's PushKit token
+            // — so the next server the phone enrols with is refused with `409 token_conflict`
+            // and the phone cannot be rung by anybody until an operator intervenes (relay
+            // `docs/API.md`, "`409 token_conflict` and a phone that moves between servers").
+            //
+            // The request therefore outlives the attempt: a row here is the *intent* to take
+            // a device out of the relay, written before the call and kept until the relay
+            // answers `2xx` (removed) or `404` (not registered to this installation — never
+            // was, already removed, or removed by an attempt whose answer was lost). It
+            // deliberately has no foreign key to `devices`: the row it is about is usually
+            // gone by the time this is settled, and a cascade would be exactly the silent
+            // abandonment this table exists to prevent.
+            //
+            // `next_attempt_at` is the schedule: the sweep in `lifecycle.js` takes the rows
+            // that are due and pushes the rest back with a growing delay, so a relay that is
+            // down is retried without being hammered, and a request is never dropped for
+            // having failed. `attempts` and `last_error` are there so an operator looking at
+            // the row can see how long it has been owed and what the relay last said.
+            db.exec(`
+                CREATE TABLE IF NOT EXISTS pending_relay_deletions (
+                  device_id TEXT PRIMARY KEY,
+                  requested_at TEXT NOT NULL,
+                  attempts INTEGER NOT NULL DEFAULT 0,
+                  last_attempt_at TEXT,
+                  next_attempt_at TEXT NOT NULL,
+                  last_error TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_pending_relay_deletions_due
+                  ON pending_relay_deletions(next_attempt_at);
+            `);
         },
     },
 ];
@@ -635,15 +689,29 @@ class Store {
     /**
      * A device identifies an install, not a person. It is what makes "this device is
      * in this call" answerable, and what a push token belongs to.
+     *
+     * The id comes from the client, so the row it names may already exist — a phone that
+     * re-registers after a reinstall, or that changes its label. That update is confined to a
+     * row this same person already holds, because an id is not a claim on somebody else's
+     * install: `WHERE devices.user_id = excluded.user_id` refuses the rest *inside the
+     * statement that would otherwise write*, so there is no read-then-write window in which
+     * the row could change hands. Without it the upsert reassigned `user_id`, which handed the
+     * row — its push token, its VoIP token, its public key — to whoever named that id, and
+     * made the ownership check on the registration route meaningless (SEC-RELAY-01).
      */
     registerDevice({ userId, deviceId, label = '', platform = '', now }) {
         if (!DEVICE_ID_PATTERN.test(String(deviceId || ''))) throw new Error('Invalid device id');
-        this.db.prepare(`
+        const result = this.db.prepare(`
             INSERT INTO devices (id, user_id, label, platform, created_at, last_seen_at)
             VALUES (?, ?, ?, ?, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET user_id=excluded.user_id, label=excluded.label,
-              platform=excluded.platform, last_seen_at=excluded.last_seen_at
+            ON CONFLICT(id) DO UPDATE SET label=excluded.label, platform=excluded.platform,
+              last_seen_at=excluded.last_seen_at
+            WHERE devices.user_id = excluded.user_id
         `).run(deviceId, userId, cleanOptional(label, 60), cleanOptional(platform, 40), now, now);
+        // Zero changed rows is reachable exactly one way: the id exists and belongs to somebody
+        // else, so the guarded update wrote nothing. The insert of a fresh id and the update of
+        // this person's own row both report one.
+        if (result.changes === 0) throw new DeviceOwnershipError(deviceId);
         return this.deviceById(deviceId);
     }
 
@@ -705,6 +773,52 @@ class Store {
         return this.db.prepare(`
             UPDATE devices SET voip_token = NULL, voip_environment = NULL WHERE id = ?
         `).run(deviceId).changes === 1;
+    }
+
+    /**
+     * A relay removal this server owes, recorded before it is attempted and kept after it
+     * fails.
+     *
+     * The local half of "this device is gone" is a statement, and the relay's half is a
+     * request: it can time out, and a timeout leaves the relay's row owning the phone's
+     * PushKit token, which then cannot be registered by any other server. So the intent is
+     * durable — written in the same transaction as the local change, in `revokeDevice` — and
+     * the sweep in `lifecycle.js` retries it until the relay answers `2xx` or `404`. Asking
+     * again for a device that is already revoked resets the schedule rather than being
+     * ignored: it is a new request for the same thing.
+     */
+    addPendingRelayDeletion(deviceId, now) {
+        this.db.prepare(`
+            INSERT INTO pending_relay_deletions (device_id, requested_at, attempts, next_attempt_at)
+            VALUES (?, ?, 0, ?)
+            ON CONFLICT(device_id) DO UPDATE SET requested_at = excluded.requested_at,
+              attempts = 0, last_attempt_at = NULL, next_attempt_at = excluded.next_attempt_at,
+              last_error = NULL
+        `).run(deviceId, now, now);
+    }
+
+    /** The owed relay deletions that are due, oldest first. `dueAt` and the caller's clock are one. */
+    pendingRelayDeletions(dueAt, limit) {
+        return this.db.prepare(`
+            SELECT device_id AS deviceId, attempts
+            FROM pending_relay_deletions WHERE next_attempt_at <= ?
+            ORDER BY next_attempt_at LIMIT ?
+        `).all(dueAt, limit);
+    }
+
+    /** The relay answered `2xx` or `404`: it has no registration for this device. Nothing is owed. */
+    clearPendingRelayDeletion(deviceId) {
+        return this.db.prepare('DELETE FROM pending_relay_deletions WHERE device_id = ?')
+            .run(deviceId).changes === 1;
+    }
+
+    /** Another attempt, later. `attempts` is what the caller's backoff is measured from. */
+    deferPendingRelayDeletion({ deviceId, now, nextAttemptAt, error }) {
+        this.db.prepare(`
+            UPDATE pending_relay_deletions
+               SET attempts = attempts + 1, last_attempt_at = ?, next_attempt_at = ?, last_error = ?
+             WHERE device_id = ?
+        `).run(now, nextAttemptAt, cleanOptional(error, 60), deviceId);
     }
 
     /**
@@ -780,13 +894,28 @@ class Store {
      * token is dropped so nothing is delivered to it, but the row stays: an iPhone
      * that was replaced is a fact worth keeping, and an audit that cannot see it is
      * not an audit.
+     *
+     * The VoIP token is deliberately *not* dropped here — a rotated PushKit token is the
+     * only way to reach that phone until it reports another — so the row still names the
+     * one registration the relay holds for it. That is why this is where the relay removal
+     * is recorded: only a device that carried a VoIP token can have a registration there,
+     * the intent is written in the same transaction as the revocation, and the record
+     * survives `removeDevice` deleting the row it is about. Anything that revokes a device
+     * — the console, the CLI, a person leaving the directory — therefore leaves a removal
+     * the sweep will finish, rather than a token owned by a server that has forgotten the
+     * phone.
      */
     revokeDevice(deviceId, now) {
-        const result = this.db.prepare(`
-            UPDATE devices SET status = 'revoked', revoked_at = ?, push_token = NULL, push_environment = NULL
-            WHERE id = ? AND status <> 'revoked'
-        `).run(now, deviceId);
-        return result.changes === 1;
+        return this.transaction(() => {
+            const held = this.db.prepare('SELECT voip_token AS token FROM devices WHERE id = ?')
+                .get(deviceId);
+            const revoked = this.db.prepare(`
+                UPDATE devices SET status = 'revoked', revoked_at = ?, push_token = NULL, push_environment = NULL
+                WHERE id = ? AND status <> 'revoked'
+            `).run(now, deviceId).changes === 1;
+            if (revoked && held?.token) this.addPendingRelayDeletion(deviceId, now);
+            return revoked;
+        });
     }
 
     /**
@@ -1448,6 +1577,7 @@ function cleanPushSubscription(subscription) {
 module.exports = {
     Store,
     DEVICE_ID_PATTERN,
+    DeviceOwnershipError,
     identityDisplayName,
     safeAvatar,
     cleanPushSubscription,

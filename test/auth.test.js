@@ -641,7 +641,16 @@ test('a device that still works is not removable, and a revoked one is', async (
 
     const gone = await act('remove');
     assert.equal(gone.status, 200, JSON.stringify(gone.data));
-    assert.deepEqual(gone.data, { removed: true });
+    // The relay's half of the removal is answered beside this server's: `removed` is the row
+    // going, and `relay` is whether the relay still holds the device. With no relay configured
+    // here there is nothing to report but that, and it is reported rather than implied.
+    assert.deepEqual(gone.data, {
+        removed: true,
+        relay: {
+            configured: false, ok: false, outcome: 'retryable', status: 0,
+            error: 'not_configured', retryAfterSeconds: null,
+        },
+    });
 
     // Out of the records, and out of the list an operator sees — which is the whole of
     // what this exists for.

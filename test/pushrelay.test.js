@@ -376,7 +376,9 @@ test('a VoIP token presented to the API is registered with the relay at the same
 
     assert.equal(saved.status, 200);
     assert.equal(saved.data.saved, true, 'the row is this server’s, whatever the relay answers');
-    assert.deepEqual(saved.data.relay, { configured: true, registered: true, error: null });
+    assert.deepEqual(saved.data.relay, {
+        configured: true, ok: true, outcome: 'saved', status: 200, error: null, retryAfterSeconds: null,
+    });
     const [registration] = stub.requests;
     assert.equal(registration.method, 'PUT');
     assert.equal(registration.path, `/v1/devices/${DEVICE_ID}`);
@@ -477,9 +479,12 @@ test('a phone that cannot be reached yet is reported, not raised', async (t) => 
     });
 
     // The token belongs to another server and no retry changes that, so the app is told what
-    // happened rather than being given an error it would retry: "this phone could not be
-    // enabled yet" is a sentence, not a bug (relay docs/BACKEND_INTEGRATION.md, 409).
+    // happened — `permanent` — rather than being given an error it would retry: "this phone
+    // could not be enabled yet" is a sentence, not a bug (relay docs/BACKEND_INTEGRATION.md, 409).
     assert.equal(saved.status, 200);
-    assert.deepEqual(saved.data.relay, { configured: true, registered: false, error: 'token_conflict' });
+    assert.deepEqual(saved.data.relay, {
+        configured: true, ok: false, outcome: 'permanent', status: 409,
+        error: 'token_conflict', retryAfterSeconds: null,
+    });
     assert.equal(server.store.voipTokensFor(['dad']).length, 1, 'this server remembers where the phone is');
 });

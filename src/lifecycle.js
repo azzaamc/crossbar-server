@@ -11,6 +11,53 @@ const machine = require('./calls');
 
 const ID_PATTERN = /^[a-z0-9][a-z0-9_-]{0,63}$/i;
 
+/**
+ * How many times one ring is attempted when the relay never answers at all.
+ *
+ * One repeat is all it takes, and is worth it: the relay records what became of a request
+ * and answers a repeat carrying the same `request_id` from that record (`pushrelay.js`,
+ * `requestIdFor`), so a single repeat decides whether the first attempt was accepted,
+ * refused, or marked a dead token whose answer was lost on the way back. A relay that fails
+ * twice inside one ring's seconds is not going to answer inside them either. Only a request
+ * that never got an answer is repeated — see `ringPhones`.
+ */
+const RING_ATTEMPTS = 2;
+
+/** The wait before that one repeat. Short: this is a phone ringing now. */
+const RING_RETRY_MS = 250;
+
+/** How many owed relay deletions one sweep attempts. */
+const RELAY_DELETION_BATCH = 20;
+
+/**
+ * The schedule for a relay deletion the relay would not confirm.
+ *
+ * Doubling from thirty seconds to a fifteen-minute cap. A relay that is deploying, or down
+ * for an hour, is asked again often enough to finish within a minute of coming back; a
+ * deployment whose relay will never answer costs one request per owed device per fifteen
+ * minutes rather than a burst that hides the problem. The delay never becomes a limit: the
+ * only thing that clears a row is the relay's own `2xx` or `404`, or a later request for
+ * the same device resetting it.
+ */
+const RELAY_DELETION_RETRY_MS = 30000;
+const RELAY_DELETION_RETRY_MAX_MS = 15 * 60 * 1000;
+
+/** A wait, as a promise. Used only for the one ring repeat. */
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * Whether a repeat of a ring can still learn something the first attempt did not.
+ *
+ * Only a request that got no answer at all: the relay records what became of every request it
+ * received and answers a repeat carrying the same `request_id` from that record, so the
+ * repeat is how a lost answer is found again. A refusal this process made before sending
+ * anything — no relay configured, an id the relay would reject — left no record behind and
+ * has nothing to replay, and status 0 is what both of those look like.
+ */
+function worthRepeating(outcome) {
+    return outcome.status === 0 && outcome.error === 'unreachable';
+}
+
 /** Sliding-window limiter, per process. Adequate for a directory, and honest about it. */
 function createLimiter() {
     const buckets = new Map();
@@ -37,8 +84,111 @@ function createLimiter() {
     };
 }
 
+/**
+ * The relay removals this server owes, and the sweep that pays them.
+ *
+ * A device leaves the relay by `DELETE /v1/devices/{id}`, and that request is the one part
+ * of removing a device this machine cannot decide: if it times out, the relay still holds the
+ * row — and the phone's PushKit token with it, so no other server can register the phone
+ * (`409 token_conflict`) and it cannot be rung by anybody. So the intent is durable
+ * (`pending_relay_deletions`, written by `store.revokeDevice` and by `forgetDeviceAtRelay`)
+ * and the sweep retries it until the relay itself says it is done: any `2xx`, or a `404`
+ * meaning the relay has no such registration — never had one, already removed it, or removed
+ * it in answer to an attempt whose reply was lost.
+ *
+ * It is its own factory rather than a closure inside `createLifecycle` because the
+ * operations CLI needs exactly this and nothing else from the lifecycle: a store, a relay
+ * client and a logger, with no event bus, no APNs session and no Web Push module to build
+ * first.
+ */
+function createRelayDeletions({ store, relay, log }) {
+    const now = () => new Date().toISOString();
+
+    /** When the attempt after this one is due, given how many have already failed. */
+    function dueAfter(attempts, at) {
+        const backoff = Math.min(RELAY_DELETION_RETRY_MS * 2 ** attempts, RELAY_DELETION_RETRY_MAX_MS);
+        return new Date(Date.parse(at) + backoff).toISOString();
+    }
+
+    /**
+     * One attempt at one owed deletion, and what it leaves behind.
+     *
+     * `2xx` is the relay having removed the device; `404` is the relay having nothing to
+     * remove. Both are the deletion being *done*, and both clear the row. Everything else —
+     * a request that never got an answer, a `429`, a `5xx`, a `403` from a suspended
+     * installation — leaves the row in place with the next attempt scheduled, because a row
+     * cleared while the relay still holds the token is the orphan this queue exists to
+     * prevent, and a refusal is not a removal no matter how permanent it looks.
+     */
+    async function attempt(row, at) {
+        const outcome = await relay.removeDevice({ deviceId: row.deviceId });
+        if (outcome.ok || outcome.status === 404) {
+            store.clearPendingRelayDeletion(row.deviceId);
+            return { deviceId: row.deviceId, done: true, outcome };
+        }
+        const nextAttemptAt = dueAfter(row.attempts, at);
+        store.deferPendingRelayDeletion({
+            deviceId: row.deviceId,
+            now: at,
+            nextAttemptAt,
+            error: outcome.error || 'unreachable',
+        });
+        log.warn('push_relay_deletion_pending', {
+            deviceId: row.deviceId,
+            status: outcome.status,
+            error: outcome.error || 'unreachable',
+            attempts: row.attempts + 1,
+            retryInSeconds: Math.round((Date.parse(nextAttemptAt) - Date.parse(at)) / 1000),
+        });
+        return { deviceId: row.deviceId, done: false, nextAttemptAt, outcome };
+    }
+
+    /**
+     * Tell the relay a device is gone, now, and go on owing it until the relay says so.
+     *
+     * The durable record is written first, so this call is not what stands between a
+     * deletion and its retry: `store.revokeDevice` already wrote one for every local path
+     * that revokes a device, and a caller reaching here directly gets one too. Asking again
+     * for a device that is already owed resets that row's schedule rather than adding a
+     * second one.
+     *
+     * A relay that refuses or cannot be reached is reported, never raised: the caller is
+     * answering somebody who asked for a removal, and "this server's half is done, the
+     * relay's half is queued" is the truth rather than an error.
+     */
+    async function forgetDeviceAtRelay(deviceId, { at = now() } = {}) {
+        if (!relay.enabled) return { configured: false, queued: false, outcome: null };
+        store.addPendingRelayDeletion(deviceId, at);
+        const { done, outcome } = await attempt({ deviceId, attempts: 0 }, at);
+        return { configured: true, queued: !done, outcome };
+    }
+
+    /**
+     * Every owed deletion that is due, each attempted once.
+     *
+     * In parallel, because the requests are independent and a relay that is down should cost
+     * one deadline rather than a batch of them. `at` is the moment the sweep is running, and
+     * it is the caller's — the same way `store.expireCalls` is given its cutoff — so a test
+     * can say when "now" is rather than waiting for a schedule to come round.
+     */
+    async function retryPendingRelayDeletions({ at = now() } = {}) {
+        if (!relay.enabled) return { configured: false, attempted: 0, settled: [], pending: [] };
+        const due = store.pendingRelayDeletions(at, RELAY_DELETION_BATCH);
+        const results = await Promise.all(due.map((row) => attempt(row, at)));
+        return {
+            configured: true,
+            attempted: due.length,
+            settled: results.filter((result) => result.done).map((result) => result.deviceId),
+            pending: results.filter((result) => !result.done).map((result) => result.deviceId),
+        };
+    }
+
+    return { forgetDeviceAtRelay, retryPendingRelayDeletions };
+}
+
 function createLifecycle({ config, store, bus, push, apns, relay, log }) {
     const limiter = createLimiter();
+    const relayDeletions = createRelayDeletions({ store, relay, log });
     const now = () => new Date().toISOString();
 
     function publicCall(call) {
@@ -138,20 +288,40 @@ function createLifecycle({ config, store, bus, push, apns, relay, log }) {
      * keep in step (`pushrelay.js`, `requestIdFor`), and only a new call or a new device
      * gets a new one.
      *
-     * A push that fails transiently is not retried here and never changes call state: the
-     * ring has the seconds it has, and a call that rings late is worse than one that does
-     * not ring.
+     * A ring the relay *answered* is never sent again: accepted, refused and unknown-device
+     * are all answers, and a second push would be a second ring (`RING_ATTEMPTS`). An attempt
+     * that never got an answer is the exception, and it is repeated with the same
+     * `request_id` — because the relay recorded what became of the first one and answers a
+     * repeat from its record ("The idempotency contract", relay `docs/API.md`). That is what
+     * recovers the ring the relay marked a dead token and whose `410` was lost on the way
+     * back: without the repeat the backend keeps a token the relay will never ring again,
+     * and without the same `request_id` the repeat would ring a phone the relay has already
+     * given up on twice.
+     *
+     * A push the relay answered is not retried here and never changes call state: the ring
+     * has the seconds it has, and a call that rings late is worse than one that does not ring.
      */
     async function ringPhones(devices, call, callerName) {
         if (!devices.length) return [];
-        const outcomes = await Promise.all(devices.map((device) => relay.sendIncomingCall({
-            deviceId: device.deviceId,
-            requestId: relay.requestIdFor(call.id, device.deviceId),
-            callId: call.id,
-            callerId: call.callerId,
-            callerName,
-            hasVideo: call.kind !== 'audio',
-        })));
+        const outcomes = await Promise.all(devices.map(async (device) => {
+            const requestId = relay.requestIdFor(call.id, device.deviceId);
+            let outcome;
+            for (let attempt = 0; attempt < RING_ATTEMPTS; attempt += 1) {
+                if (attempt) await delay(RING_RETRY_MS);
+                outcome = await relay.sendIncomingCall({
+                    deviceId: device.deviceId,
+                    requestId,
+                    callId: call.id,
+                    callerId: call.callerId,
+                    callerName,
+                    hasVideo: call.kind !== 'audio',
+                });
+                // Only an attempt the relay never answered is worth repeating; see
+                // `worthRepeating`.
+                if (!worthRepeating(outcome)) break;
+            }
+            return outcome;
+        }));
         return devices.filter((_, index) => outcomes[index].deviceGone);
     }
 
@@ -395,7 +565,11 @@ function createLifecycle({ config, store, bus, push, apns, relay, log }) {
         pushIncoming,
         emitToParticipants,
         announceOngoing,
+        // The relay half of removing a device, so the console, the CLI and the app's own
+        // unpair all go through one queue (see `createRelayDeletions`).
+        forgetDeviceAtRelay: relayDeletions.forgetDeviceAtRelay,
+        retryPendingRelayDeletions: relayDeletions.retryPendingRelayDeletions,
     };
 }
 
-module.exports = { createLifecycle };
+module.exports = { createLifecycle, createRelayDeletions };

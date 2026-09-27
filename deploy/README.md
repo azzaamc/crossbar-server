@@ -543,7 +543,7 @@ Three settings go in `.env`, in the names the operator's `relay-admin.mjs create
 
 | Setting | What it is |
 | --- | --- |
-| `CROSSBAR_PUSH_RELAY_URL` | the relay's origin, e.g. `https://crossbar-push-dev.<account>.workers.dev` |
+| `CROSSBAR_PUSH_RELAY_URL` | the relay's origin, e.g. `https://crossbar-push-dev.<account>.workers.dev`; plain `http:` is refused at start-up unless the host is loopback, because the installation credential travels on every request |
 | `CROSSBAR_PUSH_RELAY_TOKEN` | the credential, `cbr_…` — a **server secret** |
 | `CROSSBAR_PUSH_RELAY_INSTALLATION_ID` | the relay's `ins_…` for this household; nothing sends it, it is what names an installation in a log line |
 
@@ -559,27 +559,42 @@ How the pieces move:
    `POST /api/devices/push-token` with `kind: "voip"`. That endpoint now also registers the token
    with the relay, under the same opaque id — this server's `dev_…` device id *is* the relay's
    `device_id`, so there is no mapping table to keep in step.
-2. The answer carries a `relay` object beside `saved`: `{"configured": true, "registered": true,
-   "error": null}`. `saved` is about this server's row; `relay` is about whether a call can reach
-   the phone. A `409 token_conflict` means the PushKit token is already registered to *another*
-   server and only that server's removal, or the relay operator, can free it — read it as "this
-   phone could not be enabled yet", not as a bug to retry.
-3. On an incoming call the server posts one `POST /v1/push/voip` per invited phone, each with a
+2. The answer carries a `relay` object beside `saved`: `{"configured": true, "ok": true,
+   "outcome": "saved", "status": 200, "error": null, "retryAfterSeconds": null}`. `saved` is
+   about this server's row; `relay` is about whether a call can reach the phone, and it is what
+   the app acts on — it clears its held token only for `outcome: "saved"`. `retryable` is a
+   request that can still succeed: one that never arrived (`status: 0`), a `429`, any `5xx`, a
+   `409 request_in_progress`, or a deployment with no relay configured yet — and the app keeps
+   the token and tries again. `permanent` is `409 token_conflict`: the PushKit token is
+   registered to *another* server, and only that server's removal, or the relay operator, frees
+   it. Read the permanent one as "this phone could not be enabled yet", not as a bug to retry.
+   `saved: true` never stands in for the relay's answer, and the route is rate-limited like its
+   sibling `/api/push/subscriptions`.
+3. An app on its way out of a deployment — unpaired or signed out — releases its own
+   registration with `DELETE /api/devices/{device_id}`, carrying its device session. Any id but
+   the calling device is refused, so an enrolled phone cannot unring somebody else's; the device
+   is revoked here (its key stops working and the record stays) and the relay's answer comes back
+   in the same `relay` object. A `404` from the relay counts as done, because it has no such
+   registration. Without this call a re-enrolled phone keeps its token claimed at the relay.
+4. On an incoming call the server posts one `POST /v1/push/voip` per invited phone, each with a
    `request_id` derived from the call and the device. That derivation is what makes a retry a
    retry: the same ring repeated after a timeout carries the same id, so the relay replays its
    first answer rather than waking the phone twice.
-4. A rotated PushKit token is an update at the same device id — an upsert, not a second device. A
+5. A rotated PushKit token is an update at the same device id — an upsert, not a second device. A
    `410 device_unregistered` means Apple has told the relay the token is dead: this server clears
    it, exactly as it always cleared a dead APNs token, and the phone files a new one the next time
-   the app launches. Revoking or removing a device — in the console, or by removing a person from
-   the directory — also removes it at the relay, which is what frees the token for whichever server
-   the phone moves to.
-5. The **missed-call notification still goes to Apple from this deployment**, because the relay is
+   the app launches. Revoking or removing a device — in the console, with
+   `node src/admin.js revoke-device|remove-device`, or by removing a person from the directory —
+   also removes it at the relay, which is what frees the token for whichever server the phone
+   moves to. A relay that refuses is not an error for whoever asked: the removal is written down
+   as owed and retried by the running server until the relay answers `2xx` or `404`, so a lost
+   reply cannot leave a phone that nobody can ring.
+6. The **missed-call notification still goes to Apple from this deployment**, because the relay is
    a VoIP-only transport — so `CROSSBAR_APNS_*` stays configured for that. They fail separately: a
    wrong APNs key costs the missed-call line and nothing else, and a relay that cannot be reached
    costs the ring and nothing else. Neither changes a call's state; a ring is fire-and-forget with
    a logged failure.
-6. Web Push and the realtime `incoming-call` event are unchanged. A native app may receive more
+7. Web Push and the realtime `incoming-call` event are unchanged. A native app may receive more
    than one of them, and it deduplicates on the call id — which is why the push and the event carry
    the same one, and why a push can never name a call the app cannot then go and read.
 
@@ -602,7 +617,10 @@ configured at all; the journal — `push_relay_not_configured` (a phone holds a 
 is nowhere to send it), `push_relay_refused` (with the relay's status and error code: a
 `device_unregistered` clears that phone's token, a `token_conflict` on a registration needs the
 other server), `push_relay_unreachable` (a timeout or a dropped connection — the ring is not
-retried, because a call that arrives late is worse than one that does not arrive); and
+retried, because a call that arrives late is worse than one that does not arrive),
+`push_relay_deletion_pending` (a device removal the relay has not confirmed: it is owed and
+retried until the relay answers `2xx` or `404`, and until then that phone's token stays claimed
+by this installation); and
 `curl -sS "$CROSSBAR_PUSH_RELAY_URL/v1/health"`, which needs no credential and says which Apple
 environment the relay is deployed against. The relay's own logs answer the other half, with a
 `push` line carrying `apns_status` and `apns_reason` per device.

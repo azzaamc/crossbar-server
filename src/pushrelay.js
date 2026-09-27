@@ -124,26 +124,66 @@ function callerText(value) {
     return String(value ?? '').replace(CONTROL_CHARACTERS, '').slice(0, CALLER_TEXT_LIMIT);
 }
 
+/** The scheme a refused origin named, and why it is not being used. */
+const ORIGIN_REFUSALS = {
+    plaintext: 'http: would send the installation credential in cleartext; only a loopback relay may use it',
+    not_http: 'the relay is addressed over https: only',
+    unparseable: 'the setting is not a URL',
+};
+
+/** Whether a host resolves to this machine, where a plaintext origin cannot be read off the wire. */
+function isLoopbackHost(hostname) {
+    // A bracketed IPv6 literal arrives as `[::1]`; Node folds the rest to lower case.
+    const host = hostname.startsWith('[') && hostname.endsWith(']') ? hostname.slice(1, -1) : hostname;
+    if (host === 'localhost' || host === '::1') return true;
+    // The whole 127/8 block, and only that: `127.0.0.1.example.com` is somebody else's host.
+    const octets = host.split('.');
+    return octets.length === 4 && octets[0] === '127'
+        && octets.every((part) => /^\d{1,3}$/.test(part) && Number(part) <= 255);
+}
+
 /**
- * The relay's origin, or empty when the setting is missing or is not an HTTP one.
+ * The relay's origin, and — when there is none — the scheme this client will not use.
  *
- * `http:` is allowed on purpose: the relay is reachable over plain HTTP in a local
- * deployment, and refusing to speak to one would make the client untestable without a
- * certificate. A deployment that rings real phones names an `https:` worker, and a
- * misspelled scheme is refused here rather than turning every push into a transport error.
+ * `https:` is the only scheme that can carry the installation credential: the relay
+ * authenticates every call with a `Bearer` secret that authorises ringing every phone this
+ * installation has registered, so a plaintext `http:` relay hands that secret to anything on
+ * the path — every registration and every ring, for the life of the deployment, with nothing
+ * in the traffic looking wrong. A loopback `http:` relay is the one exception: a deployment on
+ * this machine has no path on which to be read, and it is how the relay's own contract tests
+ * and a local relay are reached without a certificate. Everything else — a non-loopback
+ * `http:`, a misspelled or non-HTTP scheme, a value that is not a URL — is refused at
+ * construction, where it is one log line, rather than on every push, where it is a phone that
+ * never rings for a reason nobody can see.
  */
 function originOf(value) {
-    if (!value) return '';
+    if (!value) return { origin: '', refusal: null, scheme: '' };
+    let url;
     try {
-        const url = new URL(value);
-        return url.protocol === 'https:' || url.protocol === 'http:' ? url.origin : '';
+        url = new URL(value);
     } catch {
-        return '';
+        return { origin: '', refusal: 'unparseable', scheme: '' };
     }
+    if (url.protocol === 'https:') return { origin: url.origin, refusal: null, scheme: url.protocol };
+    if (url.protocol === 'http:' && isLoopbackHost(url.hostname)) {
+        return { origin: url.origin, refusal: null, scheme: url.protocol };
+    }
+    return { origin: '', refusal: url.protocol === 'http:' ? 'plaintext' : 'not_http', scheme: url.protocol };
 }
 
 function createPushRelayClient({ config, log, fetch: fetchImpl = globalThis.fetch }) {
-    const baseUrl = originOf(config.pushRelayUrl);
+    const configured = originOf(config.pushRelayUrl);
+    const baseUrl = configured.origin;
+    if (configured.refusal) {
+        // Named here rather than met on the first push: with no origin there is no relay, and
+        // this line is the only thing that separates "nobody configured it" from "it was
+        // configured and refused".
+        log.warn('push_relay_origin_refused', {
+            scheme: configured.scheme || null,
+            reason: configured.refusal,
+            message: ORIGIN_REFUSALS[configured.refusal],
+        });
+    }
     const credential = config.pushRelayToken || '';
     // The relay derives the installation from the credential and has no field for it, so this
     // value is never sent: it is here so a log line can name the installation a refusal came
@@ -176,8 +216,14 @@ function createPushRelayClient({ config, log, fetch: fetchImpl = globalThis.fetc
      * `auth` is false for the health route alone: the relay reads no credential there, and
      * sending one to an endpoint that does not need it is a secret on a path it has no
      * business travelling.
+     *
+     * `deviceScoped` marks the two routes that address one device's *registration*. It is
+     * what makes their `404 not_found` readable: a `404` there is not "no such path", it is
+     * the relay saying it has no registration for this device (`API.md`, `POST /v1/push/voip`
+     * and `DELETE /v1/devices/{id}`), which is the only way a backend can learn of a `410`
+     * that was sent but whose answer never arrived.
      */
-    async function call(method, path, { json, auth = true, deviceId = null } = {}) {
+    async function call(method, path, { json, auth = true, deviceId = null, deviceScoped = false } = {}) {
         const endpoint = `${method} ${path}`;
         const headers = { accept: 'application/json' };
         if (auth) headers.authorization = `Bearer ${credential}`;
@@ -215,10 +261,21 @@ function createPushRelayClient({ config, log, fetch: fetchImpl = globalThis.fetc
         }
 
         const error = typeof parsed?.error === 'string' ? parsed.error : 'unknown_error';
+        // Two answers say the relay holds no registration for this device. `410` is APNs
+        // reporting the token dead; `404` is the relay itself not finding the device — never
+        // registered, already removed, marked inactive by an APNs refusal, or belonging to
+        // another installation. All of those mean the same thing to the caller: this token
+        // cannot be rung from here. A `410` whose answer was lost is *only* ever learned from
+        // the second, which is why a transport-failed ring is retried with its own
+        // `request_id` and why that retry can come back `404` (relay `API.md`, "The
+        // idempotency contract", last bullet).
+        const deviceGone = deviceScoped
+            && ((response.status === 410 && error === 'device_unregistered')
+                || (response.status === 404 && error === 'not_found'));
         const outcome = answered(false, response.status, error, {
             retryAfterSeconds: retryAfter(response.headers.get('retry-after')),
             permanent: permanence(response.status, error),
-            deviceGone: response.status === 410 && error === 'device_unregistered',
+            deviceGone,
             body: parsed,
         });
         log.warn('push_relay_refused', {
@@ -251,14 +308,19 @@ function createPushRelayClient({ config, log, fetch: fetchImpl = globalThis.fetc
 
     /**
      * Takes a device out of the relay, which is also what frees its token for the next
-     * server that presents it. A `404` means the relay does not have it — because it never
-     * did, or because this already happened — and the caller reads that as done.
+     * server that presents it.
+     *
+     * A `404 not_found` means the relay has no registration for this device — it never had
+     * one, or this already happened, or the device belongs to another installation — and it
+     * is "done" rather than a failure: there is nothing left to free. The outcome keeps
+     * `ok: false` (the relay removed nothing) and names the status, so the caller that owns
+     * the retry decision reads it as done without pretending a removal happened.
      */
     async function removeDevice({ deviceId }) {
         if (!enabled) return localRefusal('not_configured');
         const id = String(deviceId || '');
         if (!DEVICE_ID_PATTERN.test(id)) return localRefusal('invalid_device_id');
-        return call('DELETE', `/v1/devices/${id}`, { deviceId: id });
+        return call('DELETE', `/v1/devices/${id}`, { deviceId: id, deviceScoped: true });
     }
 
     /**
@@ -289,6 +351,7 @@ function createPushRelayClient({ config, log, fetch: fetchImpl = globalThis.fetc
                 has_video: hasVideo === true,
             },
             deviceId: id,
+            deviceScoped: true,
         });
     }
 

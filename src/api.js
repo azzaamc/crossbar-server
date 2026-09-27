@@ -185,35 +185,90 @@ function createRequestHandler({ config, store, bus, push, apns, relay, lifecycle
     // docs/BACKEND_INTEGRATION.md, "The lifecycle").
 
     /**
+     * How a relay attempt must be read, which is now part of what the routes answer.
+     *
+     * `saved`/`removed` is the end state reached. `retryable` means the same request sent
+     * again could yet succeed: it never arrived (`status: 0`), the relay answered 5xx or 429,
+     * another attempt holds the idempotency claim, or this deployment has no relay configured
+     * yet — a setting an operator can add, which is why it is retryable rather than a fact.
+     * `permanent` is a refusal asking again cannot change, which in this vocabulary is
+     * `409 token_conflict`: some other installation owns the token.
+     *
+     * Retryability is decided here rather than read off the client's `permanent` because that
+     * flag answers a different question. For a *ring* a relay that is broken is worth giving
+     * up on; for a *registration* the phone repeats anyway a 5xx is worth retrying, and 5xx is
+     * exactly where the two answers differ.
+     */
+    const RETRYABLE_LOCAL_ERRORS = new Set(['not_configured', 'unreachable']);
+
+    function retryableOrPermanent(outcome) {
+        // A refusal this process made without asking the relay carries status 0 too, so the
+        // status alone cannot tell "no relay configured" from "the token was never a token".
+        if (outcome.status === 0) return RETRYABLE_LOCAL_ERRORS.has(String(outcome.error)) ? 'retryable' : 'permanent';
+        if (outcome.status >= 500 || outcome.status === 429) return 'retryable';
+        if (outcome.status === 409 && outcome.error === 'request_in_progress') return 'retryable';
+        return 'permanent';
+    }
+
+    /**
+     * The relay's answer, as the route that asked for it must report it.
+     *
+     * Nothing here is the credential, the token or the relay's body: `error` is the relay's own
+     * code, which is what an operator acts on and what an app branches on, and it is the same
+     * vocabulary the ring path logs.
+     */
+    function relayReport(outcome, endState) {
+        if (!outcome || outcome.error === 'not_configured') {
+            return {
+                configured: false, ok: false, outcome: 'retryable', status: 0,
+                error: 'not_configured', retryAfterSeconds: null,
+            };
+        }
+        // A device the relay does not have answers `404`, which for a removal is the end state:
+        // either it never had it or this already happened (relay docs/API.md).
+        if (endState === 'removed' && outcome.status === 404) {
+            return {
+                configured: true, ok: true, outcome: 'removed', status: 404,
+                error: outcome.error || null, retryAfterSeconds: null,
+            };
+        }
+        return {
+            configured: true,
+            ok: outcome.ok,
+            outcome: outcome.ok ? endState : retryableOrPermanent(outcome),
+            status: outcome.status,
+            error: outcome.error || null,
+            retryAfterSeconds: outcome.retryAfterSeconds ?? null,
+        };
+    }
+
+    /**
      * Makes a phone ringable: registers its VoIP token with the relay.
      *
-     * The token is stored locally either way, so a refusal is reported rather than raised —
-     * a `409 token_conflict` means another server registered this PushKit token first and
-     * only that server's removal (or the relay operator) can free it, which the app can say
-     * to a person as "this phone could not be enabled yet". `saved` and `relay` are separate
-     * on purpose: the first is about this server's row, the second about whether a call can
-     * reach the phone.
+     * The token is stored locally either way, and that is the point of the two answers being
+     * separate. `saved` is this server's row; `relay` is whether a call can reach the phone,
+     * and it is the whole of what the app needs to decide whether to keep the token pending
+     * and try again (SEC-RELAY-07, REL-RELAY-01). A deployment with no relay is refused inside
+     * the client, which is the one place that knows.
      */
-    async function enableRingable(deviceId, token) {
-        if (!relay.enabled) return { configured: false, registered: false, error: 'not_configured' };
-        const outcome = await relay.registerDevice({ deviceId, token });
-        return { configured: true, registered: outcome.ok, error: outcome.error || null };
+    async function registerAtRelay(deviceId, token) {
+        return relayReport(await relay.registerDevice({ deviceId, token }), 'saved');
     }
 
     /**
      * Tells the relay a device is gone, so its token stops being ringable here and is free
      * for whoever owns it next.
      *
-     * A device the relay does not have answers `404` — either it never had it, or this
-     * already happened — and that is "removed" rather than a failure (relay docs/API.md,
-     * `DELETE /v1/devices/{device_id}`). Nothing about the local row depends on the answer:
-     * the row is the fact, and a relay that cannot be reached must not turn an operator's
-     * action into an error. The client logs a refusal with its status and the relay's own
-     * error code, so a `404` reads there as "already gone".
+     * The durable half lives in the lifecycle (REL-RELAY-03): the intent is written down
+     * before the request is made, the request is attempted now, and an answer that is neither
+     * a `2xx` nor a `404` leaves the intent for the sweep to retry — a deletion whose reply
+     * was lost leaves the relay holding the token, and the phone can be rung by nobody until
+     * it is released. Nothing about the local row depends on the answer: the row is the fact.
+     * What the answer is for is the caller, who gets it back as it was answered.
      */
     async function forgetAtRelay(deviceId) {
-        if (!relay.enabled) return;
-        await relay.removeDevice({ deviceId });
+        const { outcome } = await lifecycle.forgetDeviceAtRelay(deviceId);
+        return relayReport(outcome, 'removed');
     }
 
     /**
@@ -787,10 +842,17 @@ function createRequestHandler({ config, store, bus, push, apns, relay, lifecycle
                 for (const device of devices) store.revokeDevice(device.id, now);
                 // The phones are no longer ringable here, and the relay is told so that they
                 // are not ringable there either — which is also what frees their PushKit
-                // tokens for another server to register.
-                await Promise.all(devices.map((device) => forgetAtRelay(device.id)));
+                // tokens for another server to register. Each answer comes back with the
+                // person: `revokedDevices` is this server's half, and a removal the relay has
+                // not confirmed is named rather than left looking done.
+                const relayOutcomes = await Promise.all(devices.map(async (device) => ({
+                    deviceId: device.id,
+                    ...await forgetAtRelay(device.id),
+                })));
                 log.info('directory_person_removed', { personId: id, devices: devices.length, by: actor });
-                return sendJson(res, 200, { users: store.listUsers(), revokedDevices: devices.length });
+                return sendJson(res, 200, {
+                    users: store.listUsers(), revokedDevices: devices.length, relay: relayOutcomes,
+                });
             }
 
             // ── Who can reach whom ──────────────────────────────────────────────
@@ -1118,9 +1180,10 @@ function createRequestHandler({ config, store, bus, push, apns, relay, lifecycle
                     // A phone that still works is not removable, so a row that reached here was
                     // revoked first — and that revocation already told the relay. This second
                     // removal is the belt to its braces, and answers `404` when there is nothing
-                    // left to forget.
-                    await forgetAtRelay(target.id);
-                    return sendJson(res, 200, { removed: true });
+                    // left to forget. The relay's answer comes back with it: `removed` is this
+                    // server's record going, and the removal at the relay is the other half.
+                    const reported = await forgetAtRelay(target.id);
+                    return sendJson(res, 200, { removed: true, relay: reported });
                 }
 
                 if (deviceMatch[2] === 'revoke') {
@@ -1129,9 +1192,10 @@ function createRequestHandler({ config, store, bus, push, apns, relay, lifecycle
                     // The token is kept locally on purpose — a rotated PushKit token is the only
                     // way to reach that phone until it reports another — but the relay is told to
                     // forget the device, because a token still owned by this installation is what
-                    // stops the phone being rung by whichever server it moves to.
-                    await forgetAtRelay(target.id);
-                    return sendJson(res, 200, { device: adminDevice(store.deviceIdentity(target.id)) });
+                    // stops the phone being rung by whichever server it moves to. A relay that
+                    // refused is reported as such rather than hidden behind the local revocation.
+                    const reported = await forgetAtRelay(target.id);
+                    return sendJson(res, 200, { device: adminDevice(store.deviceIdentity(target.id)), relay: reported });
                 }
 
                 const body = await readJsonOrRefuse(req, res);
@@ -1184,16 +1248,71 @@ function createRequestHandler({ config, store, bus, push, apns, relay, lifecycle
                 log.info('device_registered', { userId: user.id, deviceId: device.id });
                 return sendJson(res, 201, { device });
             } catch (error) {
+                // An id somebody else already holds is not a malformed request: it is a fact
+                // about that id, and the same request with the same id will keep failing, so it
+                // is said plainly rather than dressed as a client error (SEC-RELAY-01).
+                if (error.code === 'DEVICE_OWNED') {
+                    log.warn('device_ownership_refused', { userId: user.id, deviceId: error.deviceId });
+                    return sendError(res, 409, 'DEVICE_OWNED', 'That device id is already registered to somebody else.');
+                }
                 return sendError(res, 400, 'INVALID_DEVICE', error.message);
             }
         }
 
+        // A device releasing itself.
+        //
+        // The operator route can only be reached with a console session, and a phone on its way
+        // out of a deployment deletes its key before anybody with a console could act — so this
+        // is the last moment the relay can be told not to ring it, and it is the call the app
+        // makes on unpair (SEC-RELAY-04). It is *not* the operator route: the target must be the
+        // device this session proved itself to be, so an enrolled device cannot unring somebody
+        // else's phone, or even a second phone of its own person's, by naming it.
+        //
+        // Revoked rather than erased, which is the same end state the operator's `revoke` leaves:
+        // the key stops working, the tokens are dropped here, and the row stays as the record of
+        // a device that existed. Erasing it would free the id for whoever claims it next, which
+        // is the opposite of what a device signing off should do.
+        const releaseMatch = pathname.match(/^\/api\/devices\/([A-Za-z0-9_-]{8,64})$/);
+        if (req.method === 'DELETE' && releaseMatch) {
+            const id = releaseMatch[1];
+            if (!lifecycle.limiter.take(`${user.id}:device-release`, 10, 60000)) {
+                return sendError(res, 429, 'RATE_LIMITED', 'Please wait and try again.');
+            }
+            // The device the session belongs to, not one the request names.
+            const { device: self } = currentUser(req);
+            if (!self || self.id !== id) {
+                return sendError(res, 403, 'DEVICE_NOT_YOURS', 'A device may only remove itself.');
+            }
+            const now = new Date().toISOString();
+            store.revokeDevice(id, now);
+            log.info('device_released_by_itself', { deviceId: id, userId: user.id });
+            // The relay's own answer is reported, not assumed: this is the one chance the app has
+            // to know whether its PushKit token is still claimed by this deployment.
+            const reported = await forgetAtRelay(id);
+            return sendJson(res, 200, { removed: true, relay: reported });
+        }
+
         if (req.method === 'POST' && pathname === '/api/devices/push-token') {
+            // Limited like its sibling `/api/push/subscriptions`, and for the same reason: this
+            // route reaches the relay, and a token upload happens on every launch and every
+            // rotation, so an unauthenticated-in-effect loop here is this server hammering the
+            // relay with the installation's credential (REL-RELAY-01).
+            if (!lifecycle.limiter.take(`${user.id}:push-token`, 10, 60000)) {
+                return sendError(res, 429, 'RATE_LIMITED', 'Please wait and try again.');
+            }
             const body = await readJson(req);
             const id = String(body.deviceId || '');
-            const device = store.deviceById(id);
+            const device = store.deviceIdentity(id);
             if (!device || device.userId !== user.id) {
                 return sendError(res, 404, 'DEVICE_NOT_FOUND', 'That device is not registered to you.');
+            }
+            // A revoked device is not a device any more: its key does not work and its row is
+            // kept only as a record. Registering its token would make the relay ring a phone this
+            // deployment has taken out of use — and the relay's upsert sets the device active
+            // again, so the upload would undo the operator's revocation (SEC-RELAY-02).
+            if (device.status !== 'active') {
+                return sendError(res, 409, 'DEVICE_REVOKED',
+                    `That device is ${device.status}, not active; enrol it again before registering a token.`);
             }
             // Two kinds, because a phone holds two tokens: the alert token a notification
             // goes to, and the VoIP token a ringing call goes to. Omitted means the alert
@@ -1214,8 +1333,14 @@ function createRequestHandler({ config, store, bus, push, apns, relay, lifecycle
             // which is what makes this an upsert on both sides. The alert token is not
             // registered: the relay rings phones and sends nothing else — the missed-call
             // notification stays on this deployment's own APNs key.
+            //
+            // `saved` stays true because the row *was* written; `relay` is the separate answer
+            // of whether a call can reach the phone, and a relay that refused leaves it saying
+            // so. The app keeps the token pending while that answer is `retryable`, which is
+            // what stops a registration made during a relay timeout from leaving the phone
+            // permanently unringable.
             if (kind === 'voip') {
-                return sendJson(res, 200, { saved: true, relay: await enableRingable(id, token) });
+                return sendJson(res, 200, { saved: true, relay: await registerAtRelay(id, token) });
             }
             return sendJson(res, 200, { saved: true });
         }
