@@ -67,6 +67,11 @@ const ENV_KEYS = Object.freeze([
     'VAPID_PUBLIC_KEY', 'VAPID_PRIVATE_KEY', 'VAPID_SUBJECT',
     'CROSSBAR_APNS_KEY_ID', 'CROSSBAR_APNS_TEAM_ID', 'CROSSBAR_APNS_KEY_PATH',
     'CROSSBAR_APNS_KEY', 'CROSSBAR_APNS_TOPIC',
+    // The push relay that rings a phone whose screen is off, in place of sending the VoIP
+    // push from here. The three names are the relay's own (relay `docs/DEPLOYMENT.md`,
+    // `scripts/relay-admin.mjs`), which is what its operator hands over.
+    'CROSSBAR_PUSH_RELAY_URL', 'CROSSBAR_PUSH_RELAY_TOKEN', 'CROSSBAR_PUSH_RELAY_INSTALLATION_ID',
+    'CROSSBAR_PUSH_RELAY_TIMEOUT_MS',
     // The one name that is not this project's, but decides how it behaves
     'NODE_ENV',
 ]);
@@ -358,9 +363,10 @@ function loadConfig() {
         vapidPrivateKey: text('VAPID_PRIVATE_KEY', ''),
         vapidSubject: text('VAPID_SUBJECT', ''),
 
-        // APNs, for ringing a phone that is asleep. The key is the `.p8` from the developer
-        // account, named by file rather than pasted into an environment: it is a secret with
-        // newlines in it, and a deployment already has somewhere to keep one.
+        // APNs, for telling somebody about a call they missed. The key is the `.p8` from the
+        // developer account, named by file rather than pasted into an environment: it is a
+        // secret with newlines in it, and a deployment already has somewhere to keep one.
+        // A ringing call does not use it any more — that is the relay below.
         apnsKeyId: text('CROSSBAR_APNS_KEY_ID', ''),
         apnsTeamId: text('CROSSBAR_APNS_TEAM_ID', ''),
         apnsKeyPath: text('CROSSBAR_APNS_KEY_PATH', ''),
@@ -368,6 +374,24 @@ function loadConfig() {
         // The app's bundle id. The topic a call is pushed on is this with `.voip` on the
         // end, which is the only topic a PushKit registry may be sent.
         apnsTopic: text('CROSSBAR_APNS_TOPIC', ''),
+
+        // The Crossbar Push Relay, which rings a phone that is asleep. A phone registers its
+        // VoIP token with the relay through this server, and a call wake is posted there
+        // rather than to Apple directly — so the key above is only for the missed-call alert
+        // now, which is not a ringing call and stays a notification. The relay operator hands
+        // over the three settings; the credential is a server secret, so it is not logged,
+        // not returned to a client, and not written into a payload (relay
+        // docs/BACKEND_INTEGRATION.md, "Operating the credential").
+        pushRelayUrl: text('CROSSBAR_PUSH_RELAY_URL', ''),
+        pushRelayToken: text('CROSSBAR_PUSH_RELAY_TOKEN', ''),
+        // The relay's id for this installation. Nothing here sends it — the credential names
+        // the installation — and it is kept so a refusal can be logged against the
+        // installation an operator was given.
+        pushRelayInstallationId: text('CROSSBAR_PUSH_RELAY_INSTALLATION_ID', ''),
+        // Every request to the relay is bounded, because a ring that arrives late is worth
+        // less than one that does not arrive. Five seconds is far longer than the relay takes
+        // and far shorter than the ninety a call rings for.
+        pushRelayTimeoutMs: integer('CROSSBAR_PUSH_RELAY_TIMEOUT_MS', 5000, 500, 30000),
 
         nodeEnv: text('NODE_ENV', 'development'),
     });

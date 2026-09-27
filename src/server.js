@@ -15,6 +15,7 @@ const { Store } = require('./db');
 const { createEventBus } = require('./events');
 const { createPushNotifier } = require('./push');
 const { createApnsNotifier } = require('./apns');
+const { createPushRelayClient } = require('./pushrelay');
 const { createLifecycle } = require('./lifecycle');
 const { createRequestHandler } = require('./api');
 const { createSignalServer } = require('./signal');
@@ -28,12 +29,17 @@ function createCrossbarServer({ config = loadConfig(), log } = {}) {
     const bus = createEventBus({ store, log: logger });
     const push = createPushNotifier({ config, log: logger });
     // Two transports, because a browser and a phone are woken by different things and fail
-    // in different ways: Web Push rings a page, APNs rings a phone that is asleep.
+    // in different ways: Web Push rings a page, APNs rings a phone that is asleep. The APNs
+    // notifier is what tells somebody about a call they missed; the relay is what rings a
+    // phone for a call that is still happening.
     const apns = createApnsNotifier({ config, log: logger });
-    const lifecycle = createLifecycle({ config, store, bus, push, apns, log: logger });
+    const pushRelay = createPushRelayClient({ config, log: logger });
+    const lifecycle = createLifecycle({ config, store, bus, push, apns, relay: pushRelay, log: logger });
 
     const clientRoot = path.join(__dirname, '..', 'public');
-    const handler = createRequestHandler({ config, store, bus, push, apns, lifecycle, log: logger, clientRoot });
+    const handler = createRequestHandler({
+        config, store, bus, push, apns, relay: pushRelay, lifecycle, log: logger, clientRoot,
+    });
     const httpServer = http.createServer(handler);
 
     // Upgraded sockets are not covered by `closeAllConnections`, and `close()` waits

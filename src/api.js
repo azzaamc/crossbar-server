@@ -74,7 +74,7 @@ const AUTH_MESSAGE = {
     RATE_LIMITED: 'Too many attempts. Try again shortly.',
 };
 
-function createRequestHandler({ config, store, bus, push, apns, lifecycle, log, clientRoot }) {
+function createRequestHandler({ config, store, bus, push, apns, relay, lifecycle, log, clientRoot }) {
     const websocketOrigin = (() => {
         const url = new URL(config.publicOrigin);
         url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -174,6 +174,46 @@ function createRequestHandler({ config, store, bus, push, apns, lifecycle, log, 
         if (!identity) return { identity: null, user: null, device: null };
         const user = store.observeIdentity(identity, now, { autoEnrol: config.autoEnrolIdentities });
         return { identity, user, device: null };
+    }
+
+    // ── The push relay, which is what rings a phone ────────────────────────────────
+    //
+    // A VoIP token arrives here through `POST /api/devices/push-token` and is of no use to
+    // this server: the push is sent by the relay, which is the party holding the Apple key
+    // for the shared app identity. So the token is registered there against the same opaque
+    // device id, which is the one thing that has to be kept in step (relay
+    // docs/BACKEND_INTEGRATION.md, "The lifecycle").
+
+    /**
+     * Makes a phone ringable: registers its VoIP token with the relay.
+     *
+     * The token is stored locally either way, so a refusal is reported rather than raised —
+     * a `409 token_conflict` means another server registered this PushKit token first and
+     * only that server's removal (or the relay operator) can free it, which the app can say
+     * to a person as "this phone could not be enabled yet". `saved` and `relay` are separate
+     * on purpose: the first is about this server's row, the second about whether a call can
+     * reach the phone.
+     */
+    async function enableRingable(deviceId, token) {
+        if (!relay.enabled) return { configured: false, registered: false, error: 'not_configured' };
+        const outcome = await relay.registerDevice({ deviceId, token });
+        return { configured: true, registered: outcome.ok, error: outcome.error || null };
+    }
+
+    /**
+     * Tells the relay a device is gone, so its token stops being ringable here and is free
+     * for whoever owns it next.
+     *
+     * A device the relay does not have answers `404` — either it never had it, or this
+     * already happened — and that is "removed" rather than a failure (relay docs/API.md,
+     * `DELETE /v1/devices/{device_id}`). Nothing about the local row depends on the answer:
+     * the row is the fact, and a relay that cannot be reached must not turn an operator's
+     * action into an error. The client logs a refusal with its status and the relay's own
+     * error code, so a `404` reads there as "already gone".
+     */
+    async function forgetAtRelay(deviceId) {
+        if (!relay.enabled) return;
+        await relay.removeDevice({ deviceId });
     }
 
     /**
@@ -745,6 +785,10 @@ function createRequestHandler({ config, store, bus, push, apns, lifecycle, log, 
                 const now = new Date().toISOString();
                 const devices = store.allDevices(id);
                 for (const device of devices) store.revokeDevice(device.id, now);
+                // The phones are no longer ringable here, and the relay is told so that they
+                // are not ringable there either — which is also what frees their PushKit
+                // tokens for another server to register.
+                await Promise.all(devices.map((device) => forgetAtRelay(device.id)));
                 log.info('directory_person_removed', { personId: id, devices: devices.length, by: actor });
                 return sendJson(res, 200, { users: store.listUsers(), revokedDevices: devices.length });
             }
@@ -984,11 +1028,18 @@ function createRequestHandler({ config, store, bus, push, apns, lifecycle, log, 
                     origin: config.publicOrigin,
                     requireDeviceAuth: config.requireDeviceAuth,
                     deviceAuthEnabled: Boolean(config.sessionSecret),
-                    // Whether a phone can be rung while it is asleep. Without this the app
-                    // still works with the screen on and a locked phone simply never rings,
-                    // which is the kind of fault that reads as the app's rather than the
-                    // deployment's.
+                    // Two transports, for two different things. A missed call is an ordinary
+                    // notification and goes to Apple from this deployment, so `apns` is
+                    // about being *told* something. A ringing call is a VoIP push and goes
+                    // through the relay below, which is what wakes a suspended app — so
+                    // `relay` is the one that decides whether a locked phone rings. Without
+                    // either, the fault reads as the app's rather than the deployment's.
                     apns: { enabled: Boolean(apns?.enabled), topic: apns?.topic || '' },
+                    relay: {
+                        enabled: Boolean(relay?.enabled),
+                        installationId: relay?.installationId || null,
+                        timeoutMs: relay?.timeoutMs || null,
+                    },
                     turn: config.turn?.host
                         ? {
                             host: config.turn.host,
@@ -1064,12 +1115,22 @@ function createRequestHandler({ config, store, bus, push, apns, lifecycle, log, 
                     }
                     store.removeDevice(target.id);
                     log.info('device_removed', { deviceId: target.id, userId: target.userId, by: actor });
+                    // A phone that still works is not removable, so a row that reached here was
+                    // revoked first — and that revocation already told the relay. This second
+                    // removal is the belt to its braces, and answers `404` when there is nothing
+                    // left to forget.
+                    await forgetAtRelay(target.id);
                     return sendJson(res, 200, { removed: true });
                 }
 
                 if (deviceMatch[2] === 'revoke') {
                     store.revokeDevice(target.id, now);
                     log.info('device_revoked', { deviceId: target.id, userId: target.userId, by: actor });
+                    // The token is kept locally on purpose — a rotated PushKit token is the only
+                    // way to reach that phone until it reports another — but the relay is told to
+                    // forget the device, because a token still owned by this installation is what
+                    // stops the phone being rung by whichever server it moves to.
+                    await forgetAtRelay(target.id);
                     return sendJson(res, 200, { device: adminDevice(store.deviceIdentity(target.id)) });
                 }
 
@@ -1134,19 +1195,28 @@ function createRequestHandler({ config, store, bus, push, apns, lifecycle, log, 
             if (!device || device.userId !== user.id) {
                 return sendError(res, 404, 'DEVICE_NOT_FOUND', 'That device is not registered to you.');
             }
+            // Two kinds, because a phone holds two tokens: the alert token a notification
+            // goes to, and the VoIP token a ringing call goes to. Omitted means the alert
+            // one, which is what a client written before this existed sends.
+            const kind = body.kind === 'voip' ? 'voip' : 'alert';
+            const token = String(body.token || '');
             store.savePushToken({
                 deviceId: id,
-                token: String(body.token || ''),
+                token,
                 // A token is only valid at the host that issued it, so this selects where a
                 // push is sent and is not free text. Anything else would be a token that
                 // silently never arrives.
                 environment: body.environment === 'sandbox' ? 'sandbox' : 'production',
-                // Two kinds, because a phone holds two tokens: the alert token a notification
-                // goes to, and the VoIP token a ringing call goes to. Omitted means the
-                // alert one, which is what a client written before this existed sends.
-                kind: body.kind === 'voip' ? 'voip' : 'alert',
+                kind,
                 now: new Date().toISOString(),
             });
+            // A rotated token is an update at the same device id rather than a new device,
+            // which is what makes this an upsert on both sides. The alert token is not
+            // registered: the relay rings phones and sends nothing else — the missed-call
+            // notification stays on this deployment's own APNs key.
+            if (kind === 'voip') {
+                return sendJson(res, 200, { saved: true, relay: await enableRingable(id, token) });
+            }
             return sendJson(res, 200, { saved: true });
         }
 

@@ -92,6 +92,13 @@ step-by-step for installing a second household.
 >   Apple's own help pages get. The file mode and owner it asks for (0600, the deployment's own
 >   account) is this repository's convention for the other two credentials — `.env` and the
 >   directory file — not a posture a deployment was watched enforcing on a `.p8`;
+> - **the relay ring path** (§2.7.1) — written from the relay's own documentation and source, and not
+>   exercised end to end: the credential does not exist here, and a local relay cannot reach Apple at
+>   all (its test runtime has no HTTP/2). What is measured is everything up to the wire —
+>   `src/pushrelay.js` and its two call sites, against a stub relay, in `test/pushrelay.test.js`: the
+>   request shapes, the derived per-device `request_id`, the refusal vocabulary, a `410` clearing the
+>   token, and the credential appearing in no log line. Whether a deployed relay reaches APNs is
+>   unverified by its own authors as well, so the live gate is a device that rings;
 > - ~~the full server test suite on the merged tree~~ — 177 tests, 177 pass, 0 fail, 0 skipped,
 >   the operator path's five and the `doctor` checks' five included.
 >
@@ -199,7 +206,7 @@ What it asks, and where each answer lands:
 | which modes this deployment is reached in (`--mode private`, `public` or `both`) | one block per mode, `NETWORK_MODE_<MODE>_*` in `.env` |
 | the hostname and origin of each mode, and the public bind address — the private one offered as this machine's own tailnet name, which the wizard joins the tailnet to get (§2.8.1) | the same block (§2.3) |
 | who is in the directory — `id, display name, login, admin` per person | the directory file (§2.4) |
-| the relay host and secret, APNs, Web Push — each optional, each skippable | the names in `.env` |
+| a TURN relay host and secret, APNs, Web Push — each optional, each skippable | the names in `.env` |
 | nothing about the session secret | it generates one, or keeps the one the file holds |
 | whether to set the console password, and whether to invite somebody — both default yes, both at the end of a terminal run | the password hash and one invitation (§2.7), each made by its own command in the same terminal |
 
@@ -335,6 +342,12 @@ Fill in, at minimum:
   (fifteen minutes). It is read by the mode units, not by the server, and it is not in
   `.env.example`; add the line only to change the window. See §3.4.
 - `CROSSBAR_ADMIN_PASSWORD_HASH` via `node src/admin.js password`, not by hand.
+
+**The push relay's three settings are not asked by the wizard** — they come from the relay operator,
+who hands them over once (§2.7.1) — so they are pasted into `.env` by hand, or added to an
+`--answers` file only after `src/setup.js` learns them. A deployment that never sets them runs
+exactly as it did before the relay existed: everything works except ringing a phone whose screen is
+off, and `status` says so on its `Push relay` line.
 
 On the installer's path `DATA_DIR`, `DIRECTORY_CONFIG_PATH` and `WEB_ROOT` are already rendered
 for this host: `.env.example` carries production's literals (`/home/admin/crossbar/…`), the
@@ -481,11 +494,14 @@ The invitation prints the JSON and the token; the token exists nowhere else, so 
 the one chance to hand it over. The console is at `/admin` on the server's own origin, and
 its password is what makes it reachable from a browser that has enrolled no device key.
 
-To ring a phone whose screen is off, APNs must be configured (`CROSSBAR_APNS_KEY_ID`,
-`_TEAM_ID`, `_KEY_PATH`, `_TOPIC` in `.env`); without it the console and `status` say
-`not configured — a phone with its screen off cannot be rung`, and a locked phone simply never
-rings while everything else keeps working. Web Push is the browser's equivalent and is
-optional: it needs a VAPID key pair, which `npx web-push generate-vapid-keys` prints (the
+Two transports can wake something that is not on screen, and they do different things. A **ring**
+for a call that is happening is a VoIP push, which this deployment does not send itself: it posts
+it through the push relay (§2.7.1), and that is what a locked phone needs. A **missed call** is an
+ordinary notification and still goes to Apple from here, which is what `CROSSBAR_APNS_KEY_ID`,
+`_TEAM_ID`, `_KEY_PATH` and `_TOPIC` in `.env` are for: without that key the console and `status`
+say `not configured — a missed call tells nobody`, and a missed call is silent while everything
+else keeps working. Web Push is the browser's equivalent and is optional: it needs a VAPID key
+pair, which `npx web-push generate-vapid-keys` prints (the
 public key, then the private one) plus a contact subject the push services can use — the
 wizard asks for all three, in that order, and writes them as `VAPID_PUBLIC_KEY`,
 `VAPID_PRIVATE_KEY` and `VAPID_SUBJECT`. An APNs key is the Apple **team**'s, not a server's:
@@ -513,6 +529,83 @@ note on a suspected compromise runs those first two the other way — the replac
 the old key revoked after the transition — which avoids a window with no push at all; revoking
 first spends that window to stop a forged call reaching a phone sooner. Either way the old key is
 dead, and the new one is what the deployment signs with.
+
+### 2.7.1 The push relay, which rings a phone
+
+A phone whose screen is off is woken by exactly one thing: a VoIP push, which only Apple can
+deliver and only for the app's own bundle id. This deployment does not hold that ability. The
+**Crossbar Push Relay** does — one installation per household, one Apple key for the shared app, and
+a credential the relay operator hands over. The relay knows an installation, a device id and a
+PushKit token: it holds no users, no calls, no contacts and no media, and it is a doorbell rather
+than a call setup (relay `docs/BACKEND_INTEGRATION.md`).
+
+Three settings go in `.env`, in the names the operator's `relay-admin.mjs create` prints:
+
+| Setting | What it is |
+| --- | --- |
+| `CROSSBAR_PUSH_RELAY_URL` | the relay's origin, e.g. `https://crossbar-push-dev.<account>.workers.dev` |
+| `CROSSBAR_PUSH_RELAY_TOKEN` | the credential, `cbr_…` — a **server secret** |
+| `CROSSBAR_PUSH_RELAY_INSTALLATION_ID` | the relay's `ins_…` for this household; nothing sends it, it is what names an installation in a log line |
+
+`CROSSBAR_PUSH_RELAY_TIMEOUT_MS` (default 5000) bounds every request to it. The credential is shown
+once and the relay stores only its digest, so a lost one is rotated rather than recovered; it
+belongs in `.env` (mode 0600, as that file's other secrets do) and never in a repository, a command
+line or a chat message. It never reaches a phone, never appears in a push payload, and neither this
+server nor the relay logs it.
+
+How the pieces move:
+
+1. iOS gives the app a PushKit token and the app presents it to this server, as it always has:
+   `POST /api/devices/push-token` with `kind: "voip"`. That endpoint now also registers the token
+   with the relay, under the same opaque id — this server's `dev_…` device id *is* the relay's
+   `device_id`, so there is no mapping table to keep in step.
+2. The answer carries a `relay` object beside `saved`: `{"configured": true, "registered": true,
+   "error": null}`. `saved` is about this server's row; `relay` is about whether a call can reach
+   the phone. A `409 token_conflict` means the PushKit token is already registered to *another*
+   server and only that server's removal, or the relay operator, can free it — read it as "this
+   phone could not be enabled yet", not as a bug to retry.
+3. On an incoming call the server posts one `POST /v1/push/voip` per invited phone, each with a
+   `request_id` derived from the call and the device. That derivation is what makes a retry a
+   retry: the same ring repeated after a timeout carries the same id, so the relay replays its
+   first answer rather than waking the phone twice.
+4. A rotated PushKit token is an update at the same device id — an upsert, not a second device. A
+   `410 device_unregistered` means Apple has told the relay the token is dead: this server clears
+   it, exactly as it always cleared a dead APNs token, and the phone files a new one the next time
+   the app launches. Revoking or removing a device — in the console, or by removing a person from
+   the directory — also removes it at the relay, which is what frees the token for whichever server
+   the phone moves to.
+5. The **missed-call notification still goes to Apple from this deployment**, because the relay is
+   a VoIP-only transport — so `CROSSBAR_APNS_*` stays configured for that. They fail separately: a
+   wrong APNs key costs the missed-call line and nothing else, and a relay that cannot be reached
+   costs the ring and nothing else. Neither changes a call's state; a ring is fire-and-forget with
+   a logged failure.
+6. Web Push and the realtime `incoming-call` event are unchanged. A native app may receive more
+   than one of them, and it deduplicates on the call id — which is why the push and the event carry
+   the same one, and why a push can never name a call the app cannot then go and read.
+
+**Before a push can ring, the app must read the namespaced payload.** The relay sends the call
+inside a `crossbar` object — `crossbar.call_id`, `crossbar.caller_id`, `crossbar.caller_name`,
+`crossbar.has_video`. A build that still reads the flat top-level `callId` wakes, finds nothing it
+can name, and drops the push. iOS requires an app woken by a VoIP push to report a call to CallKit
+promptly, and repeated failures cost the app its PushKit privilege — on every device, because every
+installation shares one app identity. Change the app first, then exercise the live path.
+
+**What a local run cannot show.** A `200` from the relay means APNs accepted the notification, not
+that the phone rang, and the push is sent with `apns-expiration: 0`, so nothing is stored for later.
+The live path needs a deployed relay with an Apple key and a real device; the relay's own
+documentation is explicit that a deployed Worker reaching APNs is not verified, and a local relay
+cannot reach Apple at all (its test runtime has no HTTP/2). Everything up to APNs is what the test
+suite covers.
+
+**When a phone does not ring, in this order:** `node src/admin.js status` — is a ring transport
+configured at all; the journal — `push_relay_not_configured` (a phone holds a VoIP token and there
+is nowhere to send it), `push_relay_refused` (with the relay's status and error code: a
+`device_unregistered` clears that phone's token, a `token_conflict` on a registration needs the
+other server), `push_relay_unreachable` (a timeout or a dropped connection — the ring is not
+retried, because a call that arrives late is worse than one that does not arrive); and
+`curl -sS "$CROSSBAR_PUSH_RELAY_URL/v1/health"`, which needs no credential and says which Apple
+environment the relay is deployed against. The relay's own logs answer the other half, with a
+`push` line carrying `apns_status` and `apns_reason` per device.
 
 ### 2.8 Public mode: Caddy, DNS, ports
 
@@ -1505,18 +1598,22 @@ Origin            http://127.0.0.1:3010
 Listener          127.0.0.1:3010
 Device auth       not configured
 TURN              not configured
-APNs              not configured — a phone with its screen off cannot be rung
+APNs              not configured — a missed call tells nobody
+Push relay        not configured — a phone whose screen is off cannot be rung
 People            3
 Devices           5
 Open invitations  0
 ```
 
 On a deployment, `Origin` is the mode's origin, `Device auth` reads `required` in public mode,
-and `TURN`/`APNs` carry their configured values or say they are not configured.
+and `TURN`/`APNs`/`Push relay` carry their configured values or say they are not configured.
 
-The **APNs** line matters because a browser can be woken by Web Push and a suspended iOS app
-can be woken by nothing except a VoIP push: without the key, a locked phone simply never rings
-while everything else keeps working.
+The **Push relay** line is the one that decides whether a locked phone rings: a suspended iOS app
+is woken by nothing except a VoIP push, and this deployment posts that push through the relay
+(§2.7.1) rather than to Apple itself. The **APNs** line is the other transport — a browser can be
+woken by Web Push, and the missed-call notification is an ordinary alert that still goes to Apple
+from here — so a deployment with the relay configured and no APNs key rings normally and says
+nothing about the calls that were missed while the phone was asleep.
 
 `node src/admin.js doctor` runs the reachability checks and prints one line each; the exit
 code is 0 only when every line is `OK`. Real output from the same checkout, with no server
@@ -1539,16 +1636,16 @@ rather than folded into one verdict, because "public mode is broken" is not some
 operator can act on. The TURN line reports reachability, not an allocation.
 
 `node src/admin.js devices` lists devices with a **RING** column: `yes` where the phone can be
-rung while it is asleep, `NO` where it cannot — no VoIP token on file, either because the
-phone has never filed one or because Apple has since said the one it filed was dead. `NO`
-reads from the caller's end as a broken deployment and is visible nowhere else in that output.
-The column answers a different question from `KEY`, which is only whether the device holds a
-key.
+rung while it is asleep, `NO` where it cannot — no VoIP token on file, either because the phone has
+never filed one or because the relay has since reported the one it filed dead (a `410`, which
+clears it here). `NO` reads from the caller's end as a broken deployment and is visible nowhere else
+in that output. The column answers a different question from `KEY`, which is only whether the device
+holds a key.
 
 `node src/admin.js ring --from <id> --to <id>` places a test call **through** the live server,
-over the loopback the server already treats as its proxy, so it reaches both the sockets and
-APNs — a call placed any other way would ring nothing, because the running process is the one
-holding the connections and the push credentials. `--from` has to be a person with a login,
+over the loopback the server already treats as its proxy, so it reaches both the sockets and the
+push relay — a call placed any other way would ring nothing, because the running process is the one
+holding the connections and the relay credential. `--from` has to be a person with a login,
 because a login is how a request is believed here. That is why a directory keeps one test
 person who has one: `ringtest` ("Ring Test"), with the placeholder login `ringtest@example.com`
 and contacts with `abdullah`, exists so a call can be placed from the machine. The directory

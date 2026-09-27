@@ -37,7 +37,7 @@ function createLimiter() {
     };
 }
 
-function createLifecycle({ config, store, bus, push, apns, log }) {
+function createLifecycle({ config, store, bus, push, apns, relay, log }) {
     const limiter = createLimiter();
     const now = () => new Date().toISOString();
 
@@ -89,9 +89,12 @@ function createLifecycle({ config, store, bus, push, apns, log }) {
      * Rings everybody who is not already holding a connection.
      *
      * Two transports, because a browser and a phone are woken by different things: Web Push
-     * reaches a page, and nothing but a VoIP push reaches a suspended app. Each reports the
-     * addresses it could not reach, and each of those is cleared where its own rows live —
-     * a refusal from the transport is the only evidence that a token has died.
+     * reaches a page, and nothing but a VoIP push reaches a suspended app. The wake goes
+     * through the relay, which is the party holding the Apple key for the shared app
+     * identity; this deployment registers each phone's VoIP token there when the app
+     * presents it. Each transport reports the addresses it could not reach, and each of
+     * those is cleared where its own rows live — a refusal from the transport is the only
+     * evidence that a token has died.
      */
     async function pushIncoming(call, inviteeIds) {
         const caller = store.userById(call.callerId);
@@ -106,7 +109,13 @@ function createLifecycle({ config, store, bus, push, apns, log }) {
         for (const endpoint of staleEndpoints) store.deletePushEndpoint(endpoint);
 
         const devices = store.voipTokensFor(inviteeIds);
-        const deadTokens = await apns.incoming(devices, call, callerName);
+        // Said out loud rather than passed over: without a relay there is no VoIP transport
+        // at all, and "the phone did not ring" is otherwise indistinguishable from "the push
+        // was refused" without reading the relay's log too.
+        if (devices.length && !relay.enabled) {
+            log.warn('push_relay_not_configured', { callId: call.id, phones: devices.length });
+        }
+        const deadTokens = await ringPhones(devices, call, callerName);
         for (const device of deadTokens) store.clearVoipToken(device.deviceId);
 
         if (subscriptions.length || devices.length) {
@@ -117,6 +126,33 @@ function createLifecycle({ config, store, bus, push, apns, log }) {
                 dropped: staleEndpoints.length + deadTokens.length,
             });
         }
+    }
+
+    /**
+     * One relay push per phone, and the phones whose VoIP token the relay says is gone.
+     *
+     * `request_id` is per device as well as per call, because the relay keys duplicate
+     * suppression on `(installation_id, request_id)` — one id for a fan-out is refused with
+     * a `409` for the second phone. It is derived from the call and the device rather than
+     * stored, so an attempt repeated after a timeout carries the same id with nothing to
+     * keep in step (`pushrelay.js`, `requestIdFor`), and only a new call or a new device
+     * gets a new one.
+     *
+     * A push that fails transiently is not retried here and never changes call state: the
+     * ring has the seconds it has, and a call that rings late is worse than one that does
+     * not ring.
+     */
+    async function ringPhones(devices, call, callerName) {
+        if (!devices.length) return [];
+        const outcomes = await Promise.all(devices.map((device) => relay.sendIncomingCall({
+            deviceId: device.deviceId,
+            requestId: relay.requestIdFor(call.id, device.deviceId),
+            callId: call.id,
+            callerId: call.callerId,
+            callerName,
+            hasVideo: call.kind !== 'audio',
+        })));
+        return devices.filter((_, index) => outcomes[index].deviceGone);
     }
 
     /**

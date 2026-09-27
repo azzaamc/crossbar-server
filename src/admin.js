@@ -636,7 +636,13 @@ async function main(argv) {
                 console.log(`TURN              ${config.turn?.host ? `${config.turn.host}:${config.turn.port} relays ${config.turn.minPort}-${config.turn.maxPort}` : 'not configured'}`);
                 console.log(`APNs              ${config.apnsKeyId && config.apnsTopic
                     ? `configured (${config.apnsTopic})`
-                    : 'not configured — a phone with its screen off cannot be rung'}`);
+                    : 'not configured — a missed call tells nobody'}`);
+                // The other half, and the one that decides whether a locked phone rings: a
+                // suspended iOS app is woken by a VoIP push, which this deployment posts
+                // through the relay rather than to Apple itself.
+                console.log(`Push relay        ${config.pushRelayUrl && config.pushRelayToken
+                    ? `configured (${config.pushRelayUrl})`
+                    : 'not configured — a phone whose screen is off cannot be rung'}`);
                 console.log(`People            ${store.listUsers().length}`);
                 console.log(`Devices           ${store.allDevices().length}`);
                 console.log(`Open invitations  ${openEnrollments.length}${openEnrollments.length ? ` (${openEnrollments.map((item) => item.id).join(', ')})` : ''}`);
