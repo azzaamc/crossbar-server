@@ -173,10 +173,10 @@ sudo scripts/install.sh --no-setup                          # today's behaviour:
 
 It renders the unit files' hardcoded paths for this host (§2.5), prepares Tailscale before anything
 is asked — installed if it is absent, `tailscaled` started, and the deployment's account named the
-daemon's operator, which is what lets the wizard join the tailnet itself (§2.8.1) — runs the setup
-wizard to write the mode blocks, the session secret and the directory file (§2.2.1), creates the
-data directory, installs dependencies as the account that owns the tree, enables the service **and
-the backup timer**, and finishes by waiting for `/api/health` — so "installed" means answering
+daemon's operator, which is what lets the wizard join the tailnet itself (§2.8.1) — installs
+dependencies as the account that owns the tree, runs the setup wizard to write the mode blocks, the
+session secret and the directory file (§2.2.1), creates the data directory, enables the service
+**and the backup timer**, and finishes by waiting for `/api/health` — so "installed" means answering
 rather than "the files are in `/etc`". It also refuses on a host without systemd rather than
 reporting success with no service; on macOS, where this was written, that refusal is the whole of a
 real run.
@@ -186,12 +186,11 @@ fails and you want to see it.
 
 ### 2.2.1 The setup wizard — what the installer now asks
 
-`scripts/install.sh` no longer stops over a missing directory file. Between copying the code and
-running `npm ci` it runs the deployment's own wizard, `node src/admin.js setup`, in `$PREFIX` and
-as the deployment's own account — the account that owns the two files it writes. The wizard needs
-nothing but Node's standard library and the tree that is already there (`src/setup.js` loads
-`src/diagnostics` lazily, and reports the probe as unrunnable), which is why it can run before
-`node_modules` exists.
+`scripts/install.sh` no longer stops over a missing directory file. After running `npm ci` it runs
+the deployment's own wizard, `node src/admin.js setup`, in `$PREFIX` and as the deployment's own
+account — the account that owns the two files it writes. The wizard is **not** standard-library-only:
+its public-mode checks load `src/diagnostics`, which requires `ws`, so the dependencies have to be
+installed first — a host with no `node_modules` fails the phase with `Cannot find module 'ws'`.
 
 What it asks, and where each answer lands:
 

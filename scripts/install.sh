@@ -16,7 +16,11 @@
 #      question belongs to the wizard and the join that follows it needs root work done first; a
 #      public-only install ends up with Tailscale installed and never logged in, which serves
 #      nothing and holds nothing;
-#   4. **onboarding** — `node src/admin.js setup` (§2.2.1, §2.3–§2.4), run in `$PREFIX` as the
+#   4. `npm ci --omit=dev`, in the deployment's own account — before the wizard rather than after
+#      it, because the wizard is not standard-library-only: its public-mode checks load
+#      `src/diagnostics`, which requires `ws`. Measured on a host with neither a prior deployment
+#      nor `node_modules`, the onboarding phase died with `Cannot find module 'ws'`;
+#   5. **onboarding** — `node src/admin.js setup` (§2.2.1, §2.3–§2.4), run in `$PREFIX` as the
 #      deployment's own account: it writes the mode blocks, the secrets and the **directory file**
 #      in one pass. When the mode set includes private it also **joins the tailnet there**, between
 #      the mode question and the private address that comes from it: `tailscale up --hostname <the
@@ -34,7 +38,6 @@
 #      one leaves everything else installed and says which it was. `--no-setup` turns the phase off
 #      and reproduces what this script did before: the directory file has to exist already, and it
 #      says exactly what to write when it does not;
-#   5. `npm ci --omit=dev` in the deployment's own account;
 #   6. the units, rendered for this host's paths and installed, `daemon-reload`, the service
 #      enabled and started, and the backup **timer** enabled — the backup service has no
 #      `[Install]` on purpose, so enabling the timer *is* the install step and forgetting it is a
@@ -330,13 +333,35 @@ if [ -z "$NO_SETUP" ]; then
     prepare_tailscale
 fi
 
-# ── 5. Onboarding: the wizard, the directory file, and the front door ──────────
+# ── 5. Dependencies ─────────────────────────────────────────────────────────────
+# Before the onboarding phase, because the wizard needs the tree: in public mode it loads
+# `src/diagnostics`, which is a `ws` consumer, so with no `node_modules` the phase below dies at
+# its first check (the failure is written up there).
+#
+# `--prefix` so the printed command is the one that runs: `npm ci` deletes `node_modules` and
+# rebuilds it from `package-lock.json`, which is the only way to get the tree the artefact was
+# tested with. It needs the registry or a warm npm cache; there is no build step and `node:sqlite`
+# is Node's own, so nothing else about the install needs the network.
+#
+# As the deployment's account rather than as root, so the tree it writes belongs to the account
+# that has to replace it next time.
+step 'dependencies'
+run_as_user "$NPM_BIN" ci --prefix "$PREFIX" --omit=dev --no-audit --no-fund
+
+# ── 6. Onboarding: the wizard, the directory file, and the front door ──────────
 # The server refuses to start without a directory file, so this phase is where that file comes
-# from: `node src/admin.js setup` (deploy/README.md §2.2.1) is the wizard, it needs nothing but
-# the standard library and the tree copied above, and it writes the mode blocks, the session
-# secret and the directory file in one pass — nothing written until the whole `.env` it composes
-# is complete. It runs before `node_modules` exists, which is why it is here and not after
-# `npm ci`.
+# from: `node src/admin.js setup` (deploy/README.md §2.2.1) is the wizard, and it writes the mode
+# blocks, the session secret and the directory file in one pass — nothing written until the whole
+# `.env` it composes is complete.
+#
+# It runs *after* `npm ci`, because it is not standard-library-only: `src/setup.js` requires
+# `src/diagnostics` for its public-mode checks, and `src/diagnostics.js` requires `ws`. Measured on
+# a Debian 13 host with no prior deployment and no `node_modules`, `node src/admin.js setup
+# --answers …` died with `Cannot find module 'ws'` (require stack `src/diagnostics.js` →
+# `src/setup.js` → `src/admin.js`) and the install stopped unfinished. Every earlier run passed
+# only because the prefix already had `node_modules` from a previous install — which is exactly
+# what a fresh host does not have — so the fix is the dependencies step above, not a reordering of
+# the wizard's requires.
 #
 # The wizard goes first because the *mode* it asks for is what decides whether a private door is
 # wanted at all (`onboard_deployment` in the library, §2.8.1). The private address is the one
@@ -425,17 +450,6 @@ else
         say "the directory file is in place: $DIRECTORY_PATH"
     fi
 fi
-
-# ── 6. Dependencies ─────────────────────────────────────────────────────────────
-# `--prefix` so the printed command is the one that runs: `npm ci` deletes `node_modules` and
-# rebuilds it from `package-lock.json`, which is the only way to get the tree the artefact was
-# tested with. It needs the registry or a warm npm cache; there is no build step and `node:sqlite`
-# is Node's own, so nothing else about the install needs the network.
-#
-# As the deployment's account rather than as root, so the tree it writes belongs to the account
-# that has to replace it next time.
-step 'dependencies'
-run_as_user "$NPM_BIN" ci --prefix "$PREFIX" --omit=dev --no-audit --no-fund
 
 # ── 7. The units ────────────────────────────────────────────────────────────────
 # Rendered for this host's prefix, account and node binary (§`render_unit` in the library) and

@@ -563,6 +563,20 @@ install_public_front_door() { # install_public_front_door
             PORT="$(deployment_port)" caddy validate --config /etc/caddy/Caddyfile; then
         die "Caddy is installed but its Caddyfile does not validate for $hostname, so public mode's shaper unit would start a proxy that cannot render it. Fix /etc/caddy/Caddyfile (deploy/README.md §2.8), or run with --no-setup and install the front door by hand."
     fi
+    # `apt-get install caddy` starts the service — Debian's package enables and runs it — and the
+    # Caddyfile and drop-in above land a second later. Nothing restarts Caddy after that, and that
+    # is deliberate: the shaper unit owns starting it, and `systemctl start` on a *running* unit is
+    # a no-op. So a first install serves the package's default config on port 80 — no TLS, no
+    # proxy — while a switch to public works, because Caddy was stopped in private mode and a fresh
+    # start reads `.env`. Measured on a fresh Debian 13 host: caddy active at 14:50:08, the
+    # Caddyfile and the drop-in written at 14:50:09, the running process with neither
+    # `CROSSBAR_PUBLIC_HOSTNAME` nor `CROSSBAR_BIND_ADDRESS` in its environment, and nothing
+    # answering on 443. Restart it here when it is already up, so the files this function wrote are
+    # the ones it reads.
+    if [ "$DRY_RUN" != '1' ] && systemctl is-active --quiet caddy; then
+        run systemctl restart caddy
+        say 'Caddy was already running — the package starts it — so it is restarted to read the Caddyfile and the drop-in written above.'
+    fi
     say "Caddy is installed, its Caddyfile validates for $hostname, and the drop-in gives it $PREFIX/.env."
     say "Public mode's shaper unit starts it when the units are installed and the service restarted"
     say "below; a deployment installed as private has Caddy ready and stopped until the switch. DNS,"
