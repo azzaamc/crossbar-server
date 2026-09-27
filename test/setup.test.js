@@ -497,9 +497,12 @@ test('a generated secret is 32 bytes of hex, and a second run generates a differ
 });
 
 test('setup runs on a host whose dependencies are not installed yet', (t) => {
-    // `install.sh` calls setup between the code copy and `npm ci`, which is before `node_modules`
-    // exists — and `diagnostics` is the one module this CLI reaches that needs one (`ws`). The hook
-    // is the fresh host: it makes both dependencies unresolvable, and setup still has to work.
+    // `install.sh` runs `npm ci` before the wizard now, precisely because of this: the wizard's
+    // public-mode checks load `diagnostics`, which needs `ws`, and a fresh host with no
+    // `node_modules` died on it. The by-hand path (`node src/admin.js setup` on a checkout with no
+    // dependencies) is still that host, and `--skip-checks` is the flag for it; `diagnostics` is
+    // the one module this CLI reaches that needs one. The hook is that host: it makes both
+    // dependencies unresolvable, and setup still has to work.
     const dir = deployment(t);
     const hook = path.join(dir, 'no-modules.js');
     fs.writeFileSync(hook, `
