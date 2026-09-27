@@ -164,7 +164,13 @@ if [ "$DRY_RUN" = '1' ]; then
 else
     # `src/backup.js` from the tree that is still in place, with that tree as the working
     # directory: the CLI reads `./.env`, and this is the deployment's own file.
-    if ! SNAPSHOT_OUTPUT="$(cd "$PREFIX" && "$NODE_BIN" src/backup.js)"; then
+    #
+    # As the deployment's account, which is the rule `run_as_user` states and this line used to
+    # break: the snapshot lands in `data/backups/`, and root creating that directory leaves the
+    # *service* unable to write the pre-migration snapshot it takes on its next start. The service
+    # then refuses to migrate and does not come up — so this one line, as root, turns a successful
+    # upgrade into a deployment that cannot start after the next schema change.
+    if ! SNAPSHOT_OUTPUT="$(cd "$PREFIX" && capture_as_user "$NODE_BIN" src/backup.js)"; then
         run systemctl start crossbar
         die "the snapshot failed, so nothing was replaced and the service is being started again: $SNAPSHOT_OUTPUT"
     fi
@@ -221,6 +227,11 @@ rollback() { # rollback <why>
     printf '\n!! %s\n' "$1" >&2
     say 'rolling back: the previous tree and the snapshot'
     run systemctl stop crossbar
+    # A rollback runs after the swap, and the swap removes the carry directory once data/ and .env
+    # are across — so this is a fresh one, not the one the swap used. Without it the first move
+    # below fails against a directory that is not there, and the rollback stops with the
+    # deployment holding no tree at all: the state it exists to prevent.
+    run install -d -m 0755 "$CARRY"
     # The tree that failed is kept rather than deleted: it is the evidence for whatever the reason
     # above was, and it is small next to the cost of reproducing it.
     run mv "$PREFIX/data" "$CARRY/data"

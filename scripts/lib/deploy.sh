@@ -108,6 +108,27 @@ run_as_user() {
     fi
 }
 
+# The same rule, for a command whose *output* is the point rather than whose effect is — the
+# snapshot, which reports the directory it wrote. The transcript goes to stderr rather than stdout
+# through here, because the caller is capturing stdout and a command line in the middle of a JSON
+# answer is not a JSON answer. A dry run prints the command and yields nothing, which is what the
+# callers test for.
+capture_as_user() { # capture_as_user <command...>
+    if [ "$CROSSBAR_USER" != "$(id -un 2>/dev/null || true)" ]; then
+        printf '  $ runuser -u %s -- %s\n' "$CROSSBAR_USER" "$*" >&2
+        if [ "$DRY_RUN" = '1' ]; then
+            return 0
+        fi
+        runuser -u "$CROSSBAR_USER" -- "$@"
+    else
+        printf '  $ %s\n' "$*" >&2
+        if [ "$DRY_RUN" = '1' ]; then
+            return 0
+        fi
+        "$@"
+    fi
+}
+
 # The owner of a path. GNU `stat` first, BSD `stat` second — the one place in these scripts that
 # differs by operating system, and both forms exist on both hosts involved (a Mac builds the
 # tarball, Debian runs it).
