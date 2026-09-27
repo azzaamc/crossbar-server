@@ -111,6 +111,42 @@ function createRelayDeletions({ store, relay, log }) {
     }
 
     /**
+     * The removal each device presently has in flight, so two callers cannot both ask.
+     *
+     * Two things ask the relay to remove a device: `forgetDeviceAtRelay`, because a caller
+     * wants it gone now, and the sweep, because the row is due. Both meter against the same
+     * installation's device-write allowance at the relay, and a row written due immediately is
+     * visible to a sweep tick in the same second — so without this, one device's removal is
+     * issued and paid for twice, and a household's allowance is what pays. The relay's DELETE
+     * is idempotent in effect, so the duplicate has no upside: the second caller joins the
+     * attempt already running and is given its answer instead of sending its own.
+     *
+     * This closes the window because both callers read the row and start the attempt in one
+     * synchronous step — the sweep selects its batch and calls `attempt` for every row before
+     * it yields — so neither can observe the other's request mid-flight. It is deliberately
+     * not durable: the queue is owned by one process, as the relay client and the limiter are.
+     * A completed removal leaves nothing for a later selection to find, so it is never
+     * attempted a second time.
+     */
+    const inFlight = new Map();
+
+    /**
+     * One attempt at one owed deletion, joined to any attempt already running for the device.
+     *
+     * `performRemoval` does the work; this decides whether there is work to do.
+     */
+    function attempt(row, at) {
+        const running = inFlight.get(row.deviceId);
+        if (running) return running;
+        // Held until the request is answered, so a caller arriving while it is unanswered
+        // joins it rather than asking a second time. The row for a settled attempt is cleared
+        // or deferred by then, which is what leaves the map safe to empty.
+        const tracked = performRemoval(row, at).finally(() => inFlight.delete(row.deviceId));
+        inFlight.set(row.deviceId, tracked);
+        return tracked;
+    }
+
+    /**
      * One attempt at one owed deletion, and what it leaves behind.
      *
      * `2xx` is the relay having removed the device; `404` is the relay having nothing to
@@ -120,7 +156,7 @@ function createRelayDeletions({ store, relay, log }) {
      * cleared while the relay still holds the token is the orphan this queue exists to
      * prevent, and a refusal is not a removal no matter how permanent it looks.
      */
-    async function attempt(row, at) {
+    async function performRemoval(row, at) {
         const outcome = await relay.removeDevice({ deviceId: row.deviceId });
         if (outcome.ok || outcome.status === 404) {
             store.clearPendingRelayDeletion(row.deviceId);
@@ -154,7 +190,8 @@ function createRelayDeletions({ store, relay, log }) {
      *
      * A relay that refuses or cannot be reached is reported, never raised: the caller is
      * answering somebody who asked for a removal, and "this server's half is done, the
-     * relay's half is queued" is the truth rather than an error.
+     * relay's half is queued" is the truth rather than an error. A sweep already asking about
+     * this device is joined rather than raced, so the answer here is that attempt's.
      */
     async function forgetDeviceAtRelay(deviceId, { at = now() } = {}) {
         if (!relay.enabled) return { configured: false, queued: false, outcome: null };
@@ -170,6 +207,11 @@ function createRelayDeletions({ store, relay, log }) {
      * one deadline rather than a batch of them. `at` is the moment the sweep is running, and
      * it is the caller's — the same way `store.expireCalls` is given its cutoff — so a test
      * can say when "now" is rather than waiting for a schedule to come round.
+     *
+     * A due row another caller is already working on is not asked about a second time: the
+     * attempt in flight is awaited and its answer is what this sweep reports, so a device
+     * revoked a moment before the tick is not paid for twice from the installation's
+     * device-write allowance.
      */
     async function retryPendingRelayDeletions({ at = now() } = {}) {
         if (!relay.enabled) return { configured: false, attempted: 0, settled: [], pending: [] };

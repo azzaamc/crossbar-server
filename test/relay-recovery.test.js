@@ -39,10 +39,18 @@ const ahead = (hours) => new Date(Date.now() + hours * 3600 * 1000).toISOString(
  *
  * `answers` is a queue consumed in order, and anything past its end answers `200 {ok:true}`.
  * `destroy` drops the socket — the relay that received the request and whose answer never
- * came back, which is the failure this file exists for.
+ * came back, which is the failure this file exists for. `hold` keeps the request unanswered
+ * until `release()`, which is how a test gets a request that is in flight and can act in the
+ * window: a second caller shown not to ask again, or an upload made to land after a removal.
  */
 async function startStubRelay(answers = []) {
     const requests = [];
+    const waiting = [];
+    function reply(res, answer) {
+        if (answer.destroy) return res.socket.destroy();
+        res.writeHead(answer.status, { 'content-type': 'application/json' });
+        res.end(JSON.stringify(answer.body ?? {}));
+    }
     const server = http.createServer((req, res) => {
         const chunks = [];
         req.on('data', (chunk) => chunks.push(chunk));
@@ -50,9 +58,8 @@ async function startStubRelay(answers = []) {
             const raw = Buffer.concat(chunks).toString('utf8');
             requests.push({ method: req.method, path: req.url, body: raw ? JSON.parse(raw) : null });
             const answer = answers.shift() || { status: 200, body: { ok: true } };
-            if (answer.destroy) return req.socket.destroy();
-            res.writeHead(answer.status, { 'content-type': 'application/json' });
-            res.end(JSON.stringify(answer.body ?? {}));
+            if (answer.hold) waiting.push(res);
+            else reply(res, answer);
         });
     });
     await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -61,7 +68,23 @@ async function startStubRelay(answers = []) {
         url: `http://127.0.0.1:${server.address().port}`,
         rings: () => requests.filter((request) => request.path === '/v1/push/voip'),
         removals: () => requests.filter((request) => request.method === 'DELETE'),
+        held: () => waiting.length,
+        /** Wait until `count` requests are held unanswered, so a test can act on the one in flight. */
+        async waitHeld(count) {
+            for (let attempt = 0; attempt < 200 && waiting.length < count; attempt += 1) {
+                await new Promise((resolve) => setTimeout(resolve, 10));
+            }
+            assert.equal(waiting.length, count, `the stub is holding ${count} unanswered request(s)`);
+        },
+        /** Answer the oldest held request, with an accepted answer unless another is given. */
+        release(answer = { status: 200, body: { ok: true } }) {
+            const held = waiting.shift();
+            assert.ok(held, 'a held request to answer');
+            reply(held, answer);
+        },
         async close() {
+            // A held response would keep the server — and the client awaiting it — alive.
+            for (const held of waiting.splice(0)) held.destroy();
             server.closeAllConnections?.();
             await new Promise((resolve) => server.close(resolve));
         },
@@ -235,6 +258,112 @@ test('without a relay there is nothing to ask and nothing to retry', async (t) =
         { configured: false, queued: false, outcome: null });
     assert.equal(server.store.pendingRelayDeletions(ahead(24), 10).length, 1,
         'the row is neither attempted nor dropped');
+});
+
+// ── One removal, asked for once (REL-RELAY-03, the device-write allowance) ───────
+
+test('a device due now and a sweep tick do not both ask the relay to remove it', async (t) => {
+    // `forgetDeviceAtRelay` writes a row that is due immediately and asks the relay itself,
+    // and the sweep asks again for every row that is due. A tick landing while that request is
+    // unanswered used to issue a second DELETE for the same device: the relay's DELETE is
+    // idempotent in effect, so nothing breaks logically, but both calls meter against the
+    // installation's device-write allowance — a household spending its own registration
+    // allowance on duplicates. The stub holds the first request, which is exactly that window.
+    const stub = await startStubRelay([
+        { status: 200, body: { ok: true, registered: true } },
+        { hold: true },
+    ]);
+    t.after(() => stub.close());
+    const { server, base } = await startRelayedServer(t, stub);
+    await enrolPhone(base, DEVICE_ID);
+
+    const forgotten = server.lifecycle.forgetDeviceAtRelay(DEVICE_ID);
+    await stub.waitHeld(1);
+
+    // The sweep selects the row — it is due — and must join the attempt rather than start its
+    // own. Its select-and-attempt is one synchronous step, so the request is in flight and
+    // unanswered while it decides.
+    const sweep = server.lifecycle.retryPendingRelayDeletions({ at: ahead(24) });
+    assert.equal(stub.removals().length, 1,
+        'the sweep did not ask a second time for the device already being removed');
+
+    stub.release();
+    const [released, swept] = await Promise.all([forgotten, sweep]);
+    assert.equal(stub.removals().length, 1, 'answering it did not become a second request');
+    assert.equal(released.queued, false, 'the one removal that was asked for landed');
+    assert.equal(swept.attempted, 1);
+    assert.deepEqual(swept.settled, [DEVICE_ID], 'and the sweep reports the attempt it joined');
+
+    // A removal that is done is not attempted again: the row is gone, so the next tick has
+    // nothing to select and issues nothing.
+    const later = await server.lifecycle.retryPendingRelayDeletions({ at: ahead(48) });
+    assert.deepEqual([later.attempted, later.settled, later.pending], [0, [], []]);
+    assert.equal(stub.removals().length, 1, 'a completed deletion is not attempted twice');
+});
+
+test('an upload that lands after the removal was answered is re-asserted, so the relay is not left holding it', async (t) => {
+    // The race a token upload and a revocation run: the route reads the device as active, its
+    // PUT is in flight, an operator revokes — and the revocation's DELETE is answered and
+    // clears the row it wrote — and only then does the PUT land, re-creating the registration
+    // the removal just took away. Nothing would owe that removal afterwards: the relay's row
+    // holds the phone's PushKit token, so the phone earns a `409 token_conflict` wherever it
+    // enrols next, and the phone that was taken out of use is still ringable from here. That
+    // is the orphan `pending_relay_deletions` exists to prevent.
+    const stub = await startStubRelay([
+        { status: 200, body: { ok: true, registered: true } },                      // the enrol upload
+        { hold: true },                                                            // the launch upload, in flight
+        { status: 200, body: { ok: true, device_id: DEVICE_ID, removed: true } },  // the revocation's DELETE
+        { status: 500, body: { error: 'internal' } },                              // the re-asserted DELETE, refused
+    ]);
+    t.after(() => stub.close());
+    const { server, base } = await startRelayedServer(t, stub);
+    await enrolPhone(base, DEVICE_ID);
+
+    // A rotated token goes up, and the relay holds that PUT unanswered.
+    const upload = api(base, 'dad@dev', '/api/devices/push-token', {
+        method: 'POST',
+        body: { deviceId: DEVICE_ID, token: VOIP_TOKEN, environment: 'production', kind: 'voip' },
+    });
+    await stub.waitHeld(1);
+
+    // The operator revokes the device while the upload is in flight, and the relay answers
+    // that removal before the upload lands.
+    assert.equal(server.store.revokeDevice(DEVICE_ID, new Date().toISOString()), true);
+    const revoked = await server.lifecycle.forgetDeviceAtRelay(DEVICE_ID);
+    assert.equal(revoked.queued, false, 'setup: the removal is confirmed while the upload is still in flight');
+    assert.deepEqual(server.store.pendingRelayDeletions(ahead(24), 10), [],
+        'setup: nothing is owed at the moment the upload lands');
+
+    // The upload lands, re-creating the relay's row for a device this deployment has taken out
+    // of use. It is answered as a removal, not a registration: the relay does not hold it.
+    stub.release();
+    const answered = await upload;
+    assert.equal(answered.status, 200);
+    assert.equal(answered.data.saved, true);
+    assert.deepEqual(answered.data.relay, {
+        configured: true, ok: false, outcome: 'retryable', status: 500,
+        error: 'internal', retryAfterSeconds: null,
+    });
+
+    // The relay is owed the removal again, and the last thing it was asked was to remove the
+    // device — after the upload that re-created it.
+    assert.deepEqual(server.store.pendingRelayDeletions(ahead(24), 10).map((row) => row.deviceId),
+        [DEVICE_ID], 'the removal the upload undid is owed again');
+    assert.equal(stub.removals().length, 2, 'the removal was asked a second time, after the upload');
+    assert.deepEqual(
+        [stub.requests.at(-1).method, stub.requests.at(-1).path],
+        ['DELETE', `/v1/devices/${DEVICE_ID}`],
+        'the last word to the relay was the removal, not the registration',
+    );
+    assert.equal(server.store.deviceIdentity(DEVICE_ID).status, 'revoked');
+    assert.equal(server.store.voipTokensFor(['dad']).length, 0, 'and the phone is not ringable here');
+
+    // The queue finishes it when the relay answers: the re-assertion is a real request, not a
+    // row that is never attempted.
+    const landed = await server.lifecycle.retryPendingRelayDeletions({ at: ahead(24) });
+    assert.deepEqual(landed.settled, [DEVICE_ID]);
+    assert.deepEqual(server.store.pendingRelayDeletions(ahead(48), 10), [], 'and nothing is owed');
+    assert.equal(stub.removals().length, 3);
 });
 
 // ── A plaintext relay (SEC-RELAY-06) ───────────────────────────────────────────

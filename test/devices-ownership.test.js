@@ -283,6 +283,75 @@ test('a token another installation owns is answered as permanent, because no ret
     });
 });
 
+test('a suspended installation is retryable, and the phone keeps the token an operator can make good', async (t) => {
+    // The relay refuses a suspended installation with a `403`, and a suspension is something
+    // the operator did on purpose and can lift. Reading it as permanent — which any status
+    // that was not a 5xx, a 429 or a `request_in_progress` used to be — made the app drop the
+    // pending PushKit token, so the phone stayed unringable after the suspension was lifted
+    // until PushKit announced again on some later launch. It is `retryable`, on the same
+    // bounded backoff as a timeout: the relay sends no `Retry-After` on a `403`, and the app
+    // schedules from its own doubling backoff rather than from that field.
+    const stub = await startStubRelay([{ status: 403, body: { error: 'suspended' } }]);
+    const { server, base } = await startTestServer(withRelay(stub));
+    t.after(() => Promise.all([stub.close(), server.close()]));
+
+    await registerDevice(base, 'dad@dev', DEVICE_A, 'Dad');
+    const saved = await uploadVoipToken(base, 'dad@dev', DEVICE_A);
+
+    assert.equal(saved.status, 200);
+    assert.equal(saved.data.saved, true);
+    assert.deepEqual(saved.data.relay, {
+        configured: true, ok: false, outcome: 'retryable', status: 403,
+        error: 'suspended', retryAfterSeconds: null,
+    });
+    assert.equal(server.store.voipTokensFor(['dad']).length, 1, 'the token is kept: the suspension can be lifted');
+});
+
+test('every relay refusal but a token conflict is retryable, so a repeat is never the thing given up on', async (t) => {
+    // A `400 bad_request` is the relay refusing a body, and the old classification called it
+    // permanent for no better reason than that it was not one of the four retryable shapes.
+    // Nothing but `409 token_conflict` is a fact a repeat cannot change
+    // (`docs/PUSH_RELAY_INTEGRATION.md`).
+    const stub = await startStubRelay([
+        { status: 400, body: { error: 'bad_request' } },
+        { status: 404, body: { error: 'not_found' } },
+    ]);
+    const { server, base } = await startTestServer(withRelay(stub));
+    t.after(() => Promise.all([stub.close(), server.close()]));
+
+    await registerDevice(base, 'dad@dev', DEVICE_A, 'Dad');
+    const malformed = await uploadVoipToken(base, 'dad@dev', DEVICE_A);
+    assert.deepEqual(malformed.data.relay, {
+        configured: true, ok: false, outcome: 'retryable', status: 400,
+        error: 'bad_request', retryAfterSeconds: null,
+    });
+
+    const missing = await uploadVoipToken(base, 'dad@dev', DEVICE_A);
+    assert.deepEqual(missing.data.relay, {
+        configured: true, ok: false, outcome: 'retryable', status: 404,
+        error: 'not_found', retryAfterSeconds: null,
+    });
+    assert.equal(server.store.voipTokensFor(['dad']).length, 1, 'the token is kept throughout');
+});
+
+test('a token that is not a token is permanent before the relay is ever asked', async (t) => {
+    // The one refusal that is not the relay's answer: this process refusing an argument. It
+    // carries `status: 0` like a timeout, so it is told apart by its code, and no repeat of
+    // the same upload will make a malformed token well-formed.
+    const stub = await startStubRelay();
+    const { server, base } = await startTestServer(withRelay(stub));
+    t.after(() => Promise.all([stub.close(), server.close()]));
+
+    await registerDevice(base, 'dad@dev', DEVICE_A, 'Dad');
+    const saved = await uploadVoipToken(base, 'dad@dev', DEVICE_A, 'not-a-token');
+
+    assert.deepEqual(saved.data.relay, {
+        configured: true, ok: false, outcome: 'permanent', status: 0,
+        error: 'invalid_token', retryAfterSeconds: null,
+    });
+    assert.equal(stub.requests.length, 0, 'the relay was never asked a question it cannot answer');
+});
+
 test('a relay that never answers is retryable, and a deployment without one is too', async (t) => {
     const dropped = await startTestServer({
         pushRelayUrl: UNREACHABLE_RELAY,

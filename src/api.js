@@ -188,11 +188,26 @@ function createRequestHandler({ config, store, bus, push, apns, relay, lifecycle
      * How a relay attempt must be read, which is now part of what the routes answer.
      *
      * `saved`/`removed` is the end state reached. `retryable` means the same request sent
-     * again could yet succeed: it never arrived (`status: 0`), the relay answered 5xx or 429,
-     * another attempt holds the idempotency claim, or this deployment has no relay configured
-     * yet — a setting an operator can add, which is why it is retryable rather than a fact.
-     * `permanent` is a refusal asking again cannot change, which in this vocabulary is
-     * `409 token_conflict`: some other installation owns the token.
+     * again could yet succeed; `permanent` is a refusal asking again cannot change, and in the
+     * relay's vocabulary there is exactly one of those: `409 token_conflict`, some other
+     * installation owning the token. Everything else the relay can answer is retryable — a
+     * request that never arrived (`status: 0`), `5xx`, `429`, another attempt holding the
+     * idempotency claim, and a `403 suspended` an operator can lift — because the two mistakes
+     * are not equal in size: the app drops a pending PushKit token on `permanent` and keeps it
+     * on `retryable`, so reading a suspension as permanent leaves a phone that cannot be rung
+     * until PushKit re-announces on some later launch, for a fault an operator is about to fix
+     * (`docs/PUSH_RELAY_INTEGRATION.md`, relay `docs/API.md`).
+     *
+     * The one thing outside that sentence is a refusal this process made without asking the
+     * relay, which carries `status: 0` as a timeout does: `invalid_token` and
+     * `invalid_device_id` are facts about the request that repeating it cannot change, while
+     * `not_configured` and `unreachable` are the two a later attempt can.
+     *
+     * A `403 suspended` takes the same bounded retry as a timeout rather than a slower one of
+     * its own: this app retries six times on a doubling backoff and then leaves the token
+     * held for the next launch (`CallSession.pushTokenAttempts`), and it schedules from
+     * nothing but that backoff — it does not read `retryAfterSeconds`, the relay sends none on
+     * a `403`, and a delay invented here would be a number no caller acts on.
      *
      * Retryability is decided here rather than read off the client's `permanent` because that
      * flag answers a different question. For a *ring* a relay that is broken is worth giving
@@ -205,9 +220,11 @@ function createRequestHandler({ config, store, bus, push, apns, relay, lifecycle
         // A refusal this process made without asking the relay carries status 0 too, so the
         // status alone cannot tell "no relay configured" from "the token was never a token".
         if (outcome.status === 0) return RETRYABLE_LOCAL_ERRORS.has(String(outcome.error)) ? 'retryable' : 'permanent';
-        if (outcome.status >= 500 || outcome.status === 429) return 'retryable';
-        if (outcome.status === 409 && outcome.error === 'request_in_progress') return 'retryable';
-        return 'permanent';
+        // The only relay answer a repeat cannot change. Everything else falls through to
+        // retryable on purpose — including both `403`s, one of which is an operator's to lift
+        // (relay `docs/API.md`, "Errors").
+        if (outcome.status === 409 && outcome.error === 'token_conflict') return 'permanent';
+        return 'retryable';
     }
 
     /**
@@ -1340,7 +1357,27 @@ function createRequestHandler({ config, store, bus, push, apns, relay, lifecycle
             // what stops a registration made during a relay timeout from leaving the phone
             // permanently unringable.
             if (kind === 'voip') {
-                return sendJson(res, 200, { saved: true, relay: await registerAtRelay(id, token) });
+                const reported = await registerAtRelay(id, token);
+                // This upload and a revocation can cross: the status above was read as active,
+                // and by the time the relay answered, an operator had revoked the device — and
+                // the revocation's own DELETE may already have been answered, clearing the row
+                // it left owed. The relay would then hold a registration for a device this
+                // deployment has taken out of use, with nothing left owing its removal: the
+                // orphan `pending_relay_deletions` exists to prevent (REL-RELAY-03), and the
+                // phone would earn a `409 token_conflict` at whichever server enrolled it next.
+                // Re-asserting here, *after* the relay has answered the PUT, is the one order
+                // that cannot be raced — the relay has already written the row this request
+                // re-creates, so the deletion that follows is the last word, and the row is
+                // left owing the removal if the relay will not confirm it. The answer reported
+                // is that deletion's, not the registration the relay no longer holds.
+                const after = store.deviceIdentity(id);
+                if (after?.status !== 'active') {
+                    log.warn('push_token_upload_after_revocation', {
+                        deviceId: id, status: after?.status || 'gone',
+                    });
+                    return sendJson(res, 200, { saved: true, relay: await forgetAtRelay(id) });
+                }
+                return sendJson(res, 200, { saved: true, relay: reported });
             }
             return sendJson(res, 200, { saved: true });
         }
