@@ -281,6 +281,80 @@ test('a login that fails leaves the install standing, and the report says so', (
     assert.ok(text.includes('run this installer again'), 'the instructions do not say what to do after');
 });
 
+test('the relay is installed here when the relay is this box, and skipped only when it is another', (t) => {
+    // A real install wrote `CROSSBAR_TURN_HOST=devcall.azzaamc.com` — this box's own public name,
+    // which is what the wizard writes by default — and the installer read *any* name there as "a
+    // relay elsewhere": coturn was never installed, `crossbar-turn.service` was never installed,
+    // and the only failing line in doctor afterwards was TURN on a port nothing listened on. The
+    // decision is against this deployment's own hostname, not against a hostname being there.
+    const files = scratch(t);
+    const host = 'devcall.azzaamc.com';
+    const seeded = (answers) => {
+        fs.writeFileSync(files.answers, JSON.stringify(answers));
+        return dryRun(files, '');
+    };
+    const base = { mode: 'public', publicHostname: host, publicOrigin: `https://${host}` };
+
+    const own = seeded({ ...base, turnHost: host });
+    assert.ok(own.includes('Installing the coturn relay'), `coturn is not installed for this box's own name:\n${own}`);
+    assert.ok(!own.includes('a relay elsewhere was named'), own);
+
+    // And the default, where nobody named a relay at all: the wizard writes this box's name.
+    const derived = seeded(base);
+    assert.ok(derived.includes('Installing the coturn relay'), `the default relay is not installed:\n${derived}`);
+
+    // The one case that is genuinely elsewhere.
+    const elsewhere = seeded({ ...base, turnHost: 'turn.example.com' });
+    assert.ok(!elsewhere.includes('Installing the coturn relay'), `coturn is installed for another relay:\n${elsewhere}`);
+    assert.ok(elsewhere.includes('a relay elsewhere was named'), elsewhere);
+});
+
+test('the certificate wait is bounded, and ends at the first answer rather than the ceiling', (t) => {
+    // What a real install did: `doctor` ran seconds after the restart, before ACME had answered,
+    // and reported `TLS certificate`, `HTTPS` and `WebSocket` as failures that a second run a
+    // minute later turned green. The wait before those checks is what this holds to account — it
+    // must stop as soon as TLS answers, and must not run past its stated ceiling when it never
+    // does.
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'crossbar-tls-wait-'));
+    t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+    const count = path.join(dir, 'probes');
+    const curl = path.join(dir, 'curl');
+    fs.writeFileSync(curl, [
+        '#!/bin/sh',
+        `probes=$(cat ${JSON.stringify(count)} 2>/dev/null || echo 0)`,
+        'probes=$((probes + 1))',
+        `printf '%s' "$probes" > ${JSON.stringify(count)}`,
+        // A real curl prints the status code here; `000` is what it prints when nothing answered.
+        'if [ "$probes" -ge "${ANSWER_AFTER:-1}" ]; then printf 200; else printf 000; fi',
+        '',
+    ].join('\n'), { mode: 0o755 });
+    const wait = (answerAfter, ceiling) => {
+        fs.rmSync(count, { force: true });
+        const run = spawnSync('bash', ['-c', [
+            'set -euo pipefail',
+            `. ${path.join(ROOT, 'scripts', 'lib', 'deploy.sh')}`,
+            'DRY_RUN=0',
+            `NODE_BIN=${JSON.stringify(process.execPath)}`,
+            `export PATH=${JSON.stringify(dir)}:$PATH`,
+            `if wait_for_tls example.test ${ceiling} 1; then echo TLS-OK; else echo TLS-TIMEOUT; fi`,
+        ].join('\n')], { encoding: 'utf8', env: { ...process.env, ANSWER_AFTER: String(answerAfter) } });
+        assert.equal(run.status, 0, `the wait exited non-zero:\n${run.stderr}`);
+        return { text: `${run.stdout}${run.stderr}`, probes: Number(fs.readFileSync(count, 'utf8')) };
+    };
+
+    // Answers second time round: two probes, and it stops there rather than spending the ceiling.
+    const answered = wait(2, 8);
+    assert.match(answered.text, /TLS-OK/);
+    assert.equal(answered.probes, 2, `the wait did not stop at the first answer:\n${answered.text}`);
+    assert.match(answered.text, /Waiting up to 8s/, 'the ceiling is not stated where an operator reads it');
+
+    // Never answers: exactly the ceiling's worth of probes and a non-zero answer, so the caller can
+    // report it rather than wait forever.
+    const silent = wait(99, 2);
+    assert.match(silent.text, /TLS-TIMEOUT/);
+    assert.equal(silent.probes, 2, `the wait ran past its ceiling:\n${silent.text}`);
+});
+
 test('a login that finishes reads the name back and corrects the address', (t) => {
     // `.env` holds the wizard's guess; the stub joins as `crossbar-dev` once approved. The front
     // door must read that back and correct `.env` to the machine's own address — the correction is

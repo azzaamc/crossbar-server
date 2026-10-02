@@ -566,11 +566,48 @@ fi
 # report the closing block used to hand to a person to run. So it is run here, at the end, when
 # everything it reads is finally in place.
 #
-# A first install will often have a line or two wrong: the DNS record, the certificate Caddy has
-# just asked for, a port forward nobody has made yet. Those are the front door's business and the
-# install is complete without them, so this phase reports rather than fails — a non-zero exit is
-# what `doctor` says about its own lines, not about this install.
+# A first install will often have a line or two wrong: the DNS record, a port forward nobody has
+# made yet. Those are the front door's business and the install is complete without them, so this
+# phase reports rather than fails — a non-zero exit is what `doctor` says about its own lines, not
+# about this install.
+#
+# The certificate is the exception it would be wrong to report as either: it is neither wrong nor
+# missing, it is *in flight*. Caddy asks its issuer for one the moment the shaper unit starts it,
+# and an answer takes seconds or tens of seconds — so `doctor` run straight after the restart
+# reported `TLS certificate`, `HTTPS` and `WebSocket` as failures on a box where nothing was wrong,
+# and a second run a minute later turned all three green. So the wait is explicit, bounded and
+# stated, and it is skipped where it could only burn the ceiling: a deployment not in public mode
+# has no certificate at all, and a name that does not resolve has no certificate in flight — the
+# checks say so in a second instead.
 step 'the checks'
+CERTIFICATE_WAIT_SECONDS="${CERTIFICATE_WAIT_SECONDS:-90}"
+FRONT_DOOR_MODE=''
+FRONT_DOOR_HOST=''
+if [ "$DRY_RUN" = '1' ]; then
+    # Nothing has been written, so the answers file stands in for what the wizard would write: the
+    # mode in force if it says one (`both` is private, which is what the wizard derives), and the
+    # public name.
+    FRONT_DOOR_MODE="$(answers_field "$ANSWERS" inForce)"
+    if [ -z "$FRONT_DOOR_MODE" ]; then FRONT_DOOR_MODE="$(answers_field "$ANSWERS" mode)"; fi
+    FRONT_DOOR_HOST="$(answers_field "$ANSWERS" publicHostname)"
+else
+    FRONT_DOOR_MODE="$(env_value CROSSBAR_NETWORK_MODE || true)"
+    FRONT_DOOR_HOST="$(env_value NETWORK_MODE_PUBLIC_HOSTNAME || true)"
+    if [ -z "$FRONT_DOOR_HOST" ]; then FRONT_DOOR_HOST="$(env_value CROSSBAR_PUBLIC_HOSTNAME || true)"; fi
+fi
+if [ "$FRONT_DOOR_MODE" = 'public' ] && [ -n "$FRONT_DOOR_HOST" ]; then
+    if [ "$DRY_RUN" = '1' ]; then
+        wait_for_tls "$FRONT_DOOR_HOST" "$CERTIFICATE_WAIT_SECONDS" 5
+    elif ! resolves "$FRONT_DOOR_HOST"; then
+        warn "$FRONT_DOOR_HOST does not resolve, so there is no certificate to wait for yet: the DNS"
+        warn 'record is in the next steps, and doctor below says the same.'
+    elif wait_for_tls "$FRONT_DOOR_HOST" "$CERTIFICATE_WAIT_SECONDS" 5; then
+        ok "the front door answers over TLS at $FRONT_DOOR_HOST"
+    else
+        warn "$FRONT_DOOR_HOST did not answer over TLS within ${CERTIFICATE_WAIT_SECONDS}s. Caddy"
+        warn 'keeps trying the certificate itself; doctor below says what it sees right now.'
+    fi
+fi
 if [ "$DRY_RUN" = '1' ]; then
     would_run "cd $PREFIX && $NODE_BIN src/admin.js doctor"
 else

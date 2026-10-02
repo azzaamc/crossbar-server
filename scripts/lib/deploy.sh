@@ -606,26 +606,76 @@ answers_mode() { # answers_mode <file-or-''>
     answers_field "$1" mode
 }
 
+# Whether a name resolves at all, which is what tells "the certificate is still being obtained"
+# from "nothing points here yet": the first is worth waiting for and the second is not.
+resolves() { # resolves <host>
+    "$NODE_BIN" -e 'require("node:dns").lookup(process.argv[1], (error) => process.exit(error ? 1 : 0))' "$1"
+}
+
+# Wait, bounded, for a name to answer over TLS — which for a fresh public deployment means waiting
+# for Caddy's certificate.
+#
+# This is the one thing a first install is legitimately in the middle of when it ends: Caddy asks
+# its issuer the moment the shaper unit starts it, and the answer takes seconds, or tens of seconds
+# on a retry. `doctor`, run straight after the restart, reported `TLS certificate`, `HTTPS` and
+# `WebSocket` as failures on a box where nothing was wrong — and a second run a minute later turned
+# all three green — which an operator cannot tell from a front door that is really broken.
+#
+# Any answer at all means the certificate is there: a 401 or a 404 is this deployment's own front
+# door refusing a path, not a TLS failure. Returns 0 as soon as one arrives and 1 at the ceiling,
+# which the caller reports rather than fails over. `interval` is how long to leave between probes.
+wait_for_tls() { # wait_for_tls <host> <seconds> <interval>
+    local host="$1" ceiling="$2" interval="$3" waited=0 code=''
+    if [ "$DRY_RUN" = '1' ]; then
+        would_run "wait up to ${ceiling}s for https://$host to answer (Caddy's certificate)"
+        return 0
+    fi
+    say "Waiting up to ${ceiling}s for $host to answer over TLS: Caddy asks for the certificate when the front door starts, so the first answer can take a moment."
+    while [ "$waited" -lt "$ceiling" ]; do
+        code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "https://$host" || true)"
+        if [ -n "$code" ] && [ "$code" != '000' ]; then
+            return 0
+        fi
+        sleep "$interval"
+        waited=$((waited + interval))
+    done
+    return 1
+}
+
 # Whether this deployment's call relay is coturn on this box.
 #
-# The wizard records the deployment's own address as the relay when nobody names another one
-# (`ownRelayHost` in `src/setup.js`), so an install that was not told about another host runs the
-# relay here — and a relay that is not running is worse than none, because the summary would report
-# this box's own address as a working one. `--with-relay` says it outright, and a `turnserver`
-# already on the host says it always has been.
+# The wizard records the deployment's own address as the relay unless somebody names another one
+# (`ownRelayHost` in `src/setup.js`: the public block's hostname, or the private one), so an install
+# that was not told about another host runs the relay here — and a relay that is not running is
+# worse than none, because the summary reports this box's own address as a working one.
 #
-# The host is read from the answers file in a dry run and from the file the wizard wrote in a real
-# one; `''` (nobody named one) means the default, which is this box.
+# The comparison is against this deployment's own hostname, and that is the whole of the decision:
+# the default writes `CROSSBAR_TURN_HOST` *as this box's own name*, so asking whether it names
+# anything at all reads the default as "a relay elsewhere was named" — which is how a real install
+# skipped coturn on the host that was itself the relay, and ended with nothing listening on 3478.
+# What `CROSSBAR_TURN_HOST` has to say to mean "elsewhere" is a name that is not this box's.
+#
+# Read from the answers file in a dry run, where the wizard has written no `.env` yet, and from the
+# file it did write in a real one. `--with-relay` says yes outright, and a `turnserver` already on
+# the host says it always has been.
 relay_wanted() { # relay_wanted <answers-file-or-''>
     if [ -n "$WITH_RELAY" ] || relay_is_present; then return 0; fi
-    local named=''
+    local named='' own=''
     if [ "$DRY_RUN" = '1' ]; then
         named="$(answers_field "$1" turnHost)"
-    elif [ -f "$PREFIX/.env" ]; then
+        own="$(answers_field "$1" publicHostname)"
+        if [ -z "$own" ]; then own="$(answers_field "$1" privateHostname)"; fi
+    else
         named="$(env_value CROSSBAR_TURN_HOST || true)"
+        own="$(env_value NETWORK_MODE_PUBLIC_HOSTNAME || true)"
+        if [ -z "$own" ]; then own="$(env_value CROSSBAR_PUBLIC_HOSTNAME || true)"; fi
+        if [ -z "$own" ]; then own="$(env_value NETWORK_MODE_PRIVATE_HOSTNAME || true)"; fi
     fi
-    # Empty — nobody named another host — is the default, which is coturn on this box.
-    [ -z "$named" ]
+    # Nothing named at all is the default, and the default is this box.
+    if [ -z "$named" ] || [ "$named" = "$own" ]; then
+        return 0
+    fi
+    return 1
 }
 
 # The public door: Caddy, the drop-in that hands it the same `.env` the server reads, the

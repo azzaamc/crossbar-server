@@ -897,7 +897,12 @@ have run:
 2. Then the real run. It prints one `==` phase per step with a `✓` outcome under it — the
    commands themselves are what `--dry-run` prints, and the output of apt, Tailscale's installer
    and `npm ci` goes to `/var/log/crossbar-install.log` instead — then the wizard's summary and
-   its check block, `✓ the server is up: …`, and `doctor`'s own report. If it refuses, it refuses
+   its check block, `✓ the server is up: …`, and `doctor`'s own report. In public mode the run
+   says it is waiting for the certificate before it asks `doctor` (up to 90s,
+   `CERTIFICATE_WAIT_SECONDS` to change it, and skipped for a name that does not resolve): Caddy
+   asks its issuer the moment the front door starts, an answer takes seconds, and `doctor` run
+   before it arrives reports `TLS certificate`, `HTTPS` and `WebSocket` as failures that are not.
+   If it refuses, it refuses
    before installing a
    unit — with `--answers` or a terminal the directory file is written, so a refusal there is the
    wizard naming an answer it is missing; with `--no-setup` the messages name the file to write,
