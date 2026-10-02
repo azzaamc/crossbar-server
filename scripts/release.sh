@@ -76,7 +76,12 @@ step 'the state of the tree'
 COMMIT=''
 if command -v git >/dev/null 2>&1 && git -C "$SRC" rev-parse --git-dir >/dev/null 2>&1; then
     COMMIT="$(git -C "$SRC" rev-parse --short HEAD)"
-    DIRTY="$(git -C "$SRC" status --porcelain)"
+    # The release artefacts are excluded from the tarball below, so a stale one is not an edit the
+    # build would carry: it is the thing this build is about to replace. Counting it here made a
+    # stale artefact block its own replacement — which cost a commit that claimed a build it did not
+    # contain (measured 2026-10-02: the guard refused, and the error read like an unrelated edit).
+    DIRTY="$(git -C "$SRC" status --porcelain \
+        | grep -vE "[[:space:]]crossbar-server-[^[:space:]]*\.tar\.gz(\.sha256)?$" || true)"
     say "commit:  $COMMIT"
     if [ -n "$DIRTY" ]; then
         DIRTY_COUNT="$(printf '%s\n' "$DIRTY" | wc -l | tr -d ' ')"
