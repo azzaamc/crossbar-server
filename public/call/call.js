@@ -22,12 +22,15 @@ const detailEl = document.getElementById('status-detail');
 const muteButton = document.getElementById('toggle-mute');
 const cameraButton = document.getElementById('toggle-camera');
 const endButton = document.getElementById('end');
+const answerButton = document.getElementById('answer');
 
 const state = {
     socket: null,
     admitted: false,
     myPeerId: '',
     myName: '',
+    /** This browser's device session, once one has been minted. See `ensureSession`. */
+    sessionToken: '',
     peers: new Map(), // peerId -> { pc, name, videoEl, videoOff }
     pendingIce: new Map(), // peerId -> RTCIceCandidateInit[]
     localStream: null,
@@ -79,6 +82,10 @@ async function api(path, options = {}) {
         headers: {
             'content-type': 'application/json',
             'x-crossbar-device': deviceId(),
+            // A public deployment demands a session of every client, and `x-crossbar-session` is
+            // the carrier a page can set on a fetch. Without it every call here is a 401, which is
+            // what this page did before: the room looked empty and the reason was never shown.
+            ...(state.sessionToken ? { 'x-crossbar-session': state.sessionToken } : {}),
             ...(options.headers || {}),
         },
     });
@@ -87,6 +94,32 @@ async function api(path, options = {}) {
         throw new Error(data.error?.message || `Request failed (${response.status})`);
     }
     return data;
+}
+
+/**
+ * The session this browser holds, minted from the device key it enrolled with.
+ *
+ * `CrossbarDevice` is the same module the operator console uses to enrol a browser, and it signs
+ * the server's challenge with a key generated unextractable — the nearest a page has to the
+ * Secure Enclave the native app keeps its own in. An empty answer means this browser has no key:
+ * it has never been enrolled, and no amount of retrying here will change that. That is said
+ * plainly rather than left to surface as a 401 from somewhere further in.
+ */
+async function ensureSession() {
+    if (typeof CrossbarDevice === 'undefined') {
+        note('the device module did not load — this page cannot authenticate');
+        return '';
+    }
+    try {
+        state.sessionToken = await CrossbarDevice.session();
+    } catch (error) {
+        note(`could not establish a session: ${error.message}`);
+        state.sessionToken = '';
+    }
+    if (!state.sessionToken) {
+        note('this browser is not enrolled with this server — enrol it from the console first');
+    }
+    return state.sessionToken;
 }
 
 // ── Tiles ───────────────────────────────────────────────────────────────────────
@@ -133,8 +166,15 @@ function emit(name, payload) {
 
 function connect() {
     const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
-    const url = `${scheme}://${location.host}/socket.io/?EIO=4&transport=websocket&device=${encodeURIComponent(deviceId())}`;
-    note(`connecting ${url}`);
+    // The token rides in the query string because a browser cannot set a header on a WebSocket
+    // upgrade — the server's own reason for accepting `?token=` at all (`src/auth.js`). The native
+    // client does exactly this (`MiroTalkSignalClient.swift`).
+    const token = state.sessionToken
+        ? `&token=${encodeURIComponent(state.sessionToken)}`
+        : '';
+    const url = `${scheme}://${location.host}/socket.io/?EIO=4&transport=websocket`
+        + `&device=${encodeURIComponent(deviceId())}${token}`;
+    note(`connecting ${url.replace(/token=[^&]*/, 'token=<hidden>')}`);
 
     const socket = new WebSocket(url);
     state.socket = socket;
@@ -501,7 +541,12 @@ window.crossbarStatus = reportStatus;
 
 function watchCallStatus() {
     if (!callId) return;
-    const source = new EventSource('/api/events');
+    // An `EventSource` cannot set headers either, so this is the other place the query string is
+    // the only carrier the platform offers.
+    const token = state.sessionToken
+        ? `?token=${encodeURIComponent(state.sessionToken)}`
+        : '';
+    const source = new EventSource(`/api/events${token}`);
     source.addEventListener('call-status', (event) => {
         let call;
         try {
@@ -540,11 +585,35 @@ async function start() {
         headline('Connecting…');
         await acquireMedia();
 
+        await ensureSession();
+
         const session = await api('/api/session');
         state.myName = session.user?.displayName || session.identity?.name || 'You';
         note(`who: ${state.myName}`);
 
-        const joined = await api(`/api/calls/${encodeURIComponent(callId)}/join`, { method: 'POST' });
+        let joined;
+        try {
+            joined = await api(`/api/calls/${encodeURIComponent(callId)}/join`, { method: 'POST' });
+        } catch (refusal) {
+            // The join route refuses an invitation nobody has answered, and a browser has no ring
+            // to answer with. So it is answered here — by a tap, never by the act of opening a
+            // link, because opening one is not somebody agreeing to be in a call.
+            headline('Incoming call');
+            note(refusal.message);
+            note('answer to join this call');
+            showStatus(true);
+            if (!answerButton) throw refusal;
+            answerButton.hidden = false;
+            await new Promise((resolve) => answerButton.addEventListener('click', resolve, { once: true }));
+            answerButton.hidden = true;
+            headline('Connecting…');
+            await api(`/api/calls/${encodeURIComponent(callId)}/respond`, {
+                method: 'POST',
+                body: JSON.stringify({ response: 'accepted' }),
+            });
+            note('answered');
+            joined = await api(`/api/calls/${encodeURIComponent(callId)}/join`, { method: 'POST' });
+        }
         note(`call ${joined.call?.status || '?'}, room ${roomFromUrl.slice(0, 8)}`);
 
         connect();
