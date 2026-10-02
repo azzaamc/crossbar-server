@@ -124,6 +124,13 @@ run tar -C "$SRC" -cf "$STAGE/tree.tar" \
     --exclude='./crossbar-server-*.tar.gz*' .
 run tar -C "$STAGE/crossbar-server-$VERSION" -xf "$STAGE/tree.tar"
 run rm -f "$STAGE/tree.tar"
+# Deleted rather than merely excluded, because excluding them from the *inner* tar is not enough on
+# macOS: `tar` there restores extended attributes on extraction and writes a `._name` beside them
+# again when the *outer* tar reads the staging tree — so the exclusions above proved decorative and
+# the first real install-from-artefact found 92 of them in a 184-entry release. Verified by listing
+# the release with GNU tar on the host, not with the BSD tar that wrote it: that one *hides* these
+# entries when it lists them, which is how the mistake survived a check.
+run find "$STAGE/crossbar-server-$VERSION" -name '._*' -delete
 run tar -C "$STAGE" -czf "$OUT/$TARBALL" "crossbar-server-$VERSION"
 
 # `sha256sum` on Debian, `shasum -a 256` on the Mac this may be built on. Both write
