@@ -126,11 +126,18 @@ test('the frames are the ones a Clack prompt draws', () => {
         '│  house.tailnet.ts.net',
         '└',
     ]);
+    // An answered question is one line: the frame it asked with is replaced by the line that
+    // answers it, and that line is what the run is made of.
     assert.deepEqual(frames.textFrame({ ...waiting, value: 'house', caret: 5, settled: 'submitted' }, question), [
-        '│',
-        '◇  the tailnet name',
-        '│  house',
+        '◇  the tailnet name · house',
     ]);
+    // And a hidden one settles on the word, not on what was typed: this line is the one place a
+    // password could be printed, and it is not.
+    assert.deepEqual(
+        frames.textFrame({ value: 'correct horse battery', caret: 20, settled: 'submitted' },
+            { message: 'New console password', paint: PLAIN, hidden: true }),
+        ['◇  New console password · set'],
+    );
     // A refusal keeps the question and the input, and says what is wrong under it: the field is
     // still there to be corrected, which is what makes it a re-ask rather than a failure.
     assert.deepEqual(frames.textFrame({ ...waiting, value: '0.0.0.0', problem: 'Nothing may bind 0.0.0.0.' }, question), [
@@ -152,8 +159,8 @@ test('the frames are the ones a Clack prompt draws', () => {
         '└',
     ]);
     assert.deepEqual(
-        frames.selectFrame({ cursor: 1, settled: 'submitted' }, { message: MENU.message, options: MENU.options, paint: PLAIN }).at(-1),
-        '│  Public',
+        frames.selectFrame({ cursor: 1, settled: 'submitted' }, { message: MENU.message, options: MENU.options, paint: PLAIN }),
+        ['◇  Which modes is this deployment reached in? · Public'],
     );
 
     assert.deepEqual(frames.confirmFrame({ value: false, settled: null }, { message: 'another person?', paint: PLAIN }), [
@@ -169,7 +176,8 @@ test('the frames carry the paint when there is a terminal to carry it to', () =>
     // are asserted here rather than left to the eye: green `◇` for what was submitted, cyan `◆`
     // for what is being asked, dim for what is only a hint.
     const submitted = frames.textFrame({ value: 'house', caret: 5, settled: 'submitted' }, { message: 'name' });
-    assert.match(submitted[1], /^\u001b\[32m◇\u001b\[39m {2}name$/);
+    assert.equal(submitted.length, 1);
+    assert.match(submitted[0], /^\u001b\[32m◇\u001b\[39m {2}name \u001b\[90m·\u001b\[39m \u001b\[2mhouse\u001b\[22m$/);
     const waiting = frames.textFrame({ value: '', caret: 0, problem: '', settled: null }, { message: 'name', placeholder: 'house' });
     assert.match(waiting[1], /^\u001b\[36m◆\u001b\[39m {2}name$/);
     // The caret's own character is turned about, and the rest of what is offered is dimmed.
@@ -224,7 +232,7 @@ test('a menu wraps at both ends, and settles on the option the pointer is on', a
     const wrapped = await answer(up, (ui) => ui.select({ ...MENU, initial: 'private' }), '\x1b[A', '\r');
     assert.equal(wrapped, 'both');
     assert.match(up.seen(), /│  ○ Private \(the tailnet\)\n│  ○ Public\n│  ● Both/);
-    assert.match(up.seen(), /◇  Which modes is this deployment reached in\?\n│  Both/);
+    assert.match(up.seen(), /◇  Which modes is this deployment reached in\? · Both\n/);
 
     const down = terminal(t);
     // And one press down from the last arrives at the first, so the pointer has nowhere to stop.
@@ -316,7 +324,7 @@ test('a field that refuses asks again, with what was typed still in it', async (
     // Edited down to something bindable, and the same field settles.
     await press(where.input, '\u007f\u007f\u007f\u007f\u007f\u007f', '\r');
     assert.equal(await asked, '0');
-    assert.match(where.seen(), /◇  the address Caddy binds\n│  0\n/);
+    assert.match(where.seen(), /◇  the address Caddy binds · 0\n/);
 });
 
 test('a field takes the default it is showing when Enter is pressed', async (t) => {
@@ -330,7 +338,7 @@ test('a field takes the default it is showing when Enter is pressed', async (t) 
     // The default was on the screen before Enter — that is what "shown" means — and it was the
     // placeholder, so it reads as offered rather than as typed.
     assert.match(where.seen(), /◆  the tailnet name\n│  house\.tailnet\.ts\.net\n└/);
-    assert.match(where.seen(), /◇  the tailnet name\n│  house\.tailnet\.ts\.net/);
+    assert.match(where.seen(), /◇  the tailnet name · house\.tailnet\.ts\.net/);
 });
 
 test('a yes-or-no question answers to y, n, the arrow keys and Enter', async (t) => {
@@ -358,44 +366,47 @@ test('a keypress means what Clack means by it, and a field takes what a person t
     assert.equal(steps.textStep(typed, stroke('', { name: 'left' })).caret, 2);
 });
 
-test('the next step takes the previous one off the screen, and the last note stays', async (t) => {
-    // The whole of requirement one: a question is a bounded area, and the question after it erases
-    // that area rather than being printed under it. The screen holds the current step, not the
-    // history of the run.
+test('an answered step leaves one line behind, and the record stays', async (t) => {
+    // The whole of requirement one: the only thing drawn over itself is the question being
+    // answered. As it settles, that frame is replaced by the one line that answers it, and the
+    // line stays — the step after it is drawn *under* it, so what a person has at the end of a run
+    // is one line per answer, in the order they gave them, with the summary under those.
     const where = terminal(t);
     const first = where.ui.text({ message: 'the first question', defaultValue: 'one' });
     await press(where.input, '\r');
     assert.equal(await first, 'one');
-    assert.deepEqual(screenOf(where.written(), 80), [
-        '│',
-        '◇  the first question',
-        '│  one',
-    ]);
+    assert.deepEqual(screenOf(where.written(), 80), ['◇  the first question · one']);
 
     const second = where.ui.text({ message: 'the second question', defaultValue: 'two' });
     await press(where.input, '\r');
     assert.equal(await second, 'two');
-    // One frame on the screen: the first question is nowhere in what a person is looking at.
     assert.deepEqual(screenOf(where.written(), 80), [
-        '│',
-        '◇  the second question',
-        '│  two',
+        '◇  the first question · one',
+        '◇  the second question · two',
     ]);
 
-    // A note between two questions is a step too: it replaces the question before it, and the
-    // question after replaces it. Nothing of either is left above the last frame.
+    // A note is part of the record too, and it stays where it was said: the question before it and
+    // the question after are both still there, in order, with the note between them. A select and
+    // a text field here because the kinds of step settle differently — a label and a value.
     const noted = terminal(t);
-    const asked = noted.ui.text({ message: 'a question', defaultValue: 'x' });
+    const chose = noted.ui.select({ ...MENU, initial: 'both' });
     await press(noted.input, '\r');
-    assert.equal(await asked, 'x');
-    noted.ui.note('the derived id, said between two questions', 'The directory');
-    const notedScreen = screenOf(noted.written(), 80);
-    assert.match(notedScreen[1], /^◇  The directory ─+╮$/);
-    assert.equal(notedScreen.some((line) => line.includes('a question')), false,
-        `the question above the note is still there: ${notedScreen.join(' / ')}`);
+    assert.equal(await chose, 'both');
+    noted.ui.note('Abdullah will be known as abdullah.', 'The person');
+    const logged = noted.ui.text({ message: 'abdullah: their Tailscale login', defaultValue: 'abdullah@dev' });
+    await press(noted.input, '\r');
+    assert.equal(await logged, 'abdullah@dev');
 
-    // The last note is a thing that stays: the outro after it is drawn under it rather than over
-    // it, so the summary this wizard ends with is still on the screen.
+    const lines = screenOf(noted.written(), 80);
+    const at = (needle) => lines.findIndex((line) => line.includes(needle));
+    assert.equal(lines[at('Which modes is this deployment reached in?')], '◇  Which modes is this deployment reached in? · Both',
+        lines.join('\n'));
+    assert.ok(at('Abdullah will be known as abdullah.') > at('Which modes is this deployment reached in?'), lines.join('\n'));
+    assert.equal(lines[at('abdullah: their Tailscale login')], '◇  abdullah: their Tailscale login · abdullah@dev',
+        lines.join('\n'));
+
+    // The summary is a note like any other, and the last one: the outro after it is drawn under it
+    // rather than over it, so the box this wizard ends with is still on the screen, whole.
     const summary = terminal(t);
     summary.ui.note('Modes      private', 'Crossbar setup');
     const afterNote = screenOf(summary.written(), 80);
@@ -403,20 +414,6 @@ test('the next step takes the previous one off the screen, and the last note sta
     const afterOutro = screenOf(summary.written(), 80);
     assert.deepEqual(afterOutro.slice(0, afterNote.length), afterNote, 'the summary is still there');
     assert.equal(afterOutro.at(-1), '└  Set up.');
-
-    // A command the wizard ran in this terminal takes the region with it: what it printed is not
-    // the wizard's to erase, so `forget` stops accounting for it and the next step draws under it.
-    // This is asserted on what was written and not on `screenOf`, whose model of a bare `\n` is not
-    // a cooked terminal's (a note is drawn with the escape sequences and `\n`, which a terminal
-    // translates to a carriage return as well — the frames a prompt draws use `\r\n` themselves).
-    const afterACommand = terminal(t);
-    afterACommand.ui.note('a note before the command', 'Before');
-    const beforeForget = afterACommand.written().length;
-    afterACommand.ui.forget();
-    afterACommand.ui.note('a note after it', 'After');
-    const between = afterACommand.written().slice(beforeForget);
-    assert.equal(between.includes('\u001b[0J'), false, 'the region was erased after the command');
-    assert.match(afterACommand.written(), /After/, 'the note after the command is missing');
 });
 
 test('a run with no terminal is refused, and nothing is written anywhere', () => {

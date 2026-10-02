@@ -219,19 +219,16 @@ test('without a key and no terminal, the login is not attempted and the instruct
     // Not attempted: no command the installer would run, and no key.
     assert.equal(commandLines(text, 'TS_AUTHKEY=<hidden>').length, 0, `a login was attempted:\n${text}`);
     assert.ok(!text.includes('logging this machine in:'), `the login was run without a terminal:\n${text}`);
-    // The instructions: the exact command, what it does, and that a re-run finishes it.
+    // The instructions: the exact command, and that running this installer again finishes it.
     assert.ok(text.includes('    sudo ') && text.includes('up --operator=admin --hostname crossbar-dev'),
         `the login command is not printed:\n${text}`);
-    assert.ok(text.includes('That prints a link and waits'), 'the instructions do not say what the command does');
-    assert.ok(text.includes('open it and approve this machine'), 'the instructions do not say to approve the machine');
-    assert.ok(text.includes('Then run this installer'), 'the instructions do not say what to do after');
+    assert.ok(text.includes('run this installer again'), `the instructions do not say what to do after:\n${text}`);
 });
 
 test('without a key, a name that disagrees is offered and corrected through the wizard', (t) => {
     const text = dryRun(scratch(t), REAL);
-    assert.ok(text.includes(`the private address in .env is ${GUESS}, and this machine answers at ${REAL}:`),
-        `no correction offer in:\n${text}`);
-    assert.ok(text.includes('an invitation carries that address'), 'the offer does not say why it matters');
+    // The offer itself is asserted by what it causes below — the correction run — rather than by
+    // the sentence it is made of, which is prose an operator reads and not a contract.
     // One call, into the wizard that keeps every other value and every secret — not a second writer,
     // and not the answers file again (which could carry the wrong address, or new secrets).
     const runs = wizardRuns(text);
@@ -243,19 +240,17 @@ test('without a key, a name that disagrees is offered and corrected through the 
 
 test('without a key, a name that agrees leaves the file alone', (t) => {
     const text = dryRun(scratch(t), GUESS);
-    assert.ok(!text.includes('Running the wizard again'), `a correction was offered for an agreeing name:\n${text}`);
-    assert.ok(!text.includes('the private address in .env is'), 'a mismatch was reported for an agreeing name');
     assert.equal(wizardRuns(text).length, 1, `the wizard was re-run for an agreeing name:\n${text}`);
 });
 
 test('without a key and not logged in, the report and the final report say the login is left', (t) => {
     const text = dryRun(scratch(t, 'crossbar-dev'), '');
-    assert.ok(text.includes("One step here is still a person's"), 'the login is not named as a person\'s step');
-    assert.ok(text.includes('There is no terminal here to show Tailscale'), `the reason is not said:\n${text}`);
-    // The final report states what happened, and reuses the same instruction block.
-    assert.ok(text.includes('but this machine is not logged in yet'), `the final report is silent:\n${text}`);
+    // The reason the login was not attempted — there is no terminal for its link — and then, at the
+    // end of the install, what state the machine is in and the command that fixes it.
+    assert.ok(text.includes('no terminal here to show its link'), `the reason is not said:\n${text}`);
+    assert.ok(text.includes('not logged in yet'), `the final report is silent:\n${text}`);
     assert.ok(text.includes('up --operator=admin --hostname crossbar-dev'), 'the final report does not name the command');
-    assert.ok(text.includes('Then run this installer'), 'the final report does not say how it is fixed');
+    assert.ok(text.includes('run this installer again'), 'the final report does not say how it is fixed');
 });
 
 test('the login the installer leaves for a person is the same one it would have run', (t) => {
@@ -278,13 +273,12 @@ test('a login that fails leaves the install standing, and the report says so', (
     const { status, text } = frontDoor(t, { tailnetName: '', upOk: false });
     assert.equal(status, 0, `a failed login stopped the install:\n${text}`);
     assert.ok(text.includes('FRONT-DOOR-OK'), `the front door did not finish:\n${text}`);
-    assert.ok(text.includes('The login was run here and did not finish'), `the failure is not reported:\n${text}`);
-    // The instruction block, exactly as a person reads it.
+    // The failed login is named as failed rather than as "not attempted", and the instruction block
+    // a person reads is the real one: the exact command, and to run this installer again.
+    assert.ok(text.includes('did not finish'), `the failure is not reported:\n${text}`);
     assert.ok(text.includes('    sudo ') && text.includes('up --operator=admin --hostname crossbar-dev'),
         `the instruction block is not printed:\n${text}`);
-    assert.ok(text.includes('That prints a link and waits'), `the instruction block is not the real one:\n${text}`);
-    assert.ok(text.includes('open it and approve this machine'), 'the instructions do not say to approve the machine');
-    assert.ok(text.includes('Then run this installer'), 'the instructions do not say what to do after');
+    assert.ok(text.includes('run this installer again'), 'the instructions do not say what to do after');
 });
 
 test('a login that finishes reads the name back and corrects the address', (t) => {
@@ -321,7 +315,7 @@ test('a login that finishes reads the name back and corrects the address', (t) =
     });
     const text = `${run.stdout}${run.stderr}`;
     assert.equal(run.status, 0, `the front door exited non-zero:\n${text}`);
-    assert.ok(text.includes('this machine is on the tailnet as crossbar-dev.tail1234.ts.net'),
+    assert.ok(text.includes('on the tailnet as crossbar-dev.tail1234.ts.net'),
         `the login did not report a name:\n${text}`);
     assert.ok(text.includes('CORRECTION crossbar-dev.tail1234.ts.net'),
         `the address was not corrected to the machine's own name:\n${text}`);

@@ -1317,7 +1317,12 @@ async function runChecks({ state, resolved, stunUrl, locals }) {
         };
         await run('Public ingress', async () => {
             const result = await checkPublicIngress(config);
-            return { verdict: result.ok ? 'ok' : 'fail', detail: result.detail };
+            // The front door is installed *after* the wizard (`onboard_deployment`), and Caddy is
+            // started by the shaper unit on the restart after that — so this run asks the question
+            // before anything could answer it. A name that is not serving yet is therefore the
+            // expected state of a first install rather than a fault, and it reads with the quiet
+            // mark; `■` is kept for the checks that are wrong with the file this run wrote.
+            return { verdict: result.ok ? 'ok' : 'pending', detail: result.detail };
         });
         await run('Public hostname', () => hostnameVerdict(config.publicHostname, mapped, locals));
         await run('Public bind address', async () => {
@@ -1330,11 +1335,18 @@ async function runChecks({ state, resolved, stunUrl, locals }) {
 
 // ── The report ──────────────────────────────────────────────────────────────────
 
-/** How a check reads in the summary: what could be made, and what could not. */
+/**
+ * How a check reads in the summary: what could be made, and what could not.
+ *
+ * `pending` and `unknown` share the quiet ring deliberately: one is a check that cannot be made
+ * *here* and the other a check that cannot be made *yet*, and neither is a fault. The filled
+ * square is for the checks that are wrong with the deployment as it stands.
+ */
 const CHECK_MARK = Object.freeze({
     ok: prompts.SYMBOL.submitted,
     warn: prompts.SYMBOL.refused,
     unknown: prompts.SYMBOL.quiet,
+    pending: prompts.SYMBOL.quiet,
     fail: prompts.SYMBOL.cancelled,
 });
 
@@ -1461,25 +1473,26 @@ function reportSummary(report, state, resolved, { verified, checks, checked, wro
 // Both used to be printed as next steps, which left the two states that look finished but are not
 // — a console nobody can open, and no phone able to join. So they are asked here through the same
 // prompter as every other question, and the command runs in this terminal so its own prompt and
-// the token land where the person is looking. The short run asks the password and stops there:
-// naming people and setting a password is what it is for, and the invitation is a code somebody
-// carries to a phone when they are ready, which the summary leaves as a command.
+// the token land where the person is looking. Both flows ask both questions, the short one
+// included: a deployment that has just named its first administrator is where the invitation that
+// lets a phone join is minted, and leaving its command in the summary left the app empty until
+// somebody ran it by hand.
 //
 // Neither runs unattended. With no terminal there is nobody to answer the question and nobody to
-// read the code, so the step is left in the summary rather than guessed at. `--password` and
-// `--invite` answer them from `--answers` or from a flag — including in the short run, where the
-// invitation is not asked — and an explicit false skips one without asking.
+// read the code, so the step is left in the summary rather than guessed at, and `--password` and
+// `--invite` answer them from `--answers` or from a flag. An explicit false skips one without
+// asking.
 
 /**
  * Ask, and run, the two finishing steps. Returns which of them ran to completion, so the summary
  * says what is left rather than repeating what was done.
  *
- * The short run asks the password and settles there: a password is something no machine can make,
- * which is why it is one of the three things the short path asks for — while the first invitation
- * is a code carried to a phone, and the summary leaves its command for whoever is ready to enrol.
- * `--invite` still runs it, short run or long.
+ * The short run asks both, and a machine cannot answer either: a password is something no machine
+ * can make, and an invitation is a code a person carries to a phone. A run with no terminal asks
+ * neither and leaves the two commands in the summary, which is the one case where they are still
+ * something for a person to do afterwards.
  */
-async function finishByHand({ answers, terminal, report, state, resolved, spawn, approach = 'advanced' }) {
+async function finishByHand({ answers, terminal, report, state, resolved, spawn }) {
     /** `true`/`false` when an answer or a flag decided it, `null` when nobody has yet. */
     const answered = (key) => {
         const value = answers[key];
@@ -1497,9 +1510,8 @@ async function finishByHand({ answers, terminal, report, state, resolved, spawn,
             cwd: state.dir, stdio: 'inherit', env: childEnv(),
         });
         // The command owns the terminal while it runs and leaves the cursor wherever its own
-        // output ended. The wizard no longer knows what is on the screen above it, so it stops
-        // accounting for the rows it drew and lets what the command said stay there.
-        report.forget();
+        // output ended. That is where the wizard's next line goes: it draws nothing over what is
+        // on the screen, so the command's own prompt — and the `set` line it settles to — stays.
         return status === 0;
     };
 
@@ -1517,9 +1529,11 @@ async function finishByHand({ answers, terminal, report, state, resolved, spawn,
     }
 
     let invite = false;
-    const inviteWanted = answered('invite') ?? (approach === 'advanced'
-        ? await askNow('Invite somebody now? It prints a one-time code for their phone')
-        : false);
+    // Asked in both flows: the invitation is what makes the directory this run just wrote usable
+    // — a phone cannot join without one — and minting it here means the install ends having
+    // finished, rather than having left a command in the summary for somebody to find later.
+    const inviteWanted = answered('invite')
+        ?? await askNow('Invite somebody now? It prints a one-time code for their phone');
     if (inviteWanted) {
         const admin = (resolved.directory?.users || state.directory?.users || [])
             .find((user) => user.admin && user.enabled !== false) || null;
@@ -1618,7 +1632,9 @@ async function runSetup({
     let verified;
     try {
         verified = writeDeployment({ state, resolved, env });
-        if (writing) writing.stop(`${state.envPath}, and it loads`);
+        // Stopped with no line of its own: what it says it was doing is the record's line, and a
+        // bare path under a `◇` reads as a fragment rather than as what happened.
+        if (writing) writing.stop();
     } catch (error) {
         if (writing) writing.stop('nothing was written');
         throw error;
@@ -1629,14 +1645,12 @@ async function runSetup({
         const probing = terminal ? terminal.spinner() : null;
         if (probing) probing.start('Checking what this box looks like from outside');
         checks = await runChecks({ state, resolved, stunUrl, locals });
-        if (probing) probing.stop('the checks are in the summary below');
+        if (probing) probing.stop();
     }
 
     // The two steps only a person can do, asked and run rather than left as next steps. With no
     // terminal the questions are not asked and the commands are not run; the summary says so.
-    const done = await finishByHand({
-        answers, terminal, report, state, resolved, spawn, approach: resolved.approach,
-    });
+    const done = await finishByHand({ answers, terminal, report, state, resolved, spawn });
 
     reportSummary(report, state, resolved, {
         verified,

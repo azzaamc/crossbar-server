@@ -38,11 +38,24 @@
 #      one leaves everything else installed and says which it was. `--no-setup` turns the phase off
 #      and reproduces what this script did before: the directory file has to exist already, and it
 #      says exactly what to write when it does not;
-#   6. the units, rendered for this host's paths and installed, `daemon-reload`, the service
+#   6. the **relay** (§2.9): coturn installed rather than looked for. The wizard records this box's
+#      own address as the call relay unless another one was named, so an install that skipped the
+#      relay left `.env` pointing at a port nothing listened on — the remaining case is a
+#      deployment told about another relay host, which installs nothing here;
+#   7. the units, rendered for this host's paths and installed, `daemon-reload`, the service
 #      enabled and started, and the backup **timer** enabled — the backup service has no
 #      `[Install]` on purpose, so enabling the timer *is* the install step and forgetting it is a
 #      backup that never runs;
-#   7. `/api/health`, so "installed" means "answering" rather than "the files are in /etc".
+#   8. `/api/health`, so "installed" means "answering" rather than "the files are in /etc";
+#   9. the deployment's **own checks** (`node src/admin.js doctor`), run as the last phase and
+#      reported. A first install usually has a line or two wrong — the DNS record, a certificate
+#      Caddy has just asked for, a port forward nobody has made — and those are the front door's
+#      business rather than a reason to call the install unfinished.
+#
+# What it prints: phases and outcomes, in a real run, with the two things that are not this
+# install's to say — another project's installer and `npm ci` — quietened to one line each and
+# appended to `/var/log/crossbar-install.log`. `--dry-run` prints every command instead, because
+# that transcript is that mode's whole deliverable.
 #
 # It runs as root on a host with systemd, and refuses rather than half-installing. On a host
 # without systemd — a Mac, a container — it says so and stops: an install that reports success and
@@ -61,7 +74,9 @@
 #                  install that is not watched
 #   --browser      the wizard's browser front end (`--browser`) instead of the terminal questions
 #   --no-setup     do not run the wizard: the directory file has to be there already
-#   --with-relay   install the coturn relay unit even if it is not obvious this host relays
+#   --with-relay   install the coturn relay here even though the deployment was told to use one
+#                  elsewhere. Without it the relay is installed whenever the wizard recorded this
+#                  box as the relay, which is the default
 #   --tailscale-authkey KEY
 #                  a Tailscale auth key, for a private deployment: it joins this machine to the
 #                  tailnet without the browser approval a person would otherwise do. The key is
@@ -194,13 +209,14 @@ fi
 # ── 1. The account ──────────────────────────────────────────────────────────────
 step 'the account'
 if id -u "$CROSSBAR_USER" >/dev/null 2>&1; then
-    say "the account $CROSSBAR_USER already exists"
+    ok "the account $CROSSBAR_USER is already there"
 else
     # `--user-group` for a group of the account's own name, because the units say
     # `Group=<account>`: a distribution whose `useradd` does not make one (Debian's does, by
     # USERGROUPS_ENAB) would install a unit naming a group that does not exist, and systemd
     # refuses that at start — an install that looks finished and never runs.
     run useradd --create-home --shell /bin/bash --user-group "$CROSSBAR_USER"
+    ok "created the account $CROSSBAR_USER"
 fi
 if [ "$DRY_RUN" != '1' ] && command -v getent >/dev/null 2>&1; then
     if ! getent group "$CROSSBAR_USER" >/dev/null; then
@@ -228,7 +244,7 @@ copy_code() { # copy_code <from> <to>
 
 step 'the deployment directory'
 if [ "$SOURCE" = "$PREFIX" ]; then
-    say "installing in place: the tree is already at $PREFIX, so nothing is copied"
+    ok "installing in place: the tree is already at $PREFIX, so nothing is copied"
 else
     run install -d -o "$CROSSBAR_USER" -g "$CROSSBAR_USER" -m 0755 "$PREFIX"
     copy_code "$SOURCE" "$PREFIX"
@@ -237,6 +253,7 @@ else
     # checkout has to be able to replace `node_modules/` — which a root-owned one is not, for
     # anybody else.
     run chown -R "$CROSSBAR_USER:$CROSSBAR_USER" "$PREFIX"
+    ok "the tree is at $PREFIX, owned by $CROSSBAR_USER"
 fi
 
 # ── 3. The data directory, and the file the server reads ────────────────────────
@@ -245,26 +262,24 @@ fi
 # logins, and the backups, which are a copy of both.
 step 'the data directory'
 if [ -d "$PREFIX/data" ]; then
-    say "already there: $PREFIX/data"
+    ok "already there: $PREFIX/data"
 else
     run install -d -o "$CROSSBAR_USER" -g "$CROSSBAR_USER" -m 0700 "$PREFIX/data"
+    ok "created $PREFIX/data, writable by $CROSSBAR_USER alone"
 fi
 
 step 'the configuration file'
 if [ -f "$PREFIX/.env" ]; then
-    say "keeping the .env that is already there"
+    ok "keeping the .env that is already there"
 else
     if [ ! -f "$SOURCE/.env.example" ]; then
         die "there is no $PREFIX/.env and no $SOURCE/.env.example to start one from: copy the template into place yourself (deploy/README.md §2.3), then run this again"
     fi
     run install -o "$CROSSBAR_USER" -g "$CROSSBAR_USER" -m 0600 "$SOURCE/.env.example" "$PREFIX/.env"
     if [ -n "$NO_SETUP" ]; then
-        say 'seeded .env from .env.example. It is a template: HOST/PORT, DATA_DIR, DIRECTORY_CONFIG_PATH,'
-        say 'CROSSBAR_SESSION_SECRET and one block per mode have to be filled in before this is useful'
-        say '(deploy/README.md §2.3).'
+        ok 'seeded .env from .env.example — a template to fill in by hand (deploy/README.md §2.3)'
     else
-        say 'seeded .env from .env.example. The setup wizard below fills in both mode blocks, the session'
-        say 'secret and the directory file, and the paths this host needs (deploy/README.md §2.3).'
+        ok 'seeded .env from .env.example; the wizard below fills in the rest (deploy/README.md §2.3)'
     fi
 fi
 
@@ -344,9 +359,18 @@ fi
 # is Node's own, so nothing else about the install needs the network.
 #
 # As the deployment's account rather than as root, so the tree it writes belongs to the account
-# that has to replace it next time.
+# that has to replace it next time. Quietly, like the packages above: npm's notice about a newer
+# npm and its progress bar are npm's own, and this line is what the install says instead.
 step 'dependencies'
-run_as_user "$NPM_BIN" ci --prefix "$PREFIX" --omit=dev --no-audit --no-fund
+NPM_COMMAND="env NPM_CONFIG_UPDATE_NOTIFIER=false $NPM_BIN ci --prefix $PREFIX --omit=dev --no-audit --no-fund"
+if [ "$CROSSBAR_USER" != "$(id -un 2>/dev/null || true)" ]; then
+    NPM_COMMAND="runuser -u $CROSSBAR_USER -- $NPM_COMMAND"
+fi
+if install_quietly 'the deployment dependencies (npm ci)' "$NPM_COMMAND"; then
+    ok 'dependencies installed'
+else
+    die "npm ci could not install the deployment's dependencies, and the server needs them: the output above is what npm said. Fix it and run this again — nothing else about the deployment needs redoing."
+fi
 
 # ── 6. Onboarding: the wizard, the directory file, and the front door ──────────
 # The server refuses to start without a directory file, so this phase is where that file comes
@@ -425,7 +449,7 @@ EOF
 if [ -n "$NO_SETUP" ]; then
     step 'the directory file'
     if [ -f "$DIRECTORY_PATH" ]; then
-        say "a directory file is in place: $DIRECTORY_PATH"
+        ok "a directory file is in place: $DIRECTORY_PATH"
     elif [ "$DRY_RUN" = '1' ]; then
         say 'a real run stops here, with this (and installs no unit):'
         refuse_missing_directory_file
@@ -447,21 +471,50 @@ else
             # the file the server will not start without.
             die "the wizard finished but there is no directory file at $DIRECTORY_PATH: the path .env names and the path the wizard wrote are not the same. Nothing else was installed."
         fi
-        say "the directory file is in place: $DIRECTORY_PATH"
+        ok "the directory file is in place: $DIRECTORY_PATH"
     fi
 fi
 
-# ── 7. The units ────────────────────────────────────────────────────────────────
+# ── 7a. The relay, installed rather than looked for ─────────────────────────────
+# Until now this phase asked whether a `turnserver` happened to be on the host and skipped the
+# relay if not — while the wizard, by default, records this box's own address as the relay in
+# `.env` (`ownRelayHost`). The summary then reported a working relay that nothing was listening on,
+# and relayed calls failed with nothing to point at. So the relay is installed the way Caddy and
+# Tailscale are, and a relay that could not be installed is said as the fault it is rather than
+# quietly becoming an address that answers nothing.
+step 'the relay'
+RELAY_INSTALLED=''
+if relay_wanted "$ANSWERS"; then
+    if relay_is_present || install_quietly 'the coturn relay' 'apt-get install -y coturn'; then
+        RELAY_INSTALLED=1
+        # Immediately, and not with the units: the package enables and starts its own coturn, whose
+        # stock configuration has no authentication at all, and a relay that forwards for anybody is
+        # the one state this must not be in even for the seconds between two phases. The unit below
+        # `Conflicts=` with it, so this is what is running now rather than what starts at boot.
+        if ! run systemctl disable --now coturn; then
+            warn "the package's coturn unit could not be disabled; if it is running, it is not this"
+            warn "deployment's relay and it authenticates nobody. Stop it by hand and restart"
+            warn 'crossbar-turn.service (deploy/README.md §2.9).'
+        fi
+        ok 'coturn is installed and its shared secret is the one the wizard generated'
+    else
+        warn 'coturn could not be installed, and this deployment records its own address as the'
+        warn 'call relay: relayed calls — the ones two devices cannot make directly — will fail'
+        warn 'until it is. Install it by hand (deploy/README.md §2.9) and run this installer again;'
+        warn 'nothing else about the deployment needs redoing.'
+    fi
+else
+    ok 'a relay elsewhere was named, so coturn is not installed here'
+fi
+
+# ── 7b. The units ───────────────────────────────────────────────────────────────
 # Rendered for this host's prefix, account and node binary (§`render_unit` in the library) and
 # never edited in the repository: the repository's copies stay a working example of a default
 # deployment, and the file systemd reads is the file a person can read back from /etc.
 step 'the units'
 TO_INSTALL="$UNIT_NAMES_CORE $UNIT_NAMES_BACKUP"
-if [ -n "$WITH_RELAY" ] || relay_is_present; then
+if [ -n "$RELAY_INSTALLED" ]; then
     TO_INSTALL="$TO_INSTALL $UNIT_NAMES_RELAY"
-    say 'coturn is on this host, so the relay unit is part of this install (deploy/README.md §2.9)'
-else
-    say 'no turnserver on this host, so crossbar-turn.service is not installed (deploy/README.md §2.9)'
 fi
 # Which tree the units are read from. The deployment's own, once it is there — that is the tree
 # that will run. In a dry run nothing has been copied, so the source's copies are what the copy
@@ -476,17 +529,10 @@ fi
 if ! install_units "$UNIT_SOURCE" $TO_INSTALL; then
     die "no unit was installed and no service was enabled: see the message above. Nothing else was changed."
 fi
-if [ -n "$WITH_RELAY" ] || relay_is_present; then
+if [ -n "$RELAY_INSTALLED" ]; then
     run install -D -m 0644 "$UNIT_SOURCE/coturn.conf" /etc/crossbar/coturn.conf
-    # The package's own unit would race this one for the same ports and whichever loses looks like
-    # the one that does not work. `crossbar-turn.service` also `Conflicts=` it, so this is about
-    # what starts at boot rather than about the run itself — and a host whose coturn came from
-    # somewhere without a unit is not a reason to stop the install.
-    if ! run systemctl disable --now coturn; then
-        warn "could not disable the package's coturn unit; it may not exist on this host."
-        warn 'crossbar-turn.service Conflicts= with it, so it will not run beside the relay either way.'
-    fi
 fi
+ok "units installed and enabled"
 
 # ── 8. Enable, and start ────────────────────────────────────────────────────────
 step 'enable, and start'
@@ -511,30 +557,57 @@ else
     if ! HEALTH="$(wait_for_health 30)"; then
         die "the units are installed and enabled, but the server has not answered /api/health after 30 seconds — which is not an install. Look at: journalctl -u crossbar -n 50 --no-pager, then systemctl status crossbar. Nothing was removed."
     fi
-    say "health: $HEALTH"
-    say "version: $(json_field "$HEALTH" version)   mode: $(json_field "$HEALTH" mode)   origin: $(json_field "$HEALTH" origin)"
+    ok "the server is up: $(json_field "$HEALTH" version), mode $(json_field "$HEALTH" mode), at $(json_field "$HEALTH" origin)"
 fi
 
-# ── 9. What is left for a person ────────────────────────────────────────────────
+# ── 9. The deployment's own checks ──────────────────────────────────────────────
+# `doctor` asks every question this box can answer about itself — the mode, the directory file, the
+# listener, the front door, the certificate, the relay, the STUN and TURN paths — and it is the
+# report the closing block used to hand to a person to run. So it is run here, at the end, when
+# everything it reads is finally in place.
+#
+# A first install will often have a line or two wrong: the DNS record, the certificate Caddy has
+# just asked for, a port forward nobody has made yet. Those are the front door's business and the
+# install is complete without them, so this phase reports rather than fails — a non-zero exit is
+# what `doctor` says about its own lines, not about this install.
+step 'the checks'
+if [ "$DRY_RUN" = '1' ]; then
+    would_run "cd $PREFIX && $NODE_BIN src/admin.js doctor"
+else
+    if ( cd "$PREFIX" && run_as_user "$NODE_BIN" src/admin.js doctor ); then
+        ok 'every line doctor can check is OK'
+    else
+        warn 'doctor reported lines that are not OK. The install is complete; the report above is'
+        warn "what is left, and \`cd $PREFIX && sudo -u $CROSSBAR_USER node src/admin.js doctor\`"
+        warn 'runs it again at any time.'
+    fi
+fi
+
+# ── 10. What is left for a person ───────────────────────────────────────────────
+# Short on purpose. Everything the install can finish it has finished — the dependencies, the
+# front door, the console password, the first invitation, and `doctor`'s own report above — so what
+# is here is the part no software on this host can do: the DNS record, the port forwards and the
+# firewall, which live at the registrar and the router. The two commands are how to look at what
+# was just installed, not work to do.
+TURN_PORT_SHOWN="$(env_value CROSSBAR_TURN_PORT || true)"; TURN_PORT_SHOWN="${TURN_PORT_SHOWN:-3478}"
+TURN_MIN_SHOWN="$(env_value CROSSBAR_TURN_MIN_PORT || true)"; TURN_MIN_SHOWN="${TURN_MIN_SHOWN:-49160}"
+TURN_MAX_SHOWN="$(env_value CROSSBAR_TURN_MAX_PORT || true)"; TURN_MAX_SHOWN="${TURN_MAX_SHOWN:-49200}"
 step 'next steps'
-say "  cd $PREFIX"
-say "  sudo -u $CROSSBAR_USER node src/admin.js mode       # which mode the file is in, and that it loads"
-say "  sudo -u $CROSSBAR_USER node src/admin.js status     # the running configuration and the counts"
-say "  sudo -u $CROSSBAR_USER node src/admin.js doctor     # every line OK before anybody is invited"
+say '  What software cannot do from here: the DNS record for a public hostname, the port forwards'
+say "  (443, $TURN_PORT_SHOWN and $TURN_MIN_SHOWN-$TURN_MAX_SHOWN for relayed media), the firewall, and the"
+say '  address the router forwards to — deploy/README.md §8.'
 say ''
-say '  The onboarding phase asks the console password and the first invitation at a terminal,'
-say '  and runs them there. If either was skipped, or there was no terminal to ask, they are:'
-say "      sudo -u $CROSSBAR_USER node src/admin.js password                # the console's password, at /admin"
-say "      sudo -u $CROSSBAR_USER node src/admin.js enroll --user <login>   # one invitation, printed once"
-say ''
-say '  journalctl -u crossbar -f                            # what it is saying'
-say '  systemctl list-timers crossbar-backup.timer          # the daily backup, and when it next runs'
-say '  systemctl status crossbar crossbar-backup.timer'
-say ''
-say 'A public deployment'"'"'s Caddy, its Caddyfile and the drop-in that hands it this .env were'
-say 'installed and validated in the onboarding phase. What is left is what software cannot see:'
-say 'the DNS record, the port forwards, the firewall, and the address the router forwards to —'
-say 'deploy/README.md §2.8, with the host facts in §8.'
+say "  journalctl -u crossbar -f                     # what it is saying"
+say "  systemctl status crossbar crossbar-backup.timer"
+say "  cd $PREFIX && sudo -u $CROSSBAR_USER node src/admin.js status   # the running configuration"
+# The one flow the wizard did not run: `--no-setup` leaves the console password unset and mints no
+# invitation, and both are this command's to do rather than something to discover later.
+if [ -n "$NO_SETUP" ]; then
+    say ''
+    say '  No wizard ran (--no-setup), so nothing has set the console password or minted an invitation:'
+    say "      sudo -u $CROSSBAR_USER node src/admin.js password"
+    say "      sudo -u $CROSSBAR_USER node src/admin.js enroll --user <login>"
+fi
 # Tailscale's own state, at the end, because the login is the one thing this install can still be
 # waiting on: until it happens nothing on this host can check the private address the wizard was
 # asked for, and an invitation built on a name that is not the machine's own opens nowhere. A
@@ -543,24 +616,16 @@ if [ -n "$TAILSCALE_READY" ]; then
     TAILNET_NAME="$(tailnet_name)"
     say ''
     if [ -n "$TAILNET_NAME" ]; then
-        say "Tailscale: this machine is on the tailnet as $TAILNET_NAME, and the private address in"
-        say '.env is that name.'
+        say "Tailscale: this machine is on the tailnet as $TAILNET_NAME, which is the private address"
+        say 'in .env.'
     else
-        say 'Tailscale: installed, and tailscaled is running, but this machine is not logged in yet,'
-        say 'so it has no tailnet name and the private address in .env is still what the wizard wrote.'
+        say 'Tailscale: installed and running, but this machine is not logged in yet, so it has no'
+        say 'tailnet name and the private address in .env is still what the wizard wrote.'
         case "$TAILSCALE_LOGIN" in
-            no-terminal)
-                say 'There was no terminal here to show Tailscale'"'"'s approval link, so the login was'
-                say 'not run. Run it on the host, at a terminal:'
-                ;;
-            failed)
-                say 'The login was run here and did not finish — declined, or it timed out. Try again:'
-                ;;
-            *)
-                say 'The one command left is:'
-                ;;
+            no-terminal) say 'There was no terminal here to show the approval link, so run the login on the host:' ;;
+            failed) say 'The login was run here and did not finish — declined, or it timed out. Try again:' ;;
+            *) say 'The one command left is:' ;;
         esac
-        say ''
         tailnet_login_instructions
     fi
 fi

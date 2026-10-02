@@ -209,17 +209,26 @@ What it asks, and where each answer lands:
 | who is in the directory — a display name per person, from which the id is derived | the directory file (§2.4) |
 | the call relay, when it is not this server, and the relay a phone is rung through | `CROSSBAR_TURN_HOST` and `CROSSBAR_TURN_SHARED_SECRET`, `CROSSBAR_PUSH_RELAY_URL` |
 | nothing about the session secret | it generates one, or keeps the one the file holds |
-| whether to set the console password, and (advanced only) whether to invite somebody — both default yes, both at the end of a terminal run | the password hash and one invitation (§2.7), each made by its own command in the same terminal |
+| whether to set the console password, and whether to invite somebody — both asked by both approaches, both default yes, both at the end of a terminal run | the password hash and one invitation (§2.7), each made by its own command in the same terminal |
 
 **Every question is one line, and the reasoning that used to be inside a question is here.**
-A screen that shows the current step rather than a growing list is the reason: a question that
-carries four lines of explanation cannot be redrawn in place, and a person who has already read
-what a tailnet is does not need it again above the menu. What a question still has to say it
-says in its own line; what it does not is in this section and in the summary the run ends with —
-which is where a person reads what they got, including what a blank answer chose.
+A question that carries four lines of explanation cannot be redrawn in place while it is being
+answered, and a person who has already read what a tailnet is does not need it again above the
+menu. What a question still has to say it says in its own line; what it does not is in this
+section and in the summary the run ends with — which is where a person reads what they got,
+including what a blank answer chose.
 
-**The first question is how much of the wizard to walk.** *Basic* asks three things — the modes,
-the people and the console password — and works out everything else a machine can: the private
+**The screen is a record, not a wall.** A question is the only thing the run draws over itself,
+and only while it is being answered: as it settles, the frame is replaced by the one line that
+answers it — `◇  How will people reach this deployment? · Both`, or the chosen label, or `Yes` /
+`No`, and for a password `· set` and never what was typed — and that line stays. A note the
+wizard says between two questions stays where it was said, and the summary the run ends with is
+written under the lot rather than over it. So what a person has when the wizard finishes is one
+line per answer, in the order they gave them, then the box.
+
+**The first question is how much of the wizard to walk.** *Basic* asks the things a machine cannot
+work out — the modes, the people, the console password and the first invitation — and works out
+everything else a machine can: the private
 address from the tailnet name the join read back, the public origin as the public name with
 `https://` in front, the bind address from this host's own addresses (a globally routable one
 preferred over a private one, because that is what a name can point at), the call relay as this
@@ -321,11 +330,12 @@ what to pass and writes nothing: a wizard that cannot answer its own questions m
 than write a `.env` it cannot complete, and the same refusal is what `--no-ask` is for at the
 wizard level.
 
-The console password and the first invitation are asked only where there is a terminal to ask, and
-run in that same terminal: with `--answers`, `--browser` or `--no-ask` there is nobody to type a
-password or read a one-time token, so neither runs and the summary leaves the two commands as the
-next steps. `--password` and `--invite` answer them without asking, but still run only with a
-terminal.
+The console password and the first invitation are asked by both approaches — Basic included, so an
+install that finishes its questions has finished the deployment rather than left a command behind
+— and only where there is a terminal to ask, running in that same terminal: with `--answers`,
+`--browser` or `--no-ask` there is nobody to type a password or read a one-time token, so neither
+runs and the summary leaves the two commands as the next steps. `--password` and `--invite` answer
+them without asking, but still run only with a terminal.
 
 Then the front door, for exactly the modes the wizard set up:
 
@@ -841,7 +851,7 @@ did not finish, or was not attempted for want of a terminal and a key — it is 
 the installer sets the address from the machine's own tailnet name once the machine is approved on
 the link Tailscale shows. Neither promises a name that does not exist yet.
 
-### 2.9 Installing the relay (optional)
+### 2.9 Installing the relay
 
 `coturn.conf` is a template and coturn cannot read it: coturn's configuration format has no
 environment substitution, so the file holds `${CROSSBAR_*}` references and
@@ -849,9 +859,12 @@ environment substitution, so the file holds `${CROSSBAR_*}` references and
 the values from the same `.env` the server reads. The shared secret is therefore never
 committed and the rendered copy lives on a tmpfs.
 
-The install commands are with the other units (§2.5), and `scripts/install.sh` installs the relay
-unit and `/etc/crossbar/coturn.conf` by itself when `turnserver` is on `PATH` (it says which it
-did; `--with-relay` forces it). **The wizard sets the two settings for you**: it defaults
+The install commands are with the other units (§2.5), and `scripts/install.sh` **installs coturn
+itself** — `apt-get install -y coturn`, then the relay unit and `/etc/crossbar/coturn.conf` —
+whenever this box is the relay, which is the default; a run that was told about another relay
+host installs nothing here, and `--with-relay` installs it anyway. A coturn that could not be
+installed is a fault the run says out loud rather than an address in `.env` that nothing answers
+on. **The wizard sets the two settings for you**: it defaults
 `CROSSBAR_TURN_HOST` to this deployment's own address — its public name, or its tailnet name in a
 private deployment — and generates `CROSSBAR_TURN_SHARED_SECRET`, so a run that never touched the
 relay question still has a working one (§2.2.1). By hand the pair is
@@ -870,16 +883,22 @@ phone has enrolled and rung another one. Until the relay has been exercised by a
 that could not go direct, "the relay works" is untested — the doctor's TURN line says
 `reachability only, not an allocation` for exactly that reason.
 
-`scripts/install.sh` checks the second of those for you (`/api/health` answers, and with which
-version) and prints the rest as its next steps. **The first real install happens on the rehearsal
+`scripts/install.sh` runs the first two for you — `/api/health` after the restart, and then
+`doctor` as its last phase, whose report it prints and whose failing lines it says out loud
+rather than failing the install over — and prints what is left as its next steps: the DNS
+record, the port forwards and the firewall, which live at the registrar and the router.
+**The first real install happens on the rehearsal
 host, by the integration owner**, and these are the parts of it nothing on a workstation could
 have run:
 
 1. `sudo scripts/install.sh --dry-run` first, and read it: the unit diff it prints is the whole
    substitution, and nothing below should be a surprise. In the onboarding phase it also prints
    the wizard's command and the front door it would install, and the wizard writes nothing.
-2. Then the real run. It should show the wizard's summary and its check block, and end with
-   `health: {"status":"ok",…}` and the next steps. If it refuses, it refuses before installing a
+2. Then the real run. It prints one `==` phase per step with a `✓` outcome under it — the
+   commands themselves are what `--dry-run` prints, and the output of apt, Tailscale's installer
+   and `npm ci` goes to `/var/log/crossbar-install.log` instead — then the wizard's summary and
+   its check block, `✓ the server is up: …`, and `doctor`'s own report. If it refuses, it refuses
+   before installing a
    unit — with `--answers` or a terminal the directory file is written, so a refusal there is the
    wizard naming an answer it is missing; with `--no-setup` the messages name the file to write,
    and either way the account or group that is missing is named.

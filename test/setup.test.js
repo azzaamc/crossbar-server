@@ -439,6 +439,7 @@ test('the short run asks the mode, the people and the password, and works the re
         'Abdullah Al-Faisal',       // the person: only a display name is asked
         undefined,                  // another person? no
         false,                      // no console password
+        false,                      // no invitation: the short run asks it too, it is not left as a command
     ]);
     await runSetup({
         dir,
@@ -458,6 +459,7 @@ test('the short run asks the mode, the people and the password, and works the re
         'The first person: their display name',
         'Another person?',
         'Set the console password now? It guards the web console at /admin.',
+        'Invite somebody now? It prints a one-time code for their phone',
     ]);
 
     // What was derived, in the file: the origin from the name, the bind address from this host (a

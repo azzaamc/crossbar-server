@@ -161,6 +161,17 @@ const asked = (message, paint, mark = SYMBOL.waiting, ink = 'cyan') => [
 ];
 
 /**
+ * An answered step, as the one line it leaves behind: `◇  <question> · <answer>`. The run's record
+ * is made of these, in the order they were given — the frame that asked the question is replaced by
+ * its own answer as it settles, so nothing that follows takes the line back.
+ *
+ * What is typed into a hidden field is never the answer here: `textFrame` settles one on `set`, so
+ * the line for a password says that there is one and not what it is.
+ */
+const settledLine = (message, answer, paint = PAINT, mark = SYMBOL.submitted, ink = 'green') =>
+    `${paint[ink](mark)}  ${message}${answer === '' ? '' : ` ${paint.gray('·')} ${paint.dim(answer)}`}`;
+
+/**
  * A field, as it is drawn under its question: what has been typed with the character the caret is
  * on turned about, or the placeholder when nothing has been typed — the first character boxed, the
  * rest dim, which is how Clack shows a value that is offered rather than given.
@@ -181,10 +192,12 @@ function textFrame(state, { message, placeholder = '', paint = PAINT, hidden = f
     const mask = hidden ? SYMBOL.mask : '';
     const typed = mask ? mask.repeat(state.value.length) : state.value;
     if (state.settled === 'submitted') {
-        return [...asked(message, paint, SYMBOL.submitted, 'green'), `${paint.gray(SYMBOL.guide)}  ${paint.dim(typed)}`];
+        // One line, and a hidden field says `set` on it: what was typed into a password prompt is
+        // the one value that must not come back out of this file.
+        return [settledLine(message, hidden ? 'set' : state.value, paint)];
     }
     if (state.settled === 'cancelled') {
-        return [...asked(message, paint, SYMBOL.cancelled, 'red'), `${paint.gray(SYMBOL.guide)}  ${paint.dim(typed)}`];
+        return [settledLine(message, hidden ? 'set' : state.value, paint, SYMBOL.cancelled, 'red')];
     }
     if (state.problem) {
         return [
@@ -200,10 +213,10 @@ function textFrame(state, { message, placeholder = '', paint = PAINT, hidden = f
 function selectFrame(state, { message, options, paint = PAINT } = {}) {
     const at = options[state.cursor];
     if (state.settled === 'submitted') {
-        return [...asked(message, paint, SYMBOL.submitted, 'green'), `${paint.gray(SYMBOL.guide)}  ${paint.dim(at.label ?? String(at.value))}`];
+        return [settledLine(message, at.label ?? String(at.value), paint)];
     }
     if (state.settled === 'cancelled') {
-        return [...asked(message, paint, SYMBOL.cancelled, 'red'), `${paint.gray(SYMBOL.guide)}  ${paint.dim(at.label ?? String(at.value))}`];
+        return [settledLine(message, at.label ?? String(at.value), paint, SYMBOL.cancelled, 'red')];
     }
     const rows = options.map((option, index) => {
         const chosen = index === state.cursor;
@@ -224,10 +237,10 @@ function selectFrame(state, { message, options, paint = PAINT } = {}) {
 function confirmFrame(state, { message, yes = 'Yes', no = 'No', paint = PAINT } = {}) {
     const answered = state.value ? yes : no;
     if (state.settled === 'submitted') {
-        return [...asked(message, paint, SYMBOL.submitted, 'green'), `${paint.gray(SYMBOL.guide)}  ${paint.dim(answered)}`];
+        return [settledLine(message, answered, paint)];
     }
     if (state.settled === 'cancelled') {
-        return [...asked(message, paint, SYMBOL.cancelled, 'red'), `${paint.gray(SYMBOL.guide)}  ${paint.dim(answered)}`];
+        return [settledLine(message, answered, paint, SYMBOL.cancelled, 'red')];
     }
     const pair = (label, chosen) => (chosen ? `${paint.green(SYMBOL.chosen)} ${label}` : `${paint.dim(SYMBOL.unchosen)} ${paint.dim(label)}`);
     return [
@@ -331,23 +344,18 @@ function confirmStep(state, pressed) {
  * The cursor is deliberately left where the last frame ended — the line under it is the next
  * question's — so a question that has not settled redraws over itself instead of scrolling.
  *
- * `region` is the bounded area the whole wizard draws in: one question's frame, one note, one
- * spinner line. It is cleared before this question's first frame, so the previous step is taken
- * off the screen rather than added under it, and it is told the rows this question leaves behind
- * when it settles, so the *next* step can take those off in turn. The area is measured in rows and
- * not lines, for the reason `rows` exists: a question wider than the screen occupies more rows
- * than it has lines, and a region counted in lines would leave a row of the old frame above the
- * new one every time.
+ * A question is the only thing on the screen that is not part of the record while it is being
+ * answered, and it is replaced in place as it settles: the frame it drew is erased and the one
+ * settled line it leaves (`settledLine`) is drawn where the frame was. Nothing takes that line
+ * back — the step after it draws under it — so what a person has at the end of a run is one line
+ * per answer, in the order they gave them, with the summary under them.
  */
-function converse({ input, output, draw, step, state, columns, region }) {
+function converse({ input, output, draw, step, state, columns }) {
     return new Promise((resolve) => {
         readline.emitKeypressEvents(input);
         const wasRaw = Boolean(input.isRaw);
         if (input.isTTY) input.setRawMode(true);
         input.resume();
-        // The previous step goes before this one is drawn, and before the cursor is hidden: the
-        // area it occupies is above where the cursor was left.
-        region.clear();
         output.write(HIDE_CURSOR);
 
         let drawn = null;
@@ -393,12 +401,11 @@ function converse({ input, output, draw, step, state, columns, region }) {
                 output.write(`\r\n${SHOW_CURSOR}\n`);
                 process.exit(130);
             }
-            // The settled frame is left on the screen as the region the next step erases, and the
-            // cursor is put on the row under it so that a region of N rows is N rows *up* from
-            // where the next step begins. No extra newline past that row: an empty row between two
-            // frames is a row the next `ERASE_DOWN` never takes back.
+            // The settled line is the record: `render` has already replaced this question's frame
+            // with it, and the cursor goes to the row under it so the step after it is drawn below
+            // rather than over it. No extra newline past that row: an empty row between two frames
+            // is one nobody asked for.
             output.write(`\r\n${SHOW_CURSOR}`);
-            region.track(drawn, columns());
             resolve(current);
         };
         input.on('keypress', onKey);
@@ -406,37 +413,20 @@ function converse({ input, output, draw, step, state, columns, region }) {
 }
 
 /**
- * A region nothing is drawn in: what a log gets, where every line is the next line and none is
- * taken back — and where there is nothing to forget, because nothing is ever erased.
- */
-const NO_REGION = Object.freeze({ clear() {}, track() {}, forget() {} });
-
-/**
  * The frames written one line at a time, which is all `intro`, `outro` and `note` ever do.
  *
- * `intro` and `outro` are not bounded areas: the opener is the one line the run hangs off and the
- * closer is the last thing said, so neither takes the other off the screen. Everything between
- * them — a note, a question, a spinner line — is drawn in `region`, and the step that follows
- * takes it off again.
+ * None of them is a bounded area: the opener is the one line the run hangs off, a note is part of
+ * the record, and the closer is the last thing said — so every one of them is added under what is
+ * already there and nothing takes it back. That is the whole of the difference between the
+ * terminal and the log: a question is drawn over itself while it is being answered, and the one
+ * line it settles to is written exactly as a note's lines are.
  */
-const speaking = (write, paint, columns, region = NO_REGION) => ({
+const speaking = (write, paint, columns) => ({
     columns,
     width: roomFor(columns),
     intro: (title) => write(opening(title, paint)),
     outro: (message) => { closing(message, paint).forEach(write); write(''); },
-    note: (body, title) => {
-        region.clear();
-        const lines = boxed(body, title, paint, columns);
-        lines.forEach(write);
-        region.track(lines);
-    },
-    /**
-     * Stop accounting for the last step: something wrote to the terminal without going through
-     * here — a command this wizard ran in it — and the rows it left are neither known nor the
-     * wizard's to take back. The next step then draws under what is there instead of erasing
-     * rows that are no longer where they were.
-     */
-    forget: () => region.forget(),
+    note: (body, title) => boxed(body, title, paint, columns).forEach(write),
 });
 
 /** Every method of a prompter that has no terminal: the refusal, and nothing drawn. */
@@ -444,7 +434,7 @@ const refusing = () => {
     const no = () => { throw new NoTerminal(); };
     return {
         intro: no, outro: no, note: no, select: no, text: no, confirm: no, spinner: no,
-        close: () => {}, forget: () => {},
+        close: () => {},
     };
 };
 
@@ -468,29 +458,13 @@ function createPrompter({ input = process.stdin, output = process.stdout, paint 
     const width = columnsNow();
     const say = (line) => output.write(`${line}\n`);
 
-    // The bounded area the run draws in, held in rows: `clear` takes the previous step off the
-    // screen — the cursor is left on the row under it, so a region of N rows is N rows up and
-    // `ERASE_DOWN` does the rest — and `track` records what the step just drawn left there.
-    const region = {
-        rows: 0,
-        clear() {
-            if (this.rows > 0) output.write(`\u001b[${this.rows}A\r${ERASE_DOWN}`);
-            this.rows = 0;
-        },
-        track(lines, measuredAt = columnsNow()) {
-            this.rows = rows(lines, measuredAt);
-        },
-        forget() {
-            this.rows = 0;
-        },
-    };
     const ask = (draw, step, state) => converse({
-        input, output, draw, step, state, columns: columnsNow, region,
+        input, output, draw, step, state, columns: columnsNow,
     });
 
     return {
         present: true,
-        ...speaking(say, paint, width, region),
+        ...speaking(say, paint, width),
 
         /** One option out of many, chosen with the arrow keys. */
         select: ({ message, options, initial }) => ask(
@@ -539,9 +513,6 @@ function createPrompter({ input = process.stdin, output = process.stdout, paint 
             return {
                 start: (message) => {
                     said = String(message).replace(/\.+$/, '');
-                    // The spinner is a step like any other: the question before it goes, and the
-                    // one settled line it leaves is what the next step takes away in turn.
-                    region.clear();
                     output.write(`${paint.gray(SYMBOL.guide)}\n`);
                     guided = true;
                     running = true;
@@ -561,9 +532,10 @@ function createPrompter({ input = process.stdin, output = process.stdout, paint 
                         output.write(`\u001b[1A\r${ERASE_DOWN}`);
                         guided = false;
                     }
-                    const line = `${paint.green(SYMBOL.submitted)}  ${text ?? said}`;
-                    output.write(`${line}\n`);
-                    region.track([line]);
+                    // What the work was, as one more settled line of the record: `stop` erases the
+                    // spinner's own line above this one, and neither the question before it nor
+                    // the step after is touched.
+                    output.write(`${paint.green(SYMBOL.submitted)}  ${text ?? said}\n`);
                 },
             };
         },
@@ -580,7 +552,7 @@ module.exports = {
     SYMBOL,
     PAINT,
     PLAIN,
-    frames: { opening, closing, boxed, textFrame, selectFrame, confirmFrame, wrap, rows, visibleWidth },
+    frames: { opening, closing, boxed, settledLine, textFrame, selectFrame, confirmFrame, wrap, rows, visibleWidth },
     stroke,
     steps: { selectStep, textStep, confirmStep },
 };

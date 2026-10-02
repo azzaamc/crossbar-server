@@ -42,6 +42,17 @@ say()  { printf '%s\n' "$*"; }
 step() { printf '\n== %s\n' "$*"; }
 warn() { printf '  !! %s\n' "$*" >&2; }
 
+# What a phase came to, in one line under its `==`. A real run prints phases and outcomes; the
+# commands they were made of are what `--dry-run` prints (`run` below), because that transcript is
+# that mode's whole deliverable.
+ok() { printf '  ✓ %s\n' "$*"; }
+
+# Where an installer's own output goes when it is not printed: appended, so a run that fails after
+# an earlier one leaves both, and named in the line that says the step is happening. Root owns it
+# (the redirections below are the installer's own), and it is mode 0644 so an operator can read it
+# without becoming root.
+INSTALL_LOG="${INSTALL_LOG:-/var/log/crossbar-install.log}"
+
 # A refusal, not an error to be caught: every caller either installs the whole deployment or
 # changes nothing, and a message that says what was not done is the only useful outcome.
 die() {
@@ -50,25 +61,41 @@ die() {
 }
 
 # ── Running things ──────────────────────────────────────────────────────────────
-# Every command goes through here. Printed first and unconditionally, so `--dry-run` is the same
-# transcript with the execution removed rather than a second, drifting description of it.
+# Every command goes through here, and the two modes read differently on purpose:
+#
+#   * `--dry-run` prints the command and stops. Its transcript *is* the deliverable — the whole
+#     point of the mode is to show what would happen, command by command.
+#   * a real run prints nothing of its own. An operator installing this reads phases and outcomes
+#     (`step` / `ok`), not sixty `$ ...` lines of what the installer was doing while they waited.
+#     A command that fails still names itself and its exit status, so a broken run says what broke
+#     rather than going quiet at the interesting moment.
 run() {
-    printf '  $ %s\n' "$*"
     if [ "$DRY_RUN" = '1' ]; then
+        printf '  $ %s\n' "$*"
         return 0
     fi
-    "$@"
+    local status=0
+    "$@" || status=$?
+    if [ "$status" -ne 0 ]; then
+        printf '  !! %s (exit %s)\n' "$*" "$status" >&2
+    fi
+    return "$status"
 }
 
 # For a step that is a pipeline or needs a shell: a string, because a pipeline is not an argv.
 # Only ever given paths that `require_path` has already narrowed to letters, digits and `/._-`,
 # so there is nothing here for the shell to interpret.
 run_pipe() {
-    printf '  $ %s\n' "$1"
     if [ "$DRY_RUN" = '1' ]; then
+        printf '  $ %s\n' "$1"
         return 0
     fi
-    /bin/sh -c "$1"
+    local status=0
+    /bin/sh -c "$1" || status=$?
+    if [ "$status" -ne 0 ]; then
+        printf '  !! %s (exit %s)\n' "$1" "$status" >&2
+    fi
+    return "$status"
 }
 
 # A step whose argument is a secret: printed with the value replaced, because a `--dry-run`
@@ -78,18 +105,51 @@ run_pipe() {
 run_secret() { # run_secret <VAR> <value> <command...>
     local var="$1" value="$2"
     shift 2
-    printf '  $ %s=<hidden> %s\n' "$var" "$*"
     if [ "$DRY_RUN" = '1' ]; then
+        printf '  $ %s=<hidden> %s\n' "$var" "$*"
         return 0
     fi
     env "$var=$value" "$@"
 }
 
+# The packages and third-party installers this deployment needs, run with their own output kept
+# out of the transcript. `apt`, Tailscale's own install script (which traces every command it runs)
+# and `npm ci` between them print something like sixty lines that are not this install's to say,
+# and an operator has to read past all of it to find what happened.
+#
+# One line of ours says what is being installed and where its output went; the command's own
+# output is appended to `$INSTALL_LOG`. A failure is still loud: the command, its exit status and
+# the end of the log are printed, and the step refuses. The redirection belongs to this shell —
+# root's — so a command run as the deployment's account writes the same log.
+#
+# A string rather than an argv, so a pipeline (Tailscale's `curl … | sh`) and a `runuser` wrapper
+# are both one argument. Callers pass paths `require_path` has narrowed and literals written here,
+# so there is nothing for the shell to interpret.
+install_quietly() { # install_quietly <what> <command-string>
+    local what="$1" command="$2" status=0
+    say "Installing $what — its output is kept in $INSTALL_LOG"
+    if [ "$DRY_RUN" = '1' ]; then
+        printf '  $ %s\n' "$command"
+        return 0
+    fi
+    /bin/sh -c "$command" >>"$INSTALL_LOG" 2>&1 || status=$?
+    if [ "$status" -eq 0 ]; then
+        return 0
+    fi
+    printf '\n!! Installing %s failed (exit %s).\n' "$what" "$status" >&2
+    printf '   Its own output is the end of %s:\n\n' "$INSTALL_LOG" >&2
+    tail -n 30 "$INSTALL_LOG" >&2
+    return "$status"
+}
+
 # A step whose shape is a loop or a probe rather than one command — waiting for health, reading
 # one field out of an answer. Printed so the dry run does not go silent exactly where the
-# interesting part of the script is.
+# interesting part of the script is; a real run says the outcome instead (`ok`), which is the only
+# thing about a probe an operator can act on.
 would_run() {
-    printf '  ~ %s\n' "$*"
+    if [ "$DRY_RUN" = '1' ]; then
+        printf '  ~ %s\n' "$*"
+    fi
 }
 
 # Run a command as the deployment's own account. Everything this phase installs has to belong to
@@ -114,18 +174,25 @@ run_as_user() {
 # answer is not a JSON answer. A dry run prints the command and yields nothing, which is what the
 # callers test for.
 capture_as_user() { # capture_as_user <command...>
+    local as_root=''
     if [ "$CROSSBAR_USER" != "$(id -un 2>/dev/null || true)" ]; then
-        printf '  $ runuser -u %s -- %s\n' "$CROSSBAR_USER" "$*" >&2
-        if [ "$DRY_RUN" = '1' ]; then
-            return 0
+        as_root="$CROSSBAR_USER"
+    fi
+    if [ "$DRY_RUN" = '1' ]; then
+        if [ -n "$as_root" ]; then
+            printf '  $ runuser -u %s -- %s\n' "$as_root" "$*" >&2
+        else
+            printf '  $ %s\n' "$*" >&2
         fi
-        runuser -u "$CROSSBAR_USER" -- "$@"
+        return 0
+    fi
+    # A command that fails here is one whose answer the caller needed, so it names itself: the
+    # output it was asked for is what the caller is capturing, and a silent empty answer is the
+    # one failure nobody can trace.
+    if [ -n "$as_root" ]; then
+        runuser -u "$as_root" -- "$@" || { printf '  !! runuser -u %s -- %s (exit %s)\n' "$as_root" "$*" "$?" >&2; return 1; }
     else
-        printf '  $ %s\n' "$*" >&2
-        if [ "$DRY_RUN" = '1' ]; then
-            return 0
-        fi
-        "$@"
+        "$@" || { printf '  !! %s (exit %s)\n' "$*" "$?" >&2; return 1; }
     fi
 }
 
@@ -526,12 +593,39 @@ run_setup_wizard() { # run_setup_wizard <answers-file-or-''> <browser-or-''> <au
     die "$refusal"
 }
 
-# The mode named in an answers file, for the dry run's benefit only: the real run reads what the
-# wizard wrote. Empty when there is no file, when it does not parse, or when it names no mode —
-# and the plan below then says what would follow either.
-answers_mode() { # answers_mode <file-or-''>
+# One string field of an answers file, for a dry run's benefit only: a real run reads what the
+# wizard wrote, and a dry run has no file to read. Empty when there is no file, when it does not
+# parse, or when the key is not a string — the plan then says what would follow either way.
+answers_field() { # answers_field <file-or-''> <key>
     if [ -z "$1" ]; then return 0; fi
-    "$NODE_BIN" -e 'try { const held = JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8")); process.stdout.write(typeof held.mode === "string" ? held.mode : ""); } catch (error) { /* the wizard says what is wrong with the file, not this */ }' "$1" 2>/dev/null || true
+    "$NODE_BIN" -e 'try { const held = JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8")); const value = held[process.argv[2]]; process.stdout.write(typeof value === "string" ? value : ""); } catch (error) { /* the wizard says what is wrong with the file, not this */ }' "$1" "$2" 2>/dev/null || true
+}
+
+# The mode named in an answers file, the same way and for the same reason.
+answers_mode() { # answers_mode <file-or-''>
+    answers_field "$1" mode
+}
+
+# Whether this deployment's call relay is coturn on this box.
+#
+# The wizard records the deployment's own address as the relay when nobody names another one
+# (`ownRelayHost` in `src/setup.js`), so an install that was not told about another host runs the
+# relay here — and a relay that is not running is worse than none, because the summary would report
+# this box's own address as a working one. `--with-relay` says it outright, and a `turnserver`
+# already on the host says it always has been.
+#
+# The host is read from the answers file in a dry run and from the file the wizard wrote in a real
+# one; `''` (nobody named one) means the default, which is this box.
+relay_wanted() { # relay_wanted <answers-file-or-''>
+    if [ -n "$WITH_RELAY" ] || relay_is_present; then return 0; fi
+    local named=''
+    if [ "$DRY_RUN" = '1' ]; then
+        named="$(answers_field "$1" turnHost)"
+    elif [ -f "$PREFIX/.env" ]; then
+        named="$(env_value CROSSBAR_TURN_HOST || true)"
+    fi
+    # Empty — nobody named another host — is the default, which is coturn on this box.
+    [ -z "$named" ]
 }
 
 # The public door: Caddy, the drop-in that hands it the same `.env` the server reads, the
@@ -545,9 +639,9 @@ answers_mode() { # answers_mode <file-or-''>
 install_public_front_door() { # install_public_front_door
     local dropin='/etc/systemd/system/caddy.service.d/crossbar-env.conf' tmp hostname bind
     if command -v caddy >/dev/null 2>&1; then
-        say 'caddy is already installed'
+        say 'Caddy is already installed.'
     else
-        if ! run apt-get install -y caddy; then
+        if ! install_quietly 'the web front end (Caddy)' 'apt-get install -y caddy'; then
             die "apt could not install Caddy, and public mode is reached through it. Install it by hand (deploy/README.md §2.8 — its own package repository), then run this again: this step is re-applied, and nothing else about the deployment needs redoing."
         fi
         # The binary, not the package. `apt-get install -y caddy` answers "caddy is already the
@@ -610,9 +704,7 @@ install_public_front_door() { # install_public_front_door
         say 'Caddy was already running — the package starts it — so it is restarted to read the Caddyfile and the drop-in written above.'
     fi
     say "Caddy is installed, its Caddyfile validates for $hostname, and the drop-in gives it $PREFIX/.env."
-    say "Public mode's shaper unit starts it when the units are installed and the service restarted"
-    say "below; a deployment installed as private has Caddy ready and stopped until the switch. DNS,"
-    say "the port forwards and the firewall are §8."
+    say "The shaper unit starts it with the service; DNS, the port forwards and the firewall are §8."
 }
 
 # The command these steps run for Tailscale. `tailscale` on PATH is the real one; a test — or a
@@ -663,6 +755,10 @@ tailnet_name() {
 # private door was part of this run even when the login did not finish.
 TAILSCALE_READY=''
 
+# Whether the Tailscale command's presence has been reported this run: `prepare_tailscale` and the
+# front door both check it, and a second report of something already said is noise.
+TAILSCALE_PRESENT=''
+
 # How the login in `install_private_front_door` ended, for the report that follows it: `already`
 # (the machine was logged in before this run), `ran` (the login was run here and finished), `failed`
 # (it was run here and did not finish — declined, or it timed out), `no-terminal` (there was no
@@ -676,11 +772,18 @@ TAILSCALE_LOGIN=''
 # Tailscale at all.
 install_tailscale_package() {
     if command -v "$TAILSCALE_BIN" >/dev/null 2>&1; then
-        say 'tailscale is already installed'
+        # Said once a run, and never directly under the install that just made it true:
+        # `prepare_tailscale` and the front door both ask this question, and the second answer to a
+        # question already answered read as a second, unrelated fact — which is how
+        # "tailscale is already installed" ended up printed *after* Tailscale was installed.
+        if [ "$TAILSCALE_PRESENT" != '1' ]; then
+            say 'Tailscale is already installed'
+        fi
+        TAILSCALE_PRESENT=1
         return 0
     fi
-    say 'installing Tailscale from its official install script (which adds its own package repository)'
-    run_pipe 'curl -fsSL https://tailscale.com/install.sh | sh'
+    TAILSCALE_PRESENT=1
+    install_quietly 'Tailscale' 'curl -fsSL https://tailscale.com/install.sh | sh' || return 1
     # The same fact `install_public_front_door` checks for Caddy, checked for the command this
     # installer goes on to run: the install script answering 0 is not the same as `tailscale`
     # existing, and a package the system has registered but whose binary is gone installs "fine"
@@ -732,9 +835,7 @@ install_tailscale() {
 # wizard falls back to asking for the private address and handing over the instructions, and the
 # front door, which does know the mode, refuses there if a private deployment has no Tailscale.
 prepare_tailscale() {
-    say 'Tailscale, before the questions that decide whether this deployment is reached through it:'
-    say 'the wizard joins the tailnet itself when the mode includes private, and this is what makes'
-    say 'that possible.'
+    say 'Tailscale, so the wizard can join the tailnet itself when the mode includes private.'
     if ! install_tailscale_package; then
         warn 'Tailscale could not be installed. A private deployment needs it: the wizard will ask for'
         warn 'the private address rather than reading it back. Install it by hand'
@@ -838,9 +939,8 @@ tailnet_login_command() {
 # by both the front door's report and the install's final report, so the two cannot drift.
 tailnet_login_instructions() {
     say "    sudo $(tailnet_login_command)"
-    say 'That prints a link and waits: open it and approve this machine. Then run this installer'
-    say 'again — it reads the name the machine answers at and sets the private address from it,'
-    say 'so nothing has to be guessed.'
+    say 'Open the link it prints and approve this machine, then run this installer again: it reads'
+    say 'the name the machine answers at and sets the private address from it.'
 }
 
 # What the machine answers at, read back after the login above has been attempted — which is the
@@ -858,34 +958,26 @@ report_private_front_door() { # report_private_front_door <authkey-or-''>
     local authkey="$1" name=''
     name="$(tailnet_name)"
     if [ -n "$name" ]; then
-        say "this machine is on the tailnet as $name"
+        say "This machine is on the tailnet as $name."
     else
         case "$TAILSCALE_LOGIN" in
             no-terminal)
-                say 'One step here is still a person'\''s: the login, which approves this machine in a'
-                say 'browser. There is no terminal here to show Tailscale'\''s link, so it was not run:'
+                say 'The login is still a person'\''s step, and there is no terminal here to show its link:'
                 ;;
             failed)
-                say 'The login was run here and did not finish — declined, or it timed out.'
-                say 'Everything else is installed; approve this machine when you can:'
+                say 'The login was run here and did not finish — declined, or it timed out:'
                 ;;
             *)
-                say 'One step here is still a person'\''s: the login, which approves this machine in a browser.'
+                say 'The login is still a person'\''s step — it approves this machine in a browser:'
                 ;;
         esac
         tailnet_login_instructions
-        say "That names $CROSSBAR_USER the tailnet operator, which is what lets the wizard and doctor"
-        say 'read this machine'\''s name; both run as that account. Pass --tailscale-authkey <key> to a'
-        say 'run of this installer to join without the browser; the key reaches Tailscale through'
-        say 'TS_AUTHKEY, so it is printed nowhere.'
         if [ -n "$authkey" ]; then
             warn 'tailscale up was given --tailscale-authkey and this machine still reports no tailnet name:'
             warn "check \`$TAILSCALE_BIN status\`, and that the key is valid and belongs to this tailnet."
         fi
     fi
     offer_private_hostname_correction "$name"
-    say 'The private shaper unit runs `tailscale serve --bg <port>` on every start, so once this'
-    say 'machine is joined the route needs nothing more (deploy/README.md §2.8.1).'
 }
 
 # A private block that does not name this machine is an address nobody can dial, and the catch-all
@@ -909,12 +1001,12 @@ offer_private_hostname_correction() { # offer_private_hostname_correction <name-
     configured="$(env_value NETWORK_MODE_PRIVATE_HOSTNAME || true)"
     if [ "$configured" = "$name" ]; then return 0; fi
     if [ -n "$configured" ]; then
-        say "the private address in .env is $configured, and this machine answers at $name:"
+        say "The private address in .env is $configured and this machine answers at $name: correcting it,"
     else
-        say "no private address is set in .env yet, and this machine answers at $name:"
+        say "No private address is set in .env yet and this machine answers at $name: setting it,"
     fi
-    say 'an invitation carries that address, so it has to be this machine'\''s own tailnet name.'
-    say "Running the wizard again with $name; every other answer, and every secret, is kept."
+    say 'keeping every other answer and every secret. An invitation carries this address, so it has'
+    say "to be the machine's own tailnet name."
     run_setup_wizard_correction "$name"
 }
 
