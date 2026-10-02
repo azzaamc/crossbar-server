@@ -50,6 +50,10 @@ const {
 } = require('./config');
 const directoryFile = require('./directory');
 const prompts = require('./prompt');
+// The relay's own client, for the one request that obtains this deployment's installation. It
+// requires nothing but `node:crypto`, so this does not disturb the rule that nothing here loads
+// a dependency — `install.sh` runs this wizard before `npm ci`.
+const { enrolInstallation } = require('./pushrelay');
 
 /** The default `loadConfig` falls back to, so the probe reports on the server the same address. */
 const DEFAULT_STUN = 'stun:stun.l.google.com:19302';
@@ -218,14 +222,15 @@ const ANSWER_KEYS = Object.freeze([
     'publicHostname', 'publicOrigin', 'publicBindAddress',
     'people', 'directory',
     'turnHost', 'turnSecret',
-    'pushRelayUrl',
+    'pushRelay', 'pushRelayUrl', 'pushRelayToken', 'pushRelayInstallationId',
     'sessionSecret', 'newSecrets', 'password', 'invite',
 ]);
 
 /**
  * The relay a phone is rung through when nobody names one of their own. A deployment that accepts
- * this default rings through a shared development relay, which is why the summary names it and
- * prints the three names that would point the deployment at another one — a stranger must not
+ * this default **enrols with it**: the wizard posts to its `/v1/installations` route and writes
+ * the three settings it answers with, so nobody types a credential and nobody runs a command
+ * afterwards. Which relay ended up in force is named in the summary — a stranger must not
  * inherit somebody else's relay without being told.
  */
 const DEFAULT_PUSH_RELAY_URL = 'https://crossbar-push-dev.ibnfaisalc.workers.dev';
@@ -234,6 +239,86 @@ const DEFAULT_PUSH_RELAY_URL = 'https://crossbar-push-dev.ibnfaisalc.workers.dev
 const PUSH_RELAY_KEYS = Object.freeze([
     'CROSSBAR_PUSH_RELAY_URL', 'CROSSBAR_PUSH_RELAY_TOKEN', 'CROSSBAR_PUSH_RELAY_INSTALLATION_ID',
 ]);
+
+/**
+ * The three ways a deployment can be given a push relay, in the order the menu offers them:
+ * the shared relay enrolled here, a relay somebody names, or none.
+ *
+ * `standard` is the default because it is the one that leaves nothing to type and nothing to
+ * run: the wizard obtains this deployment's own installation from the shared relay and writes
+ * its three settings. `another` is for a relay the operator runs, or one whose credential they
+ * were handed. `none` is for a deployment that does not want push — a phone whose screen is off
+ * simply is not rung.
+ */
+const PUSH_RELAY_CHOICES = Object.freeze(['standard', 'another', 'none']);
+
+/**
+ * The question, and what each answer costs. One line, like every other question here: what a
+ * relay is and why a locked phone needs one lives in `deploy/README.md` §2.7.1, and the summary
+ * is where the consequence of picking `none` is read.
+ */
+const PUSH_RELAY_QUESTION = 'How should a locked phone be rung?';
+
+const PUSH_RELAY_OPTIONS = Object.freeze([
+    { value: 'standard', label: 'The shared relay', hint: 'enrols this deployment automatically — nothing to type or run' },
+    { value: 'another', label: 'Another relay', hint: 'a relay you run, or one whose credential you were given' },
+    { value: 'none', label: 'No relay', hint: 'a phone whose screen is off cannot be rung' },
+]);
+
+/** `standard`, `another` or `none` — refusing anything else by name. */
+function parsePushRelayChoice(value) {
+    const wanted = String(value ?? '').trim().toLowerCase();
+    if (PUSH_RELAY_CHOICES.includes(wanted)) return wanted;
+    throw new SetupRefusal(`"${value}" is not a push relay choice: --push-relay takes`
+        + ' standard (the shared relay, enrolled here), another (one you name), or none.');
+}
+
+/**
+ * The label the shared relay records for this installation, which its operator reads and nobody
+ * else does: this deployment's own address is the name they would recognise it by. A hostname is
+ * already inside the relay's bound, and `os.hostname()` is the fallback for a run that somehow
+ * names no address.
+ */
+function relayLabel(blocks, inForce) {
+    const host = blocks?.[inForce]?.HOSTNAME || blocks?.public?.HOSTNAME || blocks?.private?.HOSTNAME || '';
+    return String(host || os.hostname() || '').trim();
+}
+
+/**
+ * What a refused enrolment says, in one sentence, to somebody in the middle of an install.
+ *
+ * Deliberately not the relay's error code. `enrolment_closed` and `rate_limited` are two things a
+ * person cannot act on and two codes they cannot read, and they mean opposite things about
+ * retrying — one will never succeed, the other might. What matters to the person is what happened
+ * and that this deployment is still installable, so the code stays in the relay's own logs and
+ * this is the sentence that reaches the screen.
+ *
+ * An answer that was never received is said as *unknown* rather than failed, because the route
+ * takes no idempotency key: an installation may have been created whose credential nobody holds,
+ * and nothing here sends the request a second time (relay `docs/API.md`).
+ */
+function pushRelayRefusal(outcome) {
+    switch (outcome.reason) {
+        case 'enrolment_closed':
+            return 'The shared relay is not taking new installations — it has reached the number its'
+                + ' operator allows — so nothing was created.';
+        case 'rate_limited':
+            return 'The shared relay is limiting how often installations can be created, so nothing was'
+                + ' created'
+                + (outcome.retryAfterSeconds
+                    ? `; it asks for about ${outcome.retryAfterSeconds} more seconds before another try.`
+                    : '.');
+        case 'unreachable':
+            return 'The shared relay did not answer, so whether an installation was created is unknown;'
+                + ' its enrolment request cannot be repeated, so this install will not send it again.';
+        default:
+            return 'The shared relay refused to create an installation, and nothing was created.';
+    }
+}
+
+/** The other half of a refusal: what still works, and the door that is still open. */
+const PUSH_RELAY_FALLBACK = 'This deployment can still be installed: name a relay you already have, or'
+    + ' carry on without one — calls still work, but a phone whose screen is off will not be rung.';
 
 /** The two ways a run can be walked: three questions with the rest derived, or every setting asked. */
 const APPROACHES = Object.freeze(['basic', 'advanced']);
@@ -402,10 +487,12 @@ function readState(dir) {
         },
         pushRelay: {
             url: settingIn(content, 'CROSSBAR_PUSH_RELAY_URL'),
-            // Read for one thing only: the summary says whether a relay named there can actually
-            // ring, because a URL with no token is a transport that stays disabled. It is never
-            // printed.
+            // Read for two things: the summary says whether a relay named there can actually
+            // ring, because a URL with no token is a transport that stays disabled, and a
+            // re-run keeps a credential already enrolled rather than minting a second
+            // installation whose first credential nobody holds. It is never printed.
             token: settingIn(content, 'CROSSBAR_PUSH_RELAY_TOKEN'),
+            installationId: settingIn(content, 'CROSSBAR_PUSH_RELAY_INSTALLATION_ID'),
         },
     };
 }
@@ -723,6 +810,120 @@ async function askPeopleByLines(ask, report, state, { needLogin = false } = {}) 
 }
 
 /**
+ * Decide which relay rings this deployment's phones, and obtain its credential if that is the
+ * answer.
+ *
+ * Three answers, and the order they are looked for is the wizard's usual one: an answer, then what
+ * the file already holds, then the terminal — and only a run that nothing decided takes the
+ * default. That default is `standard`, the shared relay enrolled from here, because it is the one
+ * that leaves nothing for a person to do afterwards: no credential to paste, no command to run.
+ *
+ * A relay the file already names is kept rather than replaced. Selecting `standard` over a
+ * credential already in the file would mint a second installation and orphan the first, whose
+ * credential nobody holds — so an already-enrolled standard relay is a no-op, and a custom one is
+ * the default answer of the menu rather than something the run moves on its own.
+ *
+ * A refusal does not abort. The shared relay being full or busy says nothing about whether this
+ * deployment can be installed, so the refusal is turned into a sentence, the manual path is
+ * offered, and the run continues — with a relay that already worked if there is one, and with no
+ * relay if the person declines. Nothing here throws: a stack trace in the middle of an install is
+ * the failure this degrades away from.
+ *
+ * `fetchImpl` is the seam the tests reach the shared relay through; in a real run it is Node's own
+ * `fetch`.
+ */
+async function choosePushRelay({ state, report, terminal, asker, approach, line, supplied, blocks, inForce, fetchImpl }) {
+    const held = state.pushRelay;
+    const given = supplied('pushRelay');
+    let choice = null;
+    if (given !== null) choice = parsePushRelayChoice(given);
+    // A URL in the answers is somebody naming a relay, whether or not they also said the word.
+    else if (supplied('pushRelayUrl') !== null) choice = 'another';
+    else if (approach === 'advanced' && terminal) {
+        // Asked whenever there is somebody to ask, with what the file holds as the answer Enter
+        // takes: a relay already in the file is the default rather than something this run moves
+        // on its own, and a fresh deployment gets the automatic path.
+        choice = parsePushRelayChoice(await terminal.select({
+            message: PUSH_RELAY_QUESTION,
+            options: PUSH_RELAY_OPTIONS,
+            initial: held.url ? 'another' : 'standard',
+        }));
+    } else if (approach === 'advanced' && asker) {
+        const fallback = held.url ? 'another' : 'standard';
+        const answer = await asker(`${PUSH_RELAY_QUESTION} (standard, another, or none)`, fallback);
+        choice = parsePushRelayChoice(answer === '' || answer === undefined ? fallback : answer);
+    } else if (held.url) {
+        // No terminal to ask on, and a relay already in the file: keep it, and do not mint a second
+        // installation whose first credential nobody holds.
+        choice = 'another';
+    } else {
+        // The short run, a run with no terminal, and any run nothing answered: the automatic path.
+        choice = 'standard';
+    }
+
+    if (choice === 'standard' && !(held.url === DEFAULT_PUSH_RELAY_URL && held.token)) {
+        const outcome = await enrolInstallation({
+            relayUrl: DEFAULT_PUSH_RELAY_URL,
+            label: relayLabel(blocks, inForce),
+            fetch: fetchImpl,
+        });
+        if (outcome.ok) {
+            report.note(`This deployment is enrolled with ${outcome.relayUrl} as`
+                + ` ${outcome.installationId}. The credential is in ${state.envPath} and is not shown`
+                + ' here.', 'The push relay');
+            return { url: outcome.relayUrl, token: outcome.credential, installationId: outcome.installationId, from: 'enrolled' };
+        }
+        const refusal = pushRelayRefusal(outcome);
+        report.note(`${refusal} ${PUSH_RELAY_FALLBACK}`, 'The push relay');
+        // Offered, not assumed: the manual path is a question where there is somebody to ask, and
+        // keeping what already works is the answer where there is not.
+        if (terminal
+            ? Boolean(await terminal.confirm({ message: 'Name a relay you already have instead?', initialValue: Boolean(held.url) }))
+            : Boolean(held.url && held.token)) {
+            choice = 'another';
+        } else if (held.url) {
+            return { url: held.url, token: held.token, installationId: held.installationId, from: held.token ? 'kept' : 'none', refusal };
+        } else {
+            return { url: '', token: '', installationId: '', from: 'none', refusal };
+        }
+    } else if (choice === 'standard') {
+        // Already enrolled here: nothing to obtain, and asking again would create a second
+        // installation whose credential nobody holds.
+        return { url: held.url, token: held.token, installationId: held.installationId, from: 'kept' };
+    }
+
+    if (choice === 'none') return { url: '', token: '', installationId: '', from: 'none' };
+
+    // `another`: a relay the person names, and the credential they already have. Blank keeps what
+    // the file holds, exactly as every other field here does.
+    const url = String(await line({ key: 'pushRelayUrl', message: 'The push relay to use', held: held.url }));
+    if (!url) return { url: '', token: '', installationId: '', from: 'none' };
+
+    const tokenGiven = supplied('pushRelayToken');
+    let token;
+    if (tokenGiven !== null) token = String(tokenGiven);
+    else if (terminal) {
+        token = String(await terminal.text({
+            message: 'Its installation credential',
+            placeholder: held.token ? 'the one in the file' : '',
+            defaultValue: held.token,
+            // A server secret: the field shows that there is one and never what it is.
+            hidden: true,
+        }));
+    } else if (asker) token = String(await asker('Its installation credential (blank keeps the one in the file)', held.token));
+    else token = held.token;
+
+    const idGiven = supplied('pushRelayInstallationId');
+    const installationId = idGiven !== null ? String(idGiven) : (held.url === url ? held.installationId : '');
+    return {
+        url,
+        token,
+        installationId,
+        from: tokenGiven !== null ? 'given' : (token && token === held.token ? 'kept' : (token ? 'given' : 'none')),
+    };
+}
+
+/**
  * Ask every question, in order, and answer each one from the flags, the file, the terminal — or
  * refuse, naming what is missing.
  *
@@ -755,9 +956,10 @@ async function askPeopleByLines(ask, report, state, { needLogin = false } = {}) 
  * a mode set that includes private, and only where it can be answered, so a public-only run never
  * spawns Tailscale at all and neither does one that cannot be joined from here. `locals` is this
  * host's own addresses, which is what the public bind address is a choice among — `runSetup`
- * reads them once, so the question and the checks reason about the same list.
+ * reads them once, so the question and the checks reason about the same list. `fetch` is what the
+ * push relay's enrolment request is made through, defaulting to Node's own `fetch`.
  */
-async function collectAnswers({ answers, state, asker, terminal, report, generate, tailscale = '', authkey = '', spawn = null, locals = [] }) {
+async function collectAnswers({ answers, state, asker, terminal, report, generate, tailscale = '', authkey = '', spawn = null, locals = [], fetch: fetchImpl = globalThis.fetch }) {
     const misses = [];
     const supplied = (key) => {
         const value = answers[key];
@@ -948,14 +1150,14 @@ async function collectAnswers({ answers, state, asker, terminal, report, generat
         misses.push('people');
     }
 
-    // 5. The relay, and the relay that rings a phone. Neither is optional any more in the sense the
-    //    APNs and Web Push questions were: a call relay this server can run is the default, and so
-    //    is the shared push relay. What is optional is *changing* them, which is why the call relay
-    //    is one question — "somewhere else?" — before a hostname is ever typed.
+    // 5. The relay, and the relay that rings a phone. The call relay is one question — "somewhere
+    //    else?" — before a hostname is ever typed, because a relay this server can run is the
+    //    default and there is nothing else to say about it. The push relay is the three-way choice
+    //    above, whose default obtains this deployment's own installation from the shared relay.
     //
-    //    The long run asks both; the short run takes the derived relay and the default push relay
-    //    without asking. A relay the file already names is never overwritten by a run that was not
-    //    told to change it, which is what keeps a second `setup` from moving a working relay.
+    //    The long run asks both; the short run derives the call relay and takes the automatic push
+    //    path without asking. A relay the file already names is never overwritten by a run that was
+    //    not told to change it, which is what keeps a second `setup` from moving a working relay.
     const ownRelay = ownRelayHost(blocks);
     const turnHostGiven = supplied('turnHost');
     let turnHost;
@@ -981,10 +1183,14 @@ async function collectAnswers({ answers, state, asker, terminal, report, generat
         // costs: calls still connect, but some networks fail.
         turnHost = String(state.turnHost || ownRelay);
     }
-    const pushRelayHeld = state.pushRelay.url || DEFAULT_PUSH_RELAY_URL;
-    const pushRelayUrl = approach === 'advanced'
-        ? await line({ key: 'pushRelayUrl', message: 'The push relay to use', held: pushRelayHeld })
-        : String(supplied('pushRelayUrl') ?? pushRelayHeld);
+    //    The push relay is one menu with three answers rather than a URL with a default, and the
+    //    default is the automatic path: the shared relay is asked for this deployment's own
+    //    installation, so nobody pastes a credential and nobody runs a command afterwards. The
+    //    short run does not ask — it takes the automatic path — and a relay the file already names
+    //    is kept rather than replaced (`choosePushRelay`).
+    const pushRelay = await choosePushRelay({
+        state, report, terminal, asker, approach, line, supplied, blocks, inForce, fetchImpl,
+    });
 
     // 6. What can be generated. A secret the file already holds is kept, because replacing the
     //    session secret signs every device out; `--new-secrets` is how somebody asks for that.
@@ -1012,7 +1218,7 @@ async function collectAnswers({ answers, state, asker, terminal, report, generat
         // in private mode, a record of who somebody is elsewhere in public mode.
         requireLogins,
         turnHost,
-        pushRelayUrl,
+        pushRelay,
         secrets: {
             session,
             turn,
@@ -1071,10 +1277,13 @@ function composeEnv(state, resolved) {
         content = setEnvLine(content, 'CROSSBAR_TURN_HOST', resolved.turnHost);
         content = setEnvLine(content, 'CROSSBAR_TURN_SHARED_SECRET', resolved.secrets.turn);
     }
-    // The relay a phone is rung through, named so that the summary can say which one is in force.
-    // The token is not this question's: it is a server secret the relay's operator hands over, and
-    // it is set by hand in `.env` (the summary says which three names decide all of it).
-    if (resolved.pushRelayUrl) content = setEnvLine(content, 'CROSSBAR_PUSH_RELAY_URL', resolved.pushRelayUrl);
+    // The relay a phone is rung through, and the three settings that decide it, written together
+    // because they are one thing: the relay's address, the credential the wizard either enrolled
+    // here or was given, and the relay's id for this installation. A blank choice writes all three
+    // empty rather than leaving a credential for a relay the deployment no longer uses.
+    content = setEnvLine(content, 'CROSSBAR_PUSH_RELAY_URL', resolved.pushRelay.url);
+    content = setEnvLine(content, 'CROSSBAR_PUSH_RELAY_TOKEN', resolved.pushRelay.token);
+    content = setEnvLine(content, 'CROSSBAR_PUSH_RELAY_INSTALLATION_ID', resolved.pushRelay.installationId);
     return applyMode(content, resolved.inForce);
 }
 
@@ -1386,15 +1595,29 @@ function chosenPairs(state, resolved) {
         ? `${resolved.turnHost} · shared secret ${secretWord(resolved.secrets.turnFrom)}`
         : 'not configured — calls still work, but some networks will fail']);
     // The relay a phone is rung through, named because it is not this deployment's: a stranger must
-    // not inherit somebody else's relay without being told which one it is. When the default is what
-    // is in force, the three names that would point the deployment elsewhere are printed beside it,
-    // and a relay with no token says so — a URL alone rings nothing (`src/pushrelay.js`).
-    const pushRelay = resolved.pushRelayUrl === DEFAULT_PUSH_RELAY_URL
-        ? `${resolved.pushRelayUrl} · change it with ${PUSH_RELAY_KEYS.join(', ')}`
-        : resolved.pushRelayUrl;
-    pairs.push(['Push relay', resolved.pushRelayUrl
-        ? `${pushRelay}${state.pushRelay.token ? '' : ' · no token yet, so nothing rings until CROSSBAR_PUSH_RELAY_TOKEN is set'}`
-        : 'not configured — a phone whose screen is off cannot be rung']);
+    // not inherit somebody else's relay without being told which one it is. How the credential
+    // arrived is said too — obtained automatically from the shared relay, given, or kept from the
+    // file — because that is the difference between this install having done the work and it being
+    // left for a person. The three names are printed beside whichever relay is in force, so what
+    // would point the deployment at another one is where the relay it uses is read.
+    const push = resolved.pushRelay;
+    const credentialWord = {
+        enrolled: 'credential obtained automatically',
+        kept: 'credential kept from the file',
+        given: 'credential given',
+    }[push.from];
+    let pushReading;
+    if (!push.url) {
+        pushReading = push.refusal
+            ? `not configured — ${push.refusal} A phone whose screen is off cannot be rung.`
+            : 'not configured — a phone whose screen is off cannot be rung';
+    } else if (credentialWord) {
+        pushReading = `${push.url} · ${credentialWord} · change it with ${PUSH_RELAY_KEYS.join(', ')}`;
+    } else {
+        pushReading = `${push.url} · no credential yet, so nothing rings until`
+            + ' CROSSBAR_PUSH_RELAY_TOKEN is set';
+    }
+    pairs.push(['Push relay', pushReading]);
     // "session" is the one secret whose purpose a name cannot carry, and the one whose replacement
     // signs every device out (`--new-secrets`): said here, where the value is reported.
     pairs.push(['Secrets', `session (what signs a device in) ${secretWord(resolved.secrets.sessionFrom)}`
@@ -1571,7 +1794,9 @@ const defaultSpawn = (command, args, options) => spawnSync(command, args, option
  * default is read from, `''` to skip both; a test hands it a fixture, as `checkTailscale` takes
  * one. `authkey` is a Tailscale auth key to join with when the installer carried one — it arrives
  * in `TS_AUTHKEY` from the installer, which is the variable `tailscale up` reads itself — and
- * `spawn` is what runs the login, in this terminal, like the two finishing steps below.
+ * `spawn` is what runs the login, in this terminal, like the two finishing steps below. `fetch` is
+ * the seam the one request to the shared relay's `/v1/installations` goes through: Node's own in a
+ * real run, and a stub in a test, so no test ever reaches the real relay.
  */
 async function runSetup({
     dir = process.cwd(),
@@ -1585,6 +1810,7 @@ async function runSetup({
     tailscale = 'tailscale',
     authkey = process.env.TS_AUTHKEY || '',
     locals = hostAddresses(),
+    fetch: fetchImpl = globalThis.fetch,
 } = {}) {
     const state = readState(dir);
     const { asker, terminal } = askLayer(ask);
@@ -1608,6 +1834,7 @@ async function runSetup({
     // never spawns Tailscale.
     const resolved = await collectAnswers({
         answers, state, asker, terminal, report, generate, tailscale, authkey, spawn, locals,
+        fetch: fetchImpl,
     });
     const env = composeEnv(state, resolved);
 

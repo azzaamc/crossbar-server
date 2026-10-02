@@ -207,7 +207,7 @@ What it asks, and where each answer lands:
 | which modes this deployment is reached in (`--mode private`, `public` or `both`) | one block per mode, `NETWORK_MODE_<MODE>_*` in `.env` |
 | the hostname and origin of each mode, and the public bind address — the private one offered as this machine's own tailnet name, which the wizard joins the tailnet to get (§2.8.1) | the same block (§2.3) |
 | who is in the directory — a display name per person, from which the id is derived | the directory file (§2.4) |
-| the call relay, when it is not this server, and the relay a phone is rung through | `CROSSBAR_TURN_HOST` and `CROSSBAR_TURN_SHARED_SECRET`, `CROSSBAR_PUSH_RELAY_URL` |
+| the call relay, when it is not this server, and how a locked phone is rung — the shared relay, enrolled here (the default), another relay you name, or none | `CROSSBAR_TURN_HOST` and `CROSSBAR_TURN_SHARED_SECRET`, and `CROSSBAR_PUSH_RELAY_URL`, `CROSSBAR_PUSH_RELAY_TOKEN` and `CROSSBAR_PUSH_RELAY_INSTALLATION_ID` |
 | nothing about the session secret | it generates one, or keeps the one the file holds |
 | whether to set the console password, and whether to invite somebody — both asked by both approaches, both default yes, both at the end of a terminal run | the password hash and one invitation (§2.7), each made by its own command in the same terminal |
 
@@ -257,15 +257,28 @@ way. Leaving the hostname blank after saying the relay is elsewhere is the one w
 relay at all: calls that can connect directly still work, and the summary says that some networks
 will fail.
 
-**The relay a phone is rung through is named in the run, not inherited in silence.** A locked
-phone is woken by a VoIP push through the Crossbar push relay (§2.7.1), and the wizard offers a
-shared development relay — `https://crossbar-push-dev.ibnfaisalc.workers.dev` — as the value Enter
-takes. Whichever relay is in force is named in the summary, and when the default is what was kept
-the summary also prints the three names that would point the deployment at another one:
-`CROSSBAR_PUSH_RELAY_URL`, `CROSSBAR_PUSH_RELAY_TOKEN` and `CROSSBAR_PUSH_RELAY_INSTALLATION_ID`
-(§2.7.1). The URL is the wizard's business; the token is a server secret the relay's operator hands
-over once, and it stays a hand edit in `.env` — a URL with no token rings nothing, and the summary
-says so.
+**The relay a locked phone is rung through is one question with three answers, and the default
+enrols this deployment here.** A locked phone is woken by a VoIP push through the Crossbar push
+relay (§2.7.1), and the wizard's menu is: the **shared relay** at
+`https://crossbar-push-dev.ibnfaisalc.workers.dev`, which is the default — the wizard posts to the
+relay's `POST /v1/installations`, takes the relay's URL, the installation id and the credential
+from the answer, and writes all three settings, so nobody types a credential and nobody runs a
+command afterwards; **another relay**, which keeps the questions — its URL and the credential you
+already have; or **none**, for a deployment that does not want push at all. Whichever answer is
+taken, the relay in force is named in the summary, and the summary also prints the three names that
+would point the deployment at another one: `CROSSBAR_PUSH_RELAY_URL`,
+`CROSSBAR_PUSH_RELAY_TOKEN` and `CROSSBAR_PUSH_RELAY_INSTALLATION_ID` (§2.7.1). The summary says
+whether the credential was obtained automatically or given.
+
+**A refusal from the shared relay degrades rather than stops the install.** Its enrolment route is
+not idempotent, so it is asked exactly once, and a `403 enrolment_closed` (the relay is at its
+operator's cap) or a `429 rate_limited` (its per-address allowance is spent) means this deployment
+still installs: the person is told what happened in a sentence — not the relay's error code — and
+offered the manual path, another relay being a URL and a credential they already have, and the run
+carries on with no push relay if they decline. A relay already in `.env` is kept rather than
+replaced, and an already-enrolled shared relay is a no-op, so a second `setup` never mints a second
+installation and orphans the first credential. A request that gets no answer at all is said to be
+*unknown* rather than failed, and is not repeated.
 
 **APNs and Web Push are no longer asked for.** A deployment no longer needs an Apple key to be set
 up: the missed-call notification that still uses APNs is configured by hand when somebody wants it
@@ -406,13 +419,14 @@ Fill in, at minimum:
   `.env.example`; add the line only to change the window. See §3.4.
 - `CROSSBAR_ADMIN_PASSWORD_HASH` via `node src/admin.js password`, not by hand.
 
-**The push relay's URL is the wizard's, and its credential is not.** The wizard offers
-`https://crossbar-push-dev.ibnfaisalc.workers.dev` and writes `CROSSBAR_PUSH_RELAY_URL`; the token
-and the installation id come from the relay operator, who hands them over once (§2.7.1), so they
-are pasted into `.env` by hand. Whichever relay the URL names is printed in the wizard's summary,
-and a URL with no token rings nothing. A deployment that never sets the credential runs
-exactly as it did before the relay existed: everything works except ringing a phone whose screen is
-off, and `status` says so on its `Push relay` line.
+**The push relay and its credential are both the wizard's now.** Taking the shared relay enrols
+this deployment with it: the wizard posts to `https://crossbar-push-dev.ibnfaisalc.workers.dev/v1/installations`,
+stores the relay URL, the installation id and the credential it answers with, and never shows the
+credential. Naming another relay asks for its URL and for the credential you already have, and
+writes them the same way. Either way the relay in force is printed in the summary, the credential's
+arrival is named — obtained automatically, or given — and a URL with no credential rings nothing.
+A deployment that never sets a relay runs exactly as it did before the relay existed: everything
+works except ringing a phone whose screen is off, and `status` says so on its `Push relay` line.
 
 On the installer's path `DATA_DIR`, `DIRECTORY_CONFIG_PATH` and `WEB_ROOT` are already rendered
 for this host: `.env.example` carries production's literals (`/home/admin/crossbar/…`), the
@@ -602,11 +616,14 @@ dead, and the new one is what the deployment signs with.
 A phone whose screen is off is woken by exactly one thing: a VoIP push, which only Apple can
 deliver and only for the app's own bundle id. This deployment does not hold that ability. The
 **Crossbar Push Relay** does — one installation per household, one Apple key for the shared app, and
-a credential the relay operator hands over. The relay knows an installation, a device id and a
-PushKit token: it holds no users, no calls, no contacts and no media, and it is a doorbell rather
-than a call setup (relay `docs/BACKEND_INTEGRATION.md`).
+a credential. A deployment with an operator to ask is handed that credential; a deployment that is
+standing up both halves itself obtains its own from the relay's `POST /v1/installations` during
+setup (§2.2.1), and the wizard writes all three settings below. The relay knows an installation, a
+device id and a PushKit token: it holds no users, no calls, no contacts and no media, and it is a
+doorbell rather than a call setup (relay `docs/BACKEND_INTEGRATION.md`).
 
-Three settings go in `.env`, in the names the operator's `relay-admin.mjs create` prints:
+Three settings go in `.env`, in the names the operator's `relay-admin.mjs create` prints and the
+wizard writes when it enrols this deployment itself:
 
 | Setting | What it is |
 | --- | --- |

@@ -104,7 +104,12 @@ async function press(input, ...keys) {
 }
 
 /** A private run whose two addresses are the only things left to ask. */
-const PRIVATE = { mode: 'private', people: PEOPLE, password: false, invite: false };
+const PRIVATE = {
+    mode: 'private', people: PEOPLE, password: false, invite: false,
+    // These tests are about the prompt mechanics, not the relay, and a run that names no relay
+    // would otherwise enrol with the shared relay over the network.
+    pushRelay: 'none',
+};
 
 test('tailnetName drops the trailing dot, and is empty rather than wrong', (t) => {
     const good = fakeTailscale(t, `printf '%s' '{"Self":{"DNSName":"crossbar.tailnet-name.ts.net."}}'`);
@@ -170,7 +175,7 @@ test('the console password and the first invitation are questions, defaulting to
     const ran = [];
     const spawn = (_command, args) => { ran.push(args.slice(1)); return 0; };
     const run = runSetup({
-        dir, answers: { mode: 'private', people: PEOPLE }, ask: where.ui, check: false, spawn,
+        dir, answers: { mode: 'private', people: PEOPLE, pushRelay: 'none' }, ask: where.ui, check: false, spawn,
         tailscale: '', log: () => {},
     });
     // The approach, the address, the origin, the two relays, then Enter at each finishing question.

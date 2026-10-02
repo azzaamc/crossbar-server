@@ -3,11 +3,12 @@
 // The Crossbar Push Relay, as this server uses it.
 //
 // One narrow HTTP client: a device registration, a device removal, one VoIP wake, and a
-// liveness check. It owns the base URL, the installation Bearer, the deadline on every
-// request, the JSON it sends and the decoding of what comes back — and nothing else. It
-// does not know what a call is, who may ring whom, or whether a ring is still worth
-// making: the caller decides that before it gets here, and the relay is a doorbell
-// (relay docs/BACKEND_INTEGRATION.md).
+// liveness check — plus `enrolInstallation` below, the one request that obtains this
+// deployment's own installation before any of the other four can be made. It owns the base
+// URL, the installation Bearer, the deadline on every request, the JSON it sends and the
+// decoding of what comes back — and nothing else. It does not know what a call is, who may
+// ring whom, or whether a ring is still worth making: the caller decides that before it gets
+// here, and the relay is a doorbell (relay docs/BACKEND_INTEGRATION.md).
 //
 // Two rules this file exists to keep:
 //
@@ -20,10 +21,10 @@
 //     both.
 //
 // Where a name, a path or a bound comes from is the relay's own documentation, which
-// matches its source: the four routes are the whole surface (`GET /v1/health`,
-// `PUT|DELETE /v1/devices/{device_id}`, `POST /v1/push/voip` — relay `src/app.ts`, docs/API.md),
-// the credential is `Bearer cbr_…`, and the field bounds below are the ones its validator
-// enforces.
+// matches its source: the five routes are the whole surface (`GET /v1/health`,
+// `POST /v1/installations`, `PUT|DELETE /v1/devices/{device_id}`, `POST /v1/push/voip` —
+// relay `src/app.ts`, docs/API.md), the credential is `Bearer cbr_…`, and the field bounds
+// below are the ones its validator enforces.
 
 const crypto = require('node:crypto');
 
@@ -169,6 +170,110 @@ function originOf(value) {
         return { origin: url.origin, refusal: null, scheme: url.protocol };
     }
     return { origin: '', refusal: url.protocol === 'http:' ? 'plaintext' : 'not_http', scheme: url.protocol };
+}
+
+// ── Obtaining an installation, which happens once rather than on every request ──
+//
+// Everything above runs while the deployment is serving: it has an installation already, and
+// what it does with one is register devices and ring them. This is the other end of the
+// lifecycle — the one request that obtains the installation in the first place — and it is
+// used by `src/setup.js` rather than by the running server.
+
+/** The relay's installation credential, exactly as `POST /v1/installations` issues it. */
+const CREDENTIAL_PATTERN = /^cbr_[A-Za-z0-9_-]{43}$/;
+
+/** The relay's id for an installation, `ins_…` — the value a log line names it by. */
+const INSTALLATION_ID_PATTERN = /^ins_[A-Za-z0-9_-]{8,80}$/;
+
+/** `label` is the relay's own bound: 200 UTF-16 code units, no control characters. */
+const LABEL_LIMIT = 200;
+
+/** How long the one enrolment request may take. Longer than a ring: it happens once, by hand. */
+const ENROLMENT_TIMEOUT_MS = 10000;
+
+/** A label the relay accepts, or `''`: it is the enrolling server's own words. */
+function labelText(value) {
+    return String(value ?? '').replace(CONTROL_CHARACTERS, '').slice(0, LABEL_LIMIT);
+}
+
+/**
+ * Obtain this deployment's own installation from a relay that takes self-service enrolments.
+ *
+ * One unauthenticated `POST <relay>/v1/installations`, and the answer is the three values the
+ * deployment needs: the relay's URL, its id for the installation, and the credential — which is
+ * shown once and stored by the relay only as a digest, so there is nothing to read back and
+ * nothing to recover (relay `docs/API.md`).
+ *
+ * **Deliberately one attempt.** The route takes no idempotency key, so a retry after an answer
+ * that was not received creates a *second* installation whose credential nobody holds. A
+ * transport failure is therefore reported as `unreachable` — "unknown" rather than "failed" —
+ * and the caller decides what to say about it; nothing here loops.
+ *
+ * The `relay_url` in the answer is the relay's own report of the origin the request reached, and
+ * it is the one that must be stored: the address dialled and the address answered are not
+ * necessarily spelled the same (relay `docs/BACKEND_INTEGRATION.md`).
+ *
+ * Returns `{ ok: true, relayUrl, installationId, credential }`, or
+ * `{ ok: false, reason, status, retryAfterSeconds, relayUrl }` where `reason` is the relay's own
+ * error code (`enrolment_closed`, `rate_limited`, …), `unreachable` for a request that got no
+ * answer, or `unexpected_answer` for a body that is not the documented shape.
+ */
+async function enrolInstallation({ relayUrl, label = '', fetch: fetchImpl = globalThis.fetch, timeoutMs = ENROLMENT_TIMEOUT_MS } = {}) {
+    const configured = originOf(relayUrl);
+    if (!configured.origin) {
+        return { ok: false, reason: 'unusable_url', status: 0, retryAfterSeconds: null, relayUrl: '' };
+    }
+    const word = labelText(label);
+    const request = {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(word ? { label: word } : {}),
+        signal: AbortSignal.timeout(timeoutMs),
+        // A redirect is not a relay answering. Following one could hand the request — and the
+        // credential that comes back — to a host the operator never named, so nothing here is
+        // worth following.
+        redirect: 'error',
+    };
+
+    let response;
+    try {
+        response = await fetchImpl(`${configured.origin}/v1/installations`, request);
+    } catch {
+        // A request that never got an answer: unknown, not failed, and not repeated.
+        return { ok: false, reason: 'unreachable', status: 0, retryAfterSeconds: null, relayUrl: configured.origin };
+    }
+
+    let answer = null;
+    try {
+        const text = (await response.text()).slice(0, RESPONSE_LIMIT);
+        const parsed = text ? JSON.parse(text) : null;
+        answer = parsed && typeof parsed === 'object' ? parsed : null;
+    } catch {
+        answer = null;
+    }
+
+    if (response.status === 201 && answer?.ok === true) {
+        const credential = String(answer.credential ?? '');
+        const installationId = String(answer.installation_id ?? '');
+        // The same scheme rule the running client applies: an installation credential must not
+        // travel to a plaintext relay, so a relay that reports one is not usable.
+        const reported = originOf(String(answer.relay_url ?? ''));
+        if (CREDENTIAL_PATTERN.test(credential) && INSTALLATION_ID_PATTERN.test(installationId) && reported.origin) {
+            return { ok: true, relayUrl: reported.origin, installationId, credential };
+        }
+        return {
+            ok: false, reason: 'unexpected_answer', status: response.status, retryAfterSeconds: null,
+            relayUrl: configured.origin,
+        };
+    }
+
+    return {
+        ok: false,
+        reason: typeof answer?.error === 'string' ? answer.error : 'unexpected_answer',
+        status: response.status,
+        retryAfterSeconds: retryAfter(response.headers.get('retry-after')),
+        relayUrl: configured.origin,
+    };
 }
 
 function createPushRelayClient({ config, log, fetch: fetchImpl = globalThis.fetch }) {
@@ -379,4 +484,4 @@ function createPushRelayClient({ config, log, fetch: fetchImpl = globalThis.fetc
     };
 }
 
-module.exports = { createPushRelayClient, requestIdFor };
+module.exports = { createPushRelayClient, enrolInstallation, requestIdFor };

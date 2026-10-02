@@ -63,6 +63,10 @@ const BOTH = {
     publicHostname: 'crossbar.example.com',
     publicOrigin: 'https://crossbar.example.com',
     publicBindAddress: '203.0.113.7',
+    // `none` rather than the default: a run with no push relay answer enrols with the shared relay
+    // over the network, and these tests are about the files the other answers produce. The
+    // automatic path has tests of its own below, against a stub.
+    pushRelay: 'none',
 };
 
 const HEX_32 = /^[0-9a-f]{64}$/;
@@ -135,8 +139,8 @@ function recordingTerminal(script) {
             asked.push({ kind: 'select', message, options });
             return String(next(initial ?? options[0].value));
         },
-        text: async ({ message, placeholder, defaultValue = '' }) => {
-            asked.push({ kind: 'text', message, placeholder, defaultValue });
+        text: async ({ message, placeholder, defaultValue = '', hidden = false }) => {
+            asked.push({ kind: 'text', message, placeholder, defaultValue, hidden });
             return String(next(defaultValue));
         },
         confirm: async ({ message, initialValue }) => {
@@ -149,12 +153,51 @@ function recordingTerminal(script) {
 const envOf = (dir) => fs.readFileSync(path.join(dir, '.env'), 'utf8');
 const directoryOf = (dir) => fs.readFileSync(path.join(dir, 'data', 'directory.json'), 'utf8');
 
+/** A credential of the shape the relay issues: `cbr_` and 43 base64url characters. */
+const CREDENTIAL = `cbr_${'a'.repeat(43)}`;
+
+/**
+ * The shared relay's enrolment route, as a stub.
+ *
+ * It records every request it received, so a test can assert the method, the URL and the body the
+ * wizard actually sent rather than the request the caller believes it sent — and it answers
+ * whatever the test tells it to, which is the only way to reach a `403`, a `429`, a `201` whose
+ * body is not the documented shape, and a request that gets no answer at all.
+ *
+ * It is a plain object with the three things `enrolInstallation` reads — `status`, `headers.get`
+ * and `text()` — rather than a real `Response`, so a test needs no socket and no network.
+ */
+function enrolmentStub({ status = 201, body = null, retryAfter = null, relayUrl = 'https://crossbar-push-dev.ibnfaisalc.workers.dev' } = {}) {
+    const requests = [];
+    const fetch = async (url, options) => {
+        requests.push({ url: String(url), method: options?.method, headers: options?.headers, body: options?.body });
+        const text = status === 201
+            ? JSON.stringify(body ?? {
+                ok: true,
+                installation_id: 'ins_01HQ8Z5V9K3W2M4N6P7Q8R9S0',
+                credential: CREDENTIAL,
+                relay_url: relayUrl,
+            })
+            : JSON.stringify(body ?? { error: 'internal' });
+        return {
+            status,
+            headers: { get: (name) => (String(name).toLowerCase() === 'retry-after' ? retryAfter : null) },
+            text: async () => text,
+        };
+    };
+    return { fetch, requests };
+}
+
+/** A fetch that fails the test if it is called: the proof that a run took no network path. */
+const noEnrolment = () => async () => { throw new Error('an enrolment was attempted'); };
+
 test('the answers become the files the switch reads', (t) => {
     const dir = deployment(t);
     const file = answersFile(dir, {
         ...BOTH,
         people: PEOPLE,
         turnHost: 'relay.example.com',
+        pushRelay: 'another',
         pushRelayUrl: 'https://relay.example.net',
     });
 
@@ -224,7 +267,7 @@ test('a chosen mode with a name missing is refused before anything is written', 
     // name filled in are accepted, so the test above is about the missing name and not the flags.
     const accepted = setup(dir, '--mode', 'public', '--public-hostname', 'crossbar.example.com',
         '--public-origin', 'https://crossbar.example.com', '--public-bind-address', '203.0.113.7',
-        '--people', `@${people}`, '--no-ask', '--skip-checks');
+        '--people', `@${people}`, '--no-ask', '--push-relay', 'none', '--skip-checks');
     assert.equal(accepted.status, 0, accepted.stderr);
     assert.equal(modeConfigured('public', path.join(dir, '.env')).configured, true);
 });
@@ -292,7 +335,7 @@ test('a mode not being set up is left exactly as it is, and a chosen one is put 
 
     const publicOk = setup(publicDir, '--mode', 'public', '--public-hostname', 'crossbar.example.com',
         '--public-origin', 'https://crossbar.example.com', '--public-bind-address', '203.0.113.7',
-        '--people', `@${people}`, '--no-ask', '--skip-checks');
+        '--people', `@${people}`, '--no-ask', '--push-relay', 'none', '--skip-checks');
     assert.equal(publicOk.status, 0, publicOk.stderr);
     const publicEnv = envOf(publicDir);
     assert.equal(writtenMode(publicEnv), 'public');
@@ -303,7 +346,8 @@ test('a mode not being set up is left exactly as it is, and a chosen one is put 
     // were — empty — and public stays something this file cannot be shaped for.
     const privateDir = deployment(t);
     const privateOk = setup(privateDir, '--mode', 'private', '--private-hostname', 'house.tailnet.ts.net',
-        '--private-origin', 'https://house.tailnet.ts.net', '--people', `@${people}`, '--no-ask', '--skip-checks');
+        '--private-origin', 'https://house.tailnet.ts.net', '--people', `@${people}`, '--no-ask',
+        '--push-relay', 'none', '--skip-checks');
     assert.equal(privateOk.status, 0, privateOk.stderr);
     const privateEnv = envOf(privateDir);
     assert.match(privateEnv, /^NETWORK_MODE_PUBLIC_HOSTNAME=$/m);
@@ -318,7 +362,7 @@ test('the answers file and the answers typed at a prompt produce the same files'
     const fromFile = deployment(t);
     const fromPrompt = deployment(t);
     const secrets = { sessionSecret: 'ab'.repeat(32), turnSecret: 'cd'.repeat(32) };
-    const relay = { turnHost: 'relay.example.com', pushRelayUrl: 'https://relay.example.net' };
+    const relay = { turnHost: 'relay.example.com', pushRelay: 'another', pushRelayUrl: 'https://relay.example.net' };
 
     const file = answersFile(fromFile, { ...BOTH, people: PEOPLE, ...relay, ...secrets });
     assert.equal(setup(fromFile, '--answers', file, '--skip-checks').status, 0);
@@ -354,9 +398,10 @@ test('the answers file and the answers typed at a prompt produce the same files'
 test('the relay is asked about as a change, and the push relay names itself in the summary', async (t) => {
     // Neither APNs nor Web Push is asked for any more, and the call relay is not a hostname typed
     // blind: it defaults to this server, and the question is whether to put it somewhere else. The
-    // push relay is the one question of the two, and it offers the shared default — which the
-    // summary then names, because it is not this deployment's.
+    // push relay is one question with three answers, and the default is the shared relay, enrolled
+    // from here — which the summary then names, because it is not this deployment's.
     const dir = deployment(t);
+    const relay = enrolmentStub();
     const terminal = recordingTerminal([
         'advanced',
         'private',
@@ -364,11 +409,12 @@ test('the relay is asked about as a change, and the push relay names itself in t
         'Abdullah', 'abdullah@dev', undefined,   // the first person, an administrator by default
         undefined,                                // another person? no
         undefined,                                // relay elsewhere? no — this server
-        undefined,                                // the push relay: the default offered
+        undefined,                                // the push relay: the shared relay, the default
         false, false,                             // no console password, no invitation
     ]);
     await runSetup({
         dir, answers: {}, ask: terminal, log: () => {}, check: false, tailscale: '', spawn: () => 0,
+        fetch: relay.fetch,
     });
 
     const asked = (pattern) => {
@@ -383,10 +429,12 @@ test('the relay is asked about as a change, and the push relay names itself in t
     assert.equal(terminal.asked.some((question) => /relayed through a TURN server/.test(question.message)),
         false, 'the long TURN question is not asked any more');
 
-    // The push relay is asked once, with the shared default as the value Enter takes, and no part
-    // of the Apple or Web Push vocabulary survives in the run.
-    const push = asked(/push relay/i);
-    assert.equal(push.defaultValue, 'https://crossbar-push-dev.ibnfaisalc.workers.dev');
+    // The push relay is one menu with three answers, and the shared relay is the first of them, so
+    // Enter takes the automatic path. No part of the Apple or Web Push vocabulary survives.
+    const push = asked(/locked phone be rung/);
+    assert.equal(push.kind, 'select');
+    assert.deepEqual(push.options.map((option) => option.value), ['standard', 'another', 'none']);
+    assert.match(push.options[0].hint, /automatically/);
     assert.equal(terminal.asked.some((question) => /APNs|Apple|VAPID|Web Push/.test(question.message)),
         false, 'a removed question is still being asked');
 
@@ -396,9 +444,11 @@ test('the relay is asked about as a change, and the push relay names itself in t
 
     const summary = terminal.notes.find((note) => /^Crossbar setup:\n/.test(note) && note.includes('Verified'));
     assert.ok(summary, `the summary was not made: ${terminal.notes.join(' | ')}`);
-    // Both relays are named, and the default one says what the three names that change it are.
+    // Both relays are named, the credential says how it arrived, and the three names that decide
+    // which relay is in force are printed beside the one in force.
     assert.match(summary, /Relay\s+house\.tailnet\.ts\.net · shared secret generated/);
     assert.match(summary, /https:\/\/crossbar-push-dev\.ibnfaisalc\.workers\.dev/);
+    assert.match(summary, /credential obtained automatically/);
     assert.match(summary, /CROSSBAR_PUSH_RELAY_URL, CROSSBAR_PUSH_RELAY_TOKEN, CROSSBAR_PUSH_RELAY_INSTALLATION_ID/);
     assert.equal(/APNs|Web Push/.test(summary), false, `a removed row is still in the summary:\n${summary}`);
 });
@@ -413,10 +463,12 @@ test('a relay named somewhere else is asked for by hostname, and a blank there i
         'Abdullah', 'abdullah@dev', undefined, undefined,
         true,                                     // relay elsewhere? yes
         '',                                       // and then nothing — no relay
-        undefined, undefined,                     // the push relay default, no finishing steps
+        'none',                                   // and no push relay either
+        undefined, undefined,                     // no finishing steps
     ]);
     await runSetup({
         dir, answers: {}, ask: terminal, log: () => {}, check: false, tailscale: '', spawn: () => 0,
+        fetch: noEnrolment(),
     });
 
     assert.ok(terminal.asked.some((question) => question.message === 'The relay\'s hostname'));
@@ -426,12 +478,262 @@ test('a relay named somewhere else is asked for by hostname, and a blank there i
     assert.match(summary, /not configured — calls still work, but some networks will fail/);
 });
 
+// ── The push relay the install obtains for itself ────────────────────────────────
+//
+// The default path is a network request, so every test here injects a stub: the wizard's `fetch`
+// is the seam, and no test in this file reaches the real relay. That is also why the stub records
+// what it received — what the wizard actually sends is half of what is being pinned.
+
+/** What a run with no terminal needs, so the push relay is the only thing these tests are about. */
+const SETUP_ANSWERS = {
+    mode: 'public',
+    publicHostname: 'calls.example.com',
+    publicOrigin: 'https://calls.example.com',
+    publicBindAddress: '203.0.113.7',
+    people: PEOPLE,
+};
+
+/**
+ * What a run with no terminal wrote, as one line of words: the presentation's box drawn as it is
+ * written for a log, and a wrapped sentence reassembled so an assertion is about the sentence
+ * rather than about where the column fell.
+ */
+const logged = (lines) => lines.join(' ')
+    .replace(/[│┌┐└┘├╮╯─◇]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+/** A `.env` that already holds a working relay, for the runs that have one to keep. */
+function withRelay(dir, url, token) {
+    fs.appendFileSync(path.join(dir, '.env'), [
+        `CROSSBAR_PUSH_RELAY_URL=${url}`,
+        `CROSSBAR_PUSH_RELAY_TOKEN=${token}`,
+        'CROSSBAR_PUSH_RELAY_INSTALLATION_ID=ins_old',
+    ].join('\n') + '\n');
+}
+
+test('the install sends the enrolment the relay documents, and stores what the relay reports', async (t) => {
+    // No `pushRelay` answer at all: this is the default the question offers, taken with no terminal
+    // to ask on — the unattended install that must obtain its own installation.
+    const dir = deployment(t);
+    const lines = [];
+    const relay = enrolmentStub({ relayUrl: 'https://relay.example.reported' });
+    await runSetup({
+        dir,
+        answers: { ...SETUP_ANSWERS },
+        log: (line) => lines.push(line),
+        check: false,
+        tailscale: '',
+        spawn: () => 0,
+        fetch: relay.fetch,
+    });
+
+    assert.equal(relay.requests.length, 1, 'exactly one enrolment request');
+    const sent = relay.requests[0];
+    assert.equal(sent.method, 'POST');
+    assert.equal(sent.url, 'https://crossbar-push-dev.ibnfaisalc.workers.dev/v1/installations');
+    assert.equal(sent.headers['content-type'], 'application/json');
+    assert.equal(sent.headers.authorization, undefined, 'the enrolment route takes no credential');
+    assert.deepEqual(JSON.parse(sent.body), { label: 'calls.example.com' });
+
+    // What the relay reported, not what was dialled: its own spelling of the origin it was reached
+    // at is the one stored, and all three settings are written — nobody types a credential.
+    const env = envOf(dir);
+    assert.match(env, /^CROSSBAR_PUSH_RELAY_URL=https:\/\/relay\.example\.reported$/m);
+    assert.match(env, new RegExp(`^CROSSBAR_PUSH_RELAY_TOKEN=${CREDENTIAL}$`, 'm'));
+    assert.match(env, /^CROSSBAR_PUSH_RELAY_INSTALLATION_ID=ins_01HQ8Z5V9K3W2M4N6P7Q8R9S0$/m);
+
+    const said = logged(lines);
+    assert.match(said, /credential obtained automatically/);
+    assert.match(said, /https:\/\/relay\.example\.reported/);
+    assert.match(said, /CROSSBAR_PUSH_RELAY_URL, CROSSBAR_PUSH_RELAY_TOKEN, CROSSBAR_PUSH_RELAY_INSTALLATION_ID/);
+});
+
+test('an enrolment the shared relay refuses is a sentence and a choice, not a stop', async (t) => {
+    // `enrolment_closed`: the relay is at its operator's cap. The deployment is still installable,
+    // and the person is asked whether they have a relay of their own rather than shown a code.
+    const dir = deployment(t);
+    const relay = enrolmentStub({ status: 403, body: { error: 'enrolment_closed' } });
+    const terminal = recordingTerminal([
+        'advanced', 'private',
+        'house.tailnet.ts.net', undefined,
+        'Abdullah', 'abdullah@dev', undefined, undefined,
+        undefined,                                // relay elsewhere? no
+        undefined,                                // the shared relay: the default
+        false,                                    // name another relay instead? no
+        false, false,                             // no console password, no invitation
+    ]);
+    await runSetup({
+        dir, answers: {}, ask: terminal, log: () => {}, check: false, tailscale: '', spawn: () => 0,
+        fetch: relay.fetch,
+    });
+
+    // The install finished: the mode is in force and the directory is written.
+    assert.equal(modeConfigured('private', path.join(dir, '.env')).configured, true);
+    assert.ok(fs.existsSync(path.join(dir, 'data', 'directory.json')));
+    // Nothing was created, so nothing is written for a relay and no credential is invented.
+    const env = envOf(dir);
+    assert.match(env, /^CROSSBAR_PUSH_RELAY_URL=$/m);
+    assert.match(env, /^CROSSBAR_PUSH_RELAY_TOKEN=$/m);
+    assert.match(env, /^CROSSBAR_PUSH_RELAY_INSTALLATION_ID=$/m);
+
+    // A sentence, the offer of the manual path, and neither the relay's error code nor a stack.
+    const said = terminal.notes.join('\n');
+    assert.match(said, /not taking new installations/);
+    assert.match(said, /can still be installed/);
+    assert.ok(terminal.asked.some((question) => question.message === 'Name a relay you already have instead?'),
+        'the manual path was not offered');
+    assert.equal(/enrolment_closed|Error|at async|node:internal/.test(said), false,
+        `a raw code or a stack reached the screen:\n${said}`);
+    const summary = terminal.notes.find((note) => /^Crossbar setup:\n/.test(note) && note.includes('Verified'));
+    assert.match(summary, /not configured/);
+    assert.match(summary, /not taking new installations/);
+});
+
+test('a rate-limited enrolment says when to try again, and the install still finishes', async (t) => {
+    const dir = deployment(t);
+    const lines = [];
+    const relay = enrolmentStub({ status: 429, body: { error: 'rate_limited' }, retryAfter: '42' });
+    await runSetup({
+        dir, answers: { ...SETUP_ANSWERS }, log: (line) => lines.push(line), check: false,
+        tailscale: '', spawn: () => 0, fetch: relay.fetch,
+    });
+
+    assert.equal(relay.requests.length, 1);
+    const said = logged(lines);
+    assert.match(said, /limiting how often installations can be created/);
+    assert.match(said, /about 42 more seconds/);
+    assert.equal(/rate_limited/.test(said), false, 'the relay code reached the screen');
+    assert.match(envOf(dir), /^CROSSBAR_PUSH_RELAY_URL=$/m);
+    assert.equal(modeConfigured('public', path.join(dir, '.env')).configured, true);
+});
+
+test('an enrolment that gets no answer is left unknown, said so, and never retried', async (t) => {
+    // The route is not idempotent, so a lost answer may have created an installation. Sending it
+    // again would create a second one whose credential nobody holds — so it is sent exactly once.
+    const dir = deployment(t);
+    const lines = [];
+    let calls = 0;
+    const fetch = async () => { calls += 1; throw new Error('connection refused'); };
+    await runSetup({
+        dir, answers: { ...SETUP_ANSWERS }, log: (line) => lines.push(line), check: false,
+        tailscale: '', spawn: () => 0, fetch,
+    });
+
+    assert.equal(calls, 1, 'the non-idempotent request was repeated');
+    const said = logged(lines);
+    assert.match(said, /did not answer/);
+    assert.match(said, /unknown/);
+    assert.match(envOf(dir), /^CROSSBAR_PUSH_RELAY_URL=$/m);
+});
+
+test('a 201 whose body is not the documented shape is refused rather than stored', async (t) => {
+    const dir = deployment(t);
+    const lines = [];
+    const relay = enrolmentStub({ status: 201, body: { ok: true, installation_id: 'ins_x', credential: 'nope' } });
+    await runSetup({
+        dir, answers: { ...SETUP_ANSWERS }, log: (line) => lines.push(line), check: false,
+        tailscale: '', spawn: () => 0, fetch: relay.fetch,
+    });
+
+    assert.match(envOf(dir), /^CROSSBAR_PUSH_RELAY_URL=$/m);
+    assert.match(envOf(dir), /^CROSSBAR_PUSH_RELAY_TOKEN=$/m);
+    assert.match(logged(lines), /refused to create an installation/);
+});
+
+test('naming another relay keeps the questions, and writes the credential that is given', async (t) => {
+    const dir = deployment(t);
+    const terminal = recordingTerminal([
+        'advanced', 'private',
+        'house.tailnet.ts.net', undefined,
+        'Abdullah', 'abdullah@dev', undefined, undefined,
+        undefined,                                // relay elsewhere? no
+        'another',                                // the push relay choice
+        'https://relay.example.net',              // its URL
+        CREDENTIAL,                               // its credential
+        false, false,
+    ]);
+    await runSetup({
+        dir, answers: {}, ask: terminal, log: () => {}, check: false, tailscale: '', spawn: () => 0,
+        fetch: noEnrolment(),
+    });
+
+    const env = envOf(dir);
+    assert.match(env, /^CROSSBAR_PUSH_RELAY_URL=https:\/\/relay\.example\.net$/m);
+    assert.match(env, new RegExp(`^CROSSBAR_PUSH_RELAY_TOKEN=${CREDENTIAL}$`, 'm'));
+    assert.ok(terminal.asked.some((question) => question.message === 'The push relay to use'));
+    const credential = terminal.asked.find((question) => question.message === 'Its installation credential');
+    assert.ok(credential, 'the credential is asked for');
+    assert.equal(credential.hidden, true, 'a server secret must not be drawn back to the screen');
+    const summary = terminal.notes.find((note) => /^Crossbar setup:\n/.test(note) && note.includes('Verified'));
+    assert.match(summary, /credential given/);
+});
+
+test('choosing no relay blanks the three settings a deployment already had', async (t) => {
+    const dir = deployment(t);
+    withRelay(dir, 'https://relay.old.example', CREDENTIAL);
+    await runSetup({
+        dir,
+        answers: { ...SETUP_ANSWERS, pushRelay: 'none' },
+        log: () => {}, check: false, tailscale: '', spawn: () => 0, fetch: noEnrolment(),
+    });
+
+    const env = envOf(dir);
+    assert.match(env, /^CROSSBAR_PUSH_RELAY_URL=$/m);
+    assert.match(env, /^CROSSBAR_PUSH_RELAY_TOKEN=$/m);
+    assert.match(env, /^CROSSBAR_PUSH_RELAY_INSTALLATION_ID=$/m);
+});
+
+test('a second run keeps the relay already in the file rather than enrolling again', async (t) => {
+    const dir = deployment(t);
+    const relay = enrolmentStub();
+    const answers = { ...SETUP_ANSWERS };
+    await runSetup({
+        dir, answers, log: () => {}, check: false, tailscale: '', spawn: () => 0, fetch: relay.fetch,
+    });
+    assert.equal(relay.requests.length, 1);
+    const first = envOf(dir);
+
+    // The same answers again, with no push relay named: the file already holds one at the shared
+    // relay with a credential, so nothing is sent and the bytes do not change.
+    await runSetup({
+        dir, answers, log: () => {}, check: false, tailscale: '', spawn: () => 0, fetch: noEnrolment(),
+    });
+    assert.equal(envOf(dir), first, 'the second run rewrote the relay settings');
+});
+
+test('a refused enrolment keeps a relay that already works rather than dropping it', async (t) => {
+    const dir = deployment(t);
+    withRelay(dir, 'https://relay.old.example', CREDENTIAL);
+    const relay = enrolmentStub({ status: 403, body: { error: 'enrolment_closed' } });
+    const terminal = recordingTerminal([
+        'advanced', 'private',
+        'house.tailnet.ts.net', undefined,
+        'Abdullah', 'abdullah@dev', undefined, undefined,
+        undefined,                                // relay elsewhere? no
+        'standard',                               // move to the shared relay
+        false,                                    // no manual path
+        false, false,
+    ]);
+    await runSetup({
+        dir, answers: {}, ask: terminal, log: () => {}, check: false, tailscale: '', spawn: () => 0,
+        fetch: relay.fetch,
+    });
+
+    // The relay that already worked is still in the file, and the refusal is what is said.
+    const env = envOf(dir);
+    assert.match(env, /^CROSSBAR_PUSH_RELAY_URL=https:\/\/relay\.old\.example$/m);
+    assert.match(env, new RegExp(`^CROSSBAR_PUSH_RELAY_TOKEN=${CREDENTIAL}$`, 'm'));
+    assert.match(terminal.notes.join('\n'), /not taking new installations/);
+});
+
 test('the short run asks the mode, the people and the password, and works the rest out', async (t) => {
     // Basic's whole claim: three things a machine cannot work out, and everything else — the
     // origin, the bind address, the relay, the secrets — filled in. The one address no machine can
     // work out is a public name somebody owns, so that is the single extra question the list below
     // turns up, and it is called out here rather than hidden.
     const dir = deployment(t);
+    const relay = enrolmentStub();
     const terminal = recordingTerminal([
         'basic',
         'public',
@@ -450,6 +752,7 @@ test('the short run asks the mode, the people and the password, and works the re
         tailscale: '',
         spawn: () => 0,
         locals: ['192.168.1.10', '127.0.0.1', '169.254.1.9', '100.64.3.4', '203.0.113.7', 'fe80::1'],
+        fetch: relay.fetch,
     });
 
     assert.deepEqual(terminal.asked.map((question) => question.message), [
@@ -464,12 +767,16 @@ test('the short run asks the mode, the people and the password, and works the re
 
     // What was derived, in the file: the origin from the name, the bind address from this host (a
     // routable address preferred over the private one), the relay on this server, and the shared
-    // push relay. The id comes from the display name, and the summary says so.
+    // push relay — enrolled here rather than asked about, which is the short run's whole point.
+    // The id comes from the display name, and the summary says so.
     const env = envOf(dir);
     assert.match(env, /^NETWORK_MODE_PUBLIC_ORIGIN=https:\/\/crossbar\.example\.com$/m);
     assert.match(env, /^NETWORK_MODE_PUBLIC_BIND_ADDRESS=203\.0\.113\.7$/m);
     assert.match(env, /^CROSSBAR_TURN_HOST=crossbar\.example\.com$/m);
     assert.match(env, /^CROSSBAR_PUSH_RELAY_URL=https:\/\/crossbar-push-dev\.ibnfaisalc\.workers\.dev$/m);
+    assert.match(env, new RegExp(`^CROSSBAR_PUSH_RELAY_TOKEN=${CREDENTIAL}$`, 'm'));
+    assert.match(env, /^CROSSBAR_PUSH_RELAY_INSTALLATION_ID=ins_01HQ8Z5V9K3W2M4N6P7Q8R9S0$/m);
+    assert.equal(relay.requests.length, 1, 'the short run enrolled exactly once');
     assert.match(env, /^CROSSBAR_SESSION_SECRET=[0-9a-f]{64}$/m);
     assert.deepEqual(JSON.parse(directoryOf(dir)).users.map((user) => user.id), ['abdullah-al-faisal']);
     // The id was shown when it was derived, and it is in the summary as well.
@@ -489,7 +796,7 @@ test('the long run is asked in short lines, and the person question names nobody
         'public',
         'calls.example.com', undefined, '203.0.113.7',   // hostname, origin (derived), bind address
         'Abdullah', 'abdullah@dev', undefined, undefined, // one person, an administrator, done
-        undefined, undefined,                             // relay: this server; push relay: the default
+        undefined, 'none',                                // relay: this server; push relay: none
         false, false,                                     // no console password, no invitation
     ]);
     await runSetup({
@@ -500,6 +807,7 @@ test('the long run is asked in short lines, and the person question names nobody
         check: false,
         tailscale: '',
         spawn: () => 0,
+        fetch: noEnrolment(),
         locals: ['192.168.1.10', '127.0.0.1', '169.254.1.9', '100.64.3.4', '203.0.113.7', 'fe80::1', 'fd7a:115c:a1e0::b635:a0c'],
     });
 
@@ -547,10 +855,11 @@ test('the notes and the summary say what the questions said, without a sentence 
         'house.tailnet.ts.net', undefined,
         "O'Brien", 'obrien@dev', undefined, undefined,
         true, '',                                 // relay elsewhere, then nowhere: no relay at all
-        undefined, false, false,
+        'none', false, false,                     // no push relay, and no finishing steps
     ]);
     await runSetup({
         dir, answers: {}, ask: terminal, log: () => {}, check: false, tailscale: '', spawn: () => 0,
+        fetch: noEnrolment(),
     });
 
     // The id rule, said back where a person can see it: the name keeps its apostrophe, the id does

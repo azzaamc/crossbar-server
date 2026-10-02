@@ -77,9 +77,17 @@ const SETUP_USAGE = `node src/admin.js setup — ask what a fresh deployment nee
     --turn-host <host>                the call relay, when it is not this server; blank relays
                                       through this deployment's own address
     --turn-secret <secret>            its shared secret (generated when a host is given)
-    --push-relay-url <url>            the push relay phones are rung through
-                                      (default: https://crossbar-push-dev.ibnfaisalc.workers.dev,
-                                      which the summary names)
+    --push-relay <standard|another|none>
+                                      how phones are rung: the shared relay, enrolled for this
+                                      deployment automatically (the default when nothing says
+                                      otherwise); another relay, named with --push-relay-url and
+                                      --push-relay-token; or none, which leaves a phone whose
+                                      screen is off unringable
+    --push-relay-url <url>            the relay, when another one is used
+    --push-relay-token <credential>   its installation credential, cbr_… — written into .env and
+                                      never printed; prefer an --answers file (mode 0600), because
+                                      a flag also appears in the process list
+    --push-relay-installation-id <id> its ins_…, for the log line that names the installation
     --session-secret <secret>         signs sessions (generated when the file holds none)
     --new-secrets                     generate new secrets even though the file holds some
     --password                        set the console password afterwards without asking

@@ -62,6 +62,9 @@ const BOTH = {
     publicHostname: 'crossbar.example.com',
     publicOrigin: 'https://crossbar.example.com',
     publicBindAddress: '203.0.113.7',
+    // A run with no push relay answer enrols with the shared relay over the network; these tests
+    // are about the page and the files, so the relay is explicitly none here.
+    pushRelay: 'none',
 };
 
 function deployment(t, seed = TEMPLATE) {
@@ -230,6 +233,7 @@ test('the basic answers work through the page as they do on the command line', a
         // Fixed for the same reason the other equivalence test fixes them: the two runs are being
         // compared on the mapping from answers to files, not on two rolls of the generator.
         turnSecret: 'cd'.repeat(32),
+        pushRelay: 'none',
     };
 
     const cli = cliSetup(viaCli, answers);
@@ -244,11 +248,11 @@ test('the basic answers work through the page as they do on the command line', a
     assert.equal(directoryOf(viaPage), directoryOf(viaCli), 'and so is the directory file');
     // The id came from the display name, on both front ends.
     assert.deepEqual(JSON.parse(directoryOf(viaPage)).users.map((user) => user.id), ['abdullah-al-faisal']);
-    // What the short run derived: the origin from the name, the relay as this server, and the
-    // shared push relay.
+    // What the short run derived: the origin from the name, the relay as this server, and no push
+    // relay, because these answers named none.
     assert.match(envOf(viaPage), /^NETWORK_MODE_PUBLIC_ORIGIN=https:\/\/crossbar\.example\.com$/m);
     assert.match(envOf(viaPage), /^CROSSBAR_TURN_HOST=crossbar\.example\.com$/m);
-    assert.match(envOf(viaPage), /^CROSSBAR_PUSH_RELAY_URL=https:\/\/crossbar-push-dev\.ibnfaisalc\.workers\.dev$/m);
+    assert.match(envOf(viaPage), /^CROSSBAR_PUSH_RELAY_URL=$/m);
 });
 
 test('the listener closes when setup finishes', async (t) => {

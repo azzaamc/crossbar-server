@@ -311,9 +311,26 @@ th { font-weight: 600; font-size: 0.78rem; text-transform: uppercase; letter-spa
                 <span>blank generates one</span>
                 <input data-answer="turnSecret" autocomplete="off" spellcheck="false">
             </label>
-            <label>The push relay phones are rung through
-                <span>blank uses the shared relay, ${DEFAULT_PUSH_RELAY_URL}; whichever is in force is named in the summary, and the token that goes with it is set in .env</span>
+            <label>How a locked phone is rung
+                <span>the shared relay, ${DEFAULT_PUSH_RELAY_URL}, enrols this deployment automatically and is the default — nothing to type; "another" names a relay you run, or one whose credential you were given; "none" leaves a phone whose screen is off unringable</span>
+                <select data-answer="pushRelay">
+                    <option value="">The shared relay — enrol automatically (or keep what is in .env)</option>
+                    <option value="standard">The shared relay — enrol again</option>
+                    <option value="another">Another relay — the URL and credential below</option>
+                    <option value="none">No relay</option>
+                </select>
+            </label>
+            <label>The push relay, when it is not the shared one
+                <span>a relay you run or were given; blank with "another" means no relay</span>
                 <input data-answer="pushRelayUrl" autocomplete="off" spellcheck="false">
+            </label>
+            <label>Its installation credential
+                <span>the cbr_… the relay's operator gave you; it is written into .env and never shown again</span>
+                <input data-answer="pushRelayToken" autocomplete="off" spellcheck="false">
+            </label>
+            <label>Its installation id
+                <span>the ins_…, if you have it; it only names this installation in a log line</span>
+                <input data-answer="pushRelayInstallationId" autocomplete="off" spellcheck="false">
             </label>
         </fieldset>
 
