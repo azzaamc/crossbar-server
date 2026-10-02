@@ -112,6 +112,27 @@ run_secret() { # run_secret <VAR> <value> <command...>
     env "$var=$value" "$@"
 }
 
+# A command whose output belongs to somebody else and is not for the transcript, but whose failure
+# is. `run`'s contract with both modes, with the output held back: the command is printed in a dry
+# run, and in a real one it says nothing when it works and everything it said when it does not.
+#
+# Written for `caddy validate`, which answers with eight lines of its own JSON — under a line that
+# promises the installers' output is in the log, that is the same wall in a smaller size — and for
+# systemctl on a package that ships an init script, which narrates its SysV fallback.
+run_captured() { # run_captured <command...>
+    if [ "$DRY_RUN" = '1' ]; then
+        printf '  $ %s\n' "$*"
+        return 0
+    fi
+    local output='' status=0
+    output="$("$@" 2>&1)" || status=$?
+    if [ "$status" -ne 0 ]; then
+        printf '  !! %s (exit %s)\n' "$*" "$status" >&2
+        if [ -n "$output" ]; then printf '%s\n' "$output" >&2; fi
+    fi
+    return "$status"
+}
+
 # The packages and third-party installers this deployment needs, run with their own output kept
 # out of the transcript. `apt`, Tailscale's own install script (which traces every command it runs)
 # and `npm ci` between them print something like sixty lines that are not this install's to say,
@@ -735,7 +756,7 @@ install_public_front_door() { # install_public_front_door
     if [ -z "$bind" ]; then bind="$(env_value NETWORK_MODE_PUBLIC_BIND_ADDRESS)"; fi
     if [ -z "$hostname" ]; then hostname='<the public hostname the wizard writes>'; fi
     if [ -z "$bind" ]; then bind='<the public bind address the wizard writes>'; fi
-    if ! run env CROSSBAR_PUBLIC_HOSTNAME="$hostname" CROSSBAR_BIND_ADDRESS="$bind" \
+    if ! run_captured env CROSSBAR_PUBLIC_HOSTNAME="$hostname" CROSSBAR_BIND_ADDRESS="$bind" \
             PORT="$(deployment_port)" caddy validate --config /etc/caddy/Caddyfile; then
         die "Caddy is installed but its Caddyfile does not validate for $hostname, so public mode's shaper unit would start a proxy that cannot render it. Fix /etc/caddy/Caddyfile (deploy/README.md §2.8), or run with --no-setup and install the front door by hand."
     fi

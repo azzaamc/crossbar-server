@@ -860,9 +860,11 @@ the values from the same `.env` the server reads. The shared secret is therefore
 committed and the rendered copy lives on a tmpfs.
 
 The install commands are with the other units (§2.5), and `scripts/install.sh` **installs coturn
-itself** — `apt-get install -y coturn`, then the relay unit and `/etc/crossbar/coturn.conf` —
-whenever this box is the relay, which is the default; a run that was told about another relay
-host installs nothing here, and `--with-relay` installs it anyway. A coturn that could not be
+itself** — `apt-get install -y coturn`, then the relay unit and `/etc/crossbar/coturn.conf`, then
+`systemctl enable --now crossbar-turn.service` — whenever this box is the relay, which is the
+default; a run that was told about another relay host installs nothing here, and `--with-relay`
+installs it anyway. (The distro's own `coturn.service` is disabled at the same time: it has no
+authentication configured, and the unit above is the one that reads the shared secret.) A coturn that could not be
 installed is a fault the run says out loud rather than an address in `.env` that nothing answers
 on. **The wizard sets the two settings for you**: it defaults
 `CROSSBAR_TURN_HOST` to this deployment's own address — its public name, or its tailnet name in a

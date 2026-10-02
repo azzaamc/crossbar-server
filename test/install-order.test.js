@@ -298,6 +298,12 @@ test('the relay is installed here when the relay is this box, and skipped only w
     const own = seeded({ ...base, turnHost: host });
     assert.ok(own.includes('Installing the coturn relay'), `coturn is not installed for this box's own name:\n${own}`);
     assert.ok(!own.includes('a relay elsewhere was named'), own);
+    // And the unit it installed is enabled and started, like `crossbar.service` and the backup
+    // timer: installed is not listening, and the shaper units only `try-restart` the relay on a mode
+    // switch, which is a no-op on a unit that has never run. A real install left coturn configured
+    // and silent, with eight UDP sockets on 3478 appearing only once it was started by hand.
+    assert.ok(own.includes('systemctl enable --now crossbar-turn.service'),
+        `the relay unit is never enabled or started:\n${own}`);
 
     // And the default, where nobody named a relay at all: the wizard writes this box's name.
     const derived = seeded(base);
@@ -307,6 +313,7 @@ test('the relay is installed here when the relay is this box, and skipped only w
     const elsewhere = seeded({ ...base, turnHost: 'turn.example.com' });
     assert.ok(!elsewhere.includes('Installing the coturn relay'), `coturn is installed for another relay:\n${elsewhere}`);
     assert.ok(elsewhere.includes('a relay elsewhere was named'), elsewhere);
+    assert.ok(!elsewhere.includes('crossbar-turn.service'), `another relay's host gets a local relay unit:\n${elsewhere}`);
 });
 
 test('the certificate wait is bounded, and ends at the first answer rather than the ceiling', (t) => {
@@ -353,6 +360,37 @@ test('the certificate wait is bounded, and ends at the first answer rather than 
     const silent = wait(99, 2);
     assert.match(silent.text, /TLS-TIMEOUT/);
     assert.equal(silent.probes, 2, `the wait ran past its ceiling:\n${silent.text}`);
+});
+
+test('a captured command says nothing when it works, and what it said when it fails', (t) => {
+    // `caddy validate` answers with eight lines of its own JSON — under a line promising that the
+    // installers' output is in the log, that is the same wall in a smaller size — and systemctl on a
+    // package that ships an init script narrates its SysV fallback. Neither belongs in the
+    // transcript, and both are what an operator has to see when the command is what went wrong.
+    const script = (line, dryRun = '0') => [
+        'set -euo pipefail',
+        `. ${path.join(ROOT, 'scripts', 'lib', 'deploy.sh')}`,
+        `DRY_RUN=${dryRun}`,
+        `NODE_BIN=${JSON.stringify(process.execPath)}`,
+        line,
+    ].join('\n');
+    const run = (line, dryRun) => {
+        const done = spawnSync('bash', ['-c', script(line, dryRun)], { encoding: 'utf8' });
+        return { ...done, text: `${done.stdout}${done.stderr}` };
+    };
+
+    const quiet = run('run_captured /bin/sh -c "echo eight lines of JSON; echo more of it" && echo CAPTURED-OK');
+    assert.match(quiet.text, /CAPTURED-OK/);
+    assert.ok(!quiet.text.includes('eight lines of JSON'), `the output was printed anyway:\n${quiet.text}`);
+
+    const loud = run('run_captured /bin/sh -c "echo why it failed; exit 3" || echo CAPTURED-FAILED');
+    assert.match(loud.text, /CAPTURED-FAILED/);
+    assert.match(loud.text, /why it failed/, `the failure does not say what the command said:\n${loud.text}`);
+    assert.match(loud.text, /\(exit 3\)/, `the failure does not say the exit status:\n${loud.text}`);
+
+    // A dry run still prints the command: that transcript is that mode's whole purpose.
+    const dry = run('run_captured env FOO=bar some-command --flag', '1');
+    assert.match(dry.text, /some-command --flag/, `the dry run does not print the command:\n${dry.text}`);
 });
 
 test('a login that finishes reads the name back and corrects the address', (t) => {

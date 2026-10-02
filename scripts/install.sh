@@ -491,7 +491,7 @@ if relay_wanted "$ANSWERS"; then
         # stock configuration has no authentication at all, and a relay that forwards for anybody is
         # the one state this must not be in even for the seconds between two phases. The unit below
         # `Conflicts=` with it, so this is what is running now rather than what starts at boot.
-        if ! run systemctl disable --now coturn; then
+        if ! run_captured systemctl disable --now coturn; then
             warn "the package's coturn unit could not be disabled; if it is running, it is not this"
             warn "deployment's relay and it authenticates nobody. Stop it by hand and restart"
             warn 'crossbar-turn.service (deploy/README.md §2.9).'
@@ -543,6 +543,20 @@ run systemctl enable crossbar
 # would run one backup at boot — and the timer is the only thing that schedules it. This line is
 # the difference between a daily backup and none.
 run systemctl enable --now crossbar-backup.timer
+# The relay, when it is this box, and the same treatment: installed is not listening. Nothing else
+# starts it — the shaper units only `try-restart` it on a mode switch, which is a no-op on a unit
+# that has never run — so without this line coturn is installed, configured, and silent, and the
+# deployment's own address is in `.env` as a relay that answers nobody. A relay that will not start
+# is said as the fault it is, like the install above it.
+if [ -n "$RELAY_INSTALLED" ]; then
+    if run systemctl enable --now crossbar-turn.service; then
+        ok 'the relay is enabled and running'
+    else
+        warn 'crossbar-turn.service could not be enabled and started, so relayed calls have nothing'
+        warn 'to go through. `journalctl -u crossbar-turn -n 50 --no-pager` says why; the relay is'
+        warn 'not essential to a call between two devices that can reach each other directly.'
+    fi
+fi
 # `restart`, not `start`: a second run over a running deployment has to re-apply the mode's shape,
 # and the two shaping units are oneshots that only run as part of starting the server.
 run systemctl restart crossbar
