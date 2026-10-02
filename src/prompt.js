@@ -330,13 +330,24 @@ function confirmStep(state, pressed) {
  *
  * The cursor is deliberately left where the last frame ended — the line under it is the next
  * question's — so a question that has not settled redraws over itself instead of scrolling.
+ *
+ * `region` is the bounded area the whole wizard draws in: one question's frame, one note, one
+ * spinner line. It is cleared before this question's first frame, so the previous step is taken
+ * off the screen rather than added under it, and it is told the rows this question leaves behind
+ * when it settles, so the *next* step can take those off in turn. The area is measured in rows and
+ * not lines, for the reason `rows` exists: a question wider than the screen occupies more rows
+ * than it has lines, and a region counted in lines would leave a row of the old frame above the
+ * new one every time.
  */
-function converse({ input, output, draw, step, state, columns }) {
+function converse({ input, output, draw, step, state, columns, region }) {
     return new Promise((resolve) => {
         readline.emitKeypressEvents(input);
         const wasRaw = Boolean(input.isRaw);
         if (input.isTTY) input.setRawMode(true);
         input.resume();
+        // The previous step goes before this one is drawn, and before the cursor is hidden: the
+        // area it occupies is above where the cursor was left.
+        region.clear();
         output.write(HIDE_CURSOR);
 
         let drawn = null;
@@ -375,23 +386,57 @@ function converse({ input, output, draw, step, state, columns }) {
             input.removeListener('keypress', onKey);
             if (input.isTTY) input.setRawMode(wasRaw);
             input.pause();
-            output.write(`\r\n${SHOW_CURSOR}\n`);
             // Ctrl-C is a way out, and it leaves the terminal as it found it — the same bargain
-            // `src/admin.js` strikes for the console's password.
-            if (next.settled === 'cancelled') process.exit(130);
+            // `src/admin.js` strikes for the console's password. Nothing follows it, so the
+            // shell's prompt gets a row of its own under the frame.
+            if (next.settled === 'cancelled') {
+                output.write(`\r\n${SHOW_CURSOR}\n`);
+                process.exit(130);
+            }
+            // The settled frame is left on the screen as the region the next step erases, and the
+            // cursor is put on the row under it so that a region of N rows is N rows *up* from
+            // where the next step begins. No extra newline past that row: an empty row between two
+            // frames is a row the next `ERASE_DOWN` never takes back.
+            output.write(`\r\n${SHOW_CURSOR}`);
+            region.track(drawn, columns());
             resolve(current);
         };
         input.on('keypress', onKey);
     });
 }
 
-/** The frames written one line at a time, which is all `intro`, `outro` and `note` ever do. */
-const speaking = (write, paint, columns) => ({
+/**
+ * A region nothing is drawn in: what a log gets, where every line is the next line and none is
+ * taken back — and where there is nothing to forget, because nothing is ever erased.
+ */
+const NO_REGION = Object.freeze({ clear() {}, track() {}, forget() {} });
+
+/**
+ * The frames written one line at a time, which is all `intro`, `outro` and `note` ever do.
+ *
+ * `intro` and `outro` are not bounded areas: the opener is the one line the run hangs off and the
+ * closer is the last thing said, so neither takes the other off the screen. Everything between
+ * them — a note, a question, a spinner line — is drawn in `region`, and the step that follows
+ * takes it off again.
+ */
+const speaking = (write, paint, columns, region = NO_REGION) => ({
     columns,
     width: roomFor(columns),
     intro: (title) => write(opening(title, paint)),
     outro: (message) => { closing(message, paint).forEach(write); write(''); },
-    note: (body, title) => boxed(body, title, paint, columns).forEach(write),
+    note: (body, title) => {
+        region.clear();
+        const lines = boxed(body, title, paint, columns);
+        lines.forEach(write);
+        region.track(lines);
+    },
+    /**
+     * Stop accounting for the last step: something wrote to the terminal without going through
+     * here — a command this wizard ran in it — and the rows it left are neither known nor the
+     * wizard's to take back. The next step then draws under what is there instead of erasing
+     * rows that are no longer where they were.
+     */
+    forget: () => region.forget(),
 });
 
 /** Every method of a prompter that has no terminal: the refusal, and nothing drawn. */
@@ -399,7 +444,7 @@ const refusing = () => {
     const no = () => { throw new NoTerminal(); };
     return {
         intro: no, outro: no, note: no, select: no, text: no, confirm: no, spinner: no,
-        close: () => {},
+        close: () => {}, forget: () => {},
     };
 };
 
@@ -422,11 +467,30 @@ function createPrompter({ input = process.stdin, output = process.stdout, paint 
     const columnsNow = () => (columns ?? (output.columns > 0 ? output.columns : 80));
     const width = columnsNow();
     const say = (line) => output.write(`${line}\n`);
-    const ask = (draw, step, state) => converse({ input, output, draw, step, state, columns: columnsNow });
+
+    // The bounded area the run draws in, held in rows: `clear` takes the previous step off the
+    // screen — the cursor is left on the row under it, so a region of N rows is N rows up and
+    // `ERASE_DOWN` does the rest — and `track` records what the step just drawn left there.
+    const region = {
+        rows: 0,
+        clear() {
+            if (this.rows > 0) output.write(`\u001b[${this.rows}A\r${ERASE_DOWN}`);
+            this.rows = 0;
+        },
+        track(lines, measuredAt = columnsNow()) {
+            this.rows = rows(lines, measuredAt);
+        },
+        forget() {
+            this.rows = 0;
+        },
+    };
+    const ask = (draw, step, state) => converse({
+        input, output, draw, step, state, columns: columnsNow, region,
+    });
 
     return {
         present: true,
-        ...speaking(say, paint, width),
+        ...speaking(say, paint, width, region),
 
         /** One option out of many, chosen with the arrow keys. */
         select: ({ message, options, initial }) => ask(
@@ -453,6 +517,7 @@ function createPrompter({ input = process.stdin, output = process.stdout, paint 
         spinner: () => {
             let running = false;
             let drawn = 0;
+            let guided = false;
             let turn = 0;
             let said = '';
             let timer = null;
@@ -474,7 +539,11 @@ function createPrompter({ input = process.stdin, output = process.stdout, paint 
             return {
                 start: (message) => {
                     said = String(message).replace(/\.+$/, '');
+                    // The spinner is a step like any other: the question before it goes, and the
+                    // one settled line it leaves is what the next step takes away in turn.
+                    region.clear();
                     output.write(`${paint.gray(SYMBOL.guide)}\n`);
+                    guided = true;
                     running = true;
                     timer = setInterval(() => { turn = (turn + 1) % CYCLING.length; draw(); }, interval);
                     timer.unref();
@@ -486,7 +555,15 @@ function createPrompter({ input = process.stdin, output = process.stdout, paint 
                     running = false;
                     clearInterval(timer);
                     erase();
-                    output.write(`${paint.green(SYMBOL.submitted)}  ${text ?? said}\n`);
+                    // The guide line went up with `start`, above the spinner; it comes off with it,
+                    // or the run would leave one `│` behind for every spinner it showed.
+                    if (guided) {
+                        output.write(`\u001b[1A\r${ERASE_DOWN}`);
+                        guided = false;
+                    }
+                    const line = `${paint.green(SYMBOL.submitted)}  ${text ?? said}`;
+                    output.write(`${line}\n`);
+                    region.track([line]);
                 },
             };
         },

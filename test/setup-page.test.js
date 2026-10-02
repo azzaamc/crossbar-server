@@ -151,6 +151,14 @@ test('the right code reaches the form, and the form carries no secret', async (t
     const document = await response.text();
     assert.match(document, /<form id="setup"/);
     assert.match(document, /data-answer="publicBindAddress"/);
+    // The two things the page had to gain with the command line: the same basic/advanced choice,
+    // and the same person question — a display name first, with the id derived from it.
+    assert.match(document, /data-answer="approach"/);
+    assert.match(document, /data-answer="pushRelayUrl"/);
+    assert.match(document, /crossbar-push-dev\.ibnfaisalc\.workers\.dev/, 'the shared relay is not named');
+    assert.match(document, /One person per line: "display name, login, admin"/);
+    // And the questions that were removed are not still in the form.
+    assert.doesNotMatch(document, /data-answer="apns|data-answer="vapid/);
     // The code is the credential that got here, and it is not in the document that came back:
     // the form posts to `/setup` with the cookie, so nothing a browser renders names it.
     assert.equal(document.includes(page.code), false, 'the code must not appear in the page');
@@ -204,6 +212,43 @@ test('posted answers produce the same files as the command line with the same an
     // What the page reports is the engine's own report, checks and all.
     assert.ok(body.result.checks.every((check) => typeof check.verdict === 'string'));
     assert.ok(body.lines.some((line) => /Crossbar setup/.test(line)));
+});
+
+test('the basic answers work through the page as they do on the command line', async (t) => {
+    // The page has the same fork the terminal has, and the same person question: a display name
+    // with no id, from which the id is derived. A basic run through either front end derives the
+    // origin, the bind address from this host and the relay on this server.
+    const viaCli = deployment(t);
+    const viaPage = deployment(t);
+    const answers = {
+        approach: 'basic',
+        mode: 'public',
+        publicHostname: 'crossbar.example.com',
+        publicBindAddress: '203.0.113.7',
+        people: [{ name: 'Abdullah Al-Faisal', login: 'abdullah@dev', admin: true }],
+        sessionSecret: 'ab'.repeat(32),
+        // Fixed for the same reason the other equivalence test fixes them: the two runs are being
+        // compared on the mapping from answers to files, not on two rolls of the generator.
+        turnSecret: 'cd'.repeat(32),
+    };
+
+    const cli = cliSetup(viaCli, answers);
+    assert.equal(cli.status, 0, cli.stderr);
+
+    const page = await openPage(t, viaPage);
+    const form = await fetch(page.url);
+    const body = await (await submit(page, cookieOf(form), answers)).json();
+    assert.equal(body.status, 'set-up', body.error);
+
+    assert.equal(envOf(viaPage), envOf(viaCli), 'the .env is the same bytes the CLI writes');
+    assert.equal(directoryOf(viaPage), directoryOf(viaCli), 'and so is the directory file');
+    // The id came from the display name, on both front ends.
+    assert.deepEqual(JSON.parse(directoryOf(viaPage)).users.map((user) => user.id), ['abdullah-al-faisal']);
+    // What the short run derived: the origin from the name, the relay as this server, and the
+    // shared push relay.
+    assert.match(envOf(viaPage), /^NETWORK_MODE_PUBLIC_ORIGIN=https:\/\/crossbar\.example\.com$/m);
+    assert.match(envOf(viaPage), /^CROSSBAR_TURN_HOST=crossbar\.example\.com$/m);
+    assert.match(envOf(viaPage), /^CROSSBAR_PUSH_RELAY_URL=https:\/\/crossbar-push-dev\.ibnfaisalc\.workers\.dev$/m);
 });
 
 test('the listener closes when setup finishes', async (t) => {

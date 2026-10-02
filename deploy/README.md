@@ -203,12 +203,65 @@ What it asks, and where each answer lands:
 
 | it asks | it writes |
 | --- | --- |
+| **how much of the wizard to walk** — Basic or Advanced (`--approach basic` or `--approach advanced` for the unattended path) | nothing: it decides which of the questions below are asked |
 | which modes this deployment is reached in (`--mode private`, `public` or `both`) | one block per mode, `NETWORK_MODE_<MODE>_*` in `.env` |
 | the hostname and origin of each mode, and the public bind address — the private one offered as this machine's own tailnet name, which the wizard joins the tailnet to get (§2.8.1) | the same block (§2.3) |
-| who is in the directory — `id, display name, login, admin` per person | the directory file (§2.4) |
-| a TURN relay host and secret, APNs, Web Push — each optional, each skippable | the names in `.env` |
+| who is in the directory — a display name per person, from which the id is derived | the directory file (§2.4) |
+| the call relay, when it is not this server, and the relay a phone is rung through | `CROSSBAR_TURN_HOST` and `CROSSBAR_TURN_SHARED_SECRET`, `CROSSBAR_PUSH_RELAY_URL` |
 | nothing about the session secret | it generates one, or keeps the one the file holds |
-| whether to set the console password, and whether to invite somebody — both default yes, both at the end of a terminal run | the password hash and one invitation (§2.7), each made by its own command in the same terminal |
+| whether to set the console password, and (advanced only) whether to invite somebody — both default yes, both at the end of a terminal run | the password hash and one invitation (§2.7), each made by its own command in the same terminal |
+
+**Every question is one line, and the reasoning that used to be inside a question is here.**
+A screen that shows the current step rather than a growing list is the reason: a question that
+carries four lines of explanation cannot be redrawn in place, and a person who has already read
+what a tailnet is does not need it again above the menu. What a question still has to say it
+says in its own line; what it does not is in this section and in the summary the run ends with —
+which is where a person reads what they got, including what a blank answer chose.
+
+**The first question is how much of the wizard to walk.** *Basic* asks three things — the modes,
+the people and the console password — and works out everything else a machine can: the private
+address from the tailnet name the join read back, the public origin as the public name with
+`https://` in front, the bind address from this host's own addresses (a globally routable one
+preferred over a private one, because that is what a name can point at), the call relay as this
+server, and the secrets by generating them. **The one address it still asks for is a public
+name**, because a domain you own is a fact about that domain and nothing on the machine can
+derive it; a run that needs one says so rather than inventing it. *Advanced* walks every step
+with the same detection and the same auto-derived defaults as before, so Enter keeps taking the
+suggested value. `--approach` chooses either way from a flag or from an `--answers` file, and with
+no terminal and no answer the run is advanced — a run that was not told to be short must not
+quietly derive.
+
+**A person is named by their display name, and the id everybody else knows them by is derived
+from it**: lower case, spaces become `-`, and nothing but lower-case letters, digits and `-`
+survives — `O'Brien` is `obrien`, `Abdullah Al-Faisal` is `abdullah-al-faisal`. A name that
+derives nothing is asked again, and the derived id is said back beside the question and named in
+the summary, so nobody has to work out what they will be shown as. The id may still be given
+outright in an `--answers` file or a `--people` file, which is what a script that needs a specific
+id should do; the rule is `shortIdFrom` in `src/setup.js` and the same in every front end.
+
+**The call relay is this server unless you say otherwise.** A call that cannot connect directly
+is relayed through a TURN server, and the one this deployment can always reach is itself: its
+public address in a public deployment, its tailnet name in a private one. So the question is
+whether to put the relay somewhere else, and only then is a hostname asked for — `CROSSBAR_TURN_HOST`
+is filled in with this server's own address when it is not. Its shared secret is generated either
+way. Leaving the hostname blank after saying the relay is elsewhere is the one way to ask for no
+relay at all: calls that can connect directly still work, and the summary says that some networks
+will fail.
+
+**The relay a phone is rung through is named in the run, not inherited in silence.** A locked
+phone is woken by a VoIP push through the Crossbar push relay (§2.7.1), and the wizard offers a
+shared development relay — `https://crossbar-push-dev.ibnfaisalc.workers.dev` — as the value Enter
+takes. Whichever relay is in force is named in the summary, and when the default is what was kept
+the summary also prints the three names that would point the deployment at another one:
+`CROSSBAR_PUSH_RELAY_URL`, `CROSSBAR_PUSH_RELAY_TOKEN` and `CROSSBAR_PUSH_RELAY_INSTALLATION_ID`
+(§2.7.1). The URL is the wizard's business; the token is a server secret the relay's operator hands
+over once, and it stays a hand edit in `.env` — a URL with no token rings nothing, and the summary
+says so.
+
+**APNs and Web Push are no longer asked for.** A deployment no longer needs an Apple key to be set
+up: the missed-call notification that still uses APNs is configured by hand when somebody wants it
+(§2.7), and the wizard neither asks for the key nor writes any of its four names. Web Push is not
+asked for either, and no summary row reports it. Both capabilities are unchanged in the server.
 
 A value the deployment already holds is offered as the default, so a second run over a configured
 deployment changes only what it was told to; secrets are kept unless `--new-secrets` is passed.
@@ -343,9 +396,11 @@ Fill in, at minimum:
   `.env.example`; add the line only to change the window. See §3.4.
 - `CROSSBAR_ADMIN_PASSWORD_HASH` via `node src/admin.js password`, not by hand.
 
-**The push relay's three settings are not asked by the wizard** — they come from the relay operator,
-who hands them over once (§2.7.1) — so they are pasted into `.env` by hand, or added to an
-`--answers` file only after `src/setup.js` learns them. A deployment that never sets them runs
+**The push relay's URL is the wizard's, and its credential is not.** The wizard offers
+`https://crossbar-push-dev.ibnfaisalc.workers.dev` and writes `CROSSBAR_PUSH_RELAY_URL`; the token
+and the installation id come from the relay operator, who hands them over once (§2.7.1), so they
+are pasted into `.env` by hand. Whichever relay the URL names is printed in the wizard's summary,
+and a URL with no token rings nothing. A deployment that never sets the credential runs
 exactly as it did before the relay existed: everything works except ringing a phone whose screen is
 off, and `status` says so on its `Push relay` line.
 
@@ -377,7 +432,8 @@ nothing more. Why in place rather than a staged rename, and what that costs, is 
 
 **The setup wizard writes this file too.** `scripts/install.sh` runs it (§2.2.1) and it writes the
 people it was given — the `people` key of an `--answers` file or the terminal's
-`id, display name, login, admin` lines — through the same validator the server uses, at the path
+`display name, login, admin` lines, whose id is derived from the display name (§2.2.1) — through
+the same validator the server uses, at the path
 `.env`'s `DIRECTORY_CONFIG_PATH` names. `node src/admin.js setup` in the deployment runs the same
 wizard by hand. The block below is the by-hand path, what `--no-setup` leaves you to do.
 
@@ -502,9 +558,10 @@ ordinary notification and still goes to Apple from here, which is what `CROSSBAR
 say `not configured — a missed call tells nobody`, and a missed call is silent while everything
 else keeps working. Web Push is the browser's equivalent and is optional: it needs a VAPID key
 pair, which `npx web-push generate-vapid-keys` prints (the
-public key, then the private one) plus a contact subject the push services can use — the
-wizard asks for all three, in that order, and writes them as `VAPID_PUBLIC_KEY`,
-`VAPID_PRIVATE_KEY` and `VAPID_SUBJECT`. An APNs key is the Apple **team**'s, not a server's:
+public key, then the private one) plus a contact subject the push services can use, pasted into
+`.env` as `VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY` and `VAPID_SUBJECT`. **The wizard no longer asks
+for either of these transports** — an Apple key and a VAPID pair are set by hand when somebody
+wants them, and no question or summary row mentions them. An APNs key is the Apple **team**'s, not a server's:
 deployments serving the same app share one key id, team id and topic, and each names the `.p8`
 file on its own server — copy it there, and let the account the deployment runs as read it.
 
@@ -794,9 +851,12 @@ committed and the rendered copy lives on a tmpfs.
 
 The install commands are with the other units (§2.5), and `scripts/install.sh` installs the relay
 unit and `/etc/crossbar/coturn.conf` by itself when `turnserver` is on `PATH` (it says which it
-did; `--with-relay` forces it). Then set
+did; `--with-relay` forces it). **The wizard sets the two settings for you**: it defaults
+`CROSSBAR_TURN_HOST` to this deployment's own address — its public name, or its tailnet name in a
+private deployment — and generates `CROSSBAR_TURN_SHARED_SECRET`, so a run that never touched the
+relay question still has a working one (§2.2.1). By hand the pair is
 `CROSSBAR_TURN_HOST=<CROSSBAR_PUBLIC_HOSTNAME>` and a `CROSSBAR_TURN_SHARED_SECRET`
-(`openssl rand -hex 32`) in `.env`, and restart the relay and the server so the ICE list the
+(`openssl rand -hex 32`) in `.env`; either way, restart the relay and the server so the ICE list the
 server hands out names the relay that is actually running. The relay refuses to start if the
 rendered secret is empty, because a coturn with no secret accepts no one — which looks like a
 media failure rather than a configuration one. `CROSSBAR_TURN_EXTERNAL_IP` is required on a

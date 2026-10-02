@@ -18,7 +18,9 @@ const { spawnSync } = require('node:child_process');
 
 const ADMIN = path.join(__dirname, '..', 'src', 'admin.js');
 const { modeBlock, modeConfigured, writtenMode } = require('../src/config');
-const { runSetup, readState, natVerdict } = require('../src/setup');
+const {
+    runSetup, readState, natVerdict, shortIdFrom, ownBindAddress,
+} = require('../src/setup');
 
 /** The `.env` an install seeds: both blocks, the switch's section, and nothing filled in. */
 const TEMPLATE = `HOST=127.0.0.1
@@ -127,6 +129,7 @@ function recordingTerminal(script) {
         intro: (title) => notes.push(title),
         outro: (message) => notes.push(message),
         note: (body, title) => notes.push(`${title}:\n${body}`),
+        forget: () => {},
         spinner: () => ({ start() {}, stop() {}, message() {} }),
         select: async ({ message, options, initial }) => {
             asked.push({ kind: 'select', message, options });
@@ -152,13 +155,7 @@ test('the answers become the files the switch reads', (t) => {
         ...BOTH,
         people: PEOPLE,
         turnHost: 'relay.example.com',
-        apnsKeyId: 'ABC123',
-        apnsTeamId: 'TEAM123',
-        apnsKeyPath: '/etc/crossbar/apns.p8',
-        apnsTopic: 'com.example.crossbar',
-        vapidPublicKey: 'vapid-public',
-        vapidPrivateKey: 'vapid-private',
-        vapidSubject: 'mailto:abdullah@example.com',
+        pushRelayUrl: 'https://relay.example.net',
     });
 
     const result = setup(dir, '--answers', file, '--skip-checks');
@@ -182,13 +179,17 @@ test('the answers become the files the switch reads', (t) => {
     assert.match(env, /^PUBLIC_ORIGIN=https:\/\/house\.tailnet\.ts\.net$/m);
     assert.match(env, /^CROSSBAR_BIND_ADDRESS=$/m);
 
-    // The secrets, the relay and the push material.
+    // The secrets, the relay and the push relay — the relay's secret generated, the push relay's
+    // URL the one that was named. Neither APNs nor Web Push is asked for any more, so neither is
+    // written.
     const state = readState(dir);
     assert.match(state.secrets.session, HEX_32, 'the session secret is 32 bytes of hex');
     assert.match(state.secrets.turn, HEX_32, 'the relay secret is 32 bytes of hex');
     assert.equal(state.turnHost, 'relay.example.com');
-    assert.deepEqual(state.vapid, { publicKey: 'vapid-public', privateKey: 'vapid-private', subject: 'mailto:abdullah@example.com' });
-    assert.deepEqual(state.apns, { keyId: 'ABC123', teamId: 'TEAM123', keyPath: '/etc/crossbar/apns.p8', topic: 'com.example.crossbar' });
+    assert.equal(state.pushRelay.url, 'https://relay.example.net');
+    assert.match(env, /^CROSSBAR_PUSH_RELAY_URL=https:\/\/relay\.example\.net$/m);
+    assert.doesNotMatch(env, /^VAPID_PUBLIC_KEY=/m);
+    assert.doesNotMatch(env, /^CROSSBAR_APNS_KEY_ID=/m);
 
     // The directory: the people, who administers, and everybody able to reach everybody — a
     // directory with no pairs in it reads as an empty app.
@@ -317,20 +318,20 @@ test('the answers file and the answers typed at a prompt produce the same files'
     const fromFile = deployment(t);
     const fromPrompt = deployment(t);
     const secrets = { sessionSecret: 'ab'.repeat(32), turnSecret: 'cd'.repeat(32) };
+    const relay = { turnHost: 'relay.example.com', pushRelayUrl: 'https://relay.example.net' };
 
-    const file = answersFile(fromFile, { ...BOTH, people: PEOPLE, turnHost: 'relay.example.com', ...secrets });
+    const file = answersFile(fromFile, { ...BOTH, people: PEOPLE, ...relay, ...secrets });
     assert.equal(setup(fromFile, '--answers', file, '--skip-checks').status, 0);
 
-    // The same answers, one question at a time, in the order the questions are asked.
+    // The same answers, one question at a time, in the order the questions are asked. The relay
+    // and the push relay come from the answers here, so the questions that remain are the mode, the
+    // five addresses and the two people — whose ids are derived from the names they are given.
     const script = [
         'both',
         BOTH.privateHostname, BOTH.privateOrigin,
         BOTH.publicHostname, BOTH.publicOrigin, BOTH.publicBindAddress,
-        'abdullah, Abdullah, abdullah@dev, admin',
-        'dad, Dad, dad@dev',
-        '',
-        'relay.example.com',
-        '',
+        'Abdullah, abdullah@dev, admin',
+        'Dad, dad@dev',
         '',
     ];
     const ask = async (_prompt, fallback = '') => {
@@ -339,7 +340,7 @@ test('the answers file and the answers typed at a prompt produce the same files'
     };
     await runSetup({
         dir: fromPrompt,
-        answers: secrets,
+        answers: { ...relay, ...secrets },
         ask,
         log: () => {},
         check: false,
@@ -350,60 +351,143 @@ test('the answers file and the answers typed at a prompt produce the same files'
     assert.equal(directoryOf(fromPrompt), directoryOf(fromFile));
 });
 
-test('the optional questions say they can be skipped, and that an Apple key is the team\'s', async (t) => {
-    // The owner stopped at the APNs question to ask why a key was needed when another deployment
-    // already had one. The note above the step had not answered that, and the question's wording is
-    // the only thing a person reads — so what these questions say is the thing under test.
-    const dir = deployment(t);
-    const asked = [];
-    const script = ['', '', '']; // the relay, APNs, then Web Push: each skipped with a blank line
-    const ask = async (prompt) => {
-        asked.push(prompt);
-        return script.shift() ?? '';
-    };
-    await runSetup({ dir, answers: { ...BOTH, people: PEOPLE }, ask, log: () => {}, check: false });
-    assert.equal(script.length, 0, 'every optional question was asked');
-
-    const apns = asked.find((prompt) => /Push is optional/.test(prompt));
-    assert.ok(apns, `the APNs question was asked: ${asked.join(' | ')}`);
-    assert.match(apns, /blank skips it/);
-    assert.match(apns, /a phone whose screen is off cannot be rung/);
-    // The team credential, and the three values another deployment of the same app shares — which
-    // is the answer the owner had to ask for.
-    assert.match(apns, /belongs to the Apple team, not to this server/);
-    assert.match(apns, /key id/);
-    assert.match(apns, /team id/);
-    assert.match(apns, /topic/);
-
-    const webpush = asked.find((prompt) => /Web Push/.test(prompt));
-    assert.ok(webpush, `the Web Push question was asked: ${asked.join(' | ')}`);
-    assert.match(webpush, /Web Push is optional/);
-    assert.match(webpush, /blank skips it/);
-    assert.match(webpush, /a closed browser cannot be woken/);
-
-    // And the blank lines at each are what skipped them: the file holds none of the four names.
-    assert.deepEqual(readState(dir).apns, { keyId: '', teamId: '', keyPath: '', topic: '' });
-    assert.deepEqual(readState(dir).vapid, { publicKey: '', privateKey: '', subject: '' });
-
-    // The question for a key pair says where a pair comes from: a person who has never made one
-    // cannot answer "its VAPID public key" at all, and nowhere else in the run says it either.
-    assert.match(webpush, /generate-vapid-keys/);
-    // And the APNs question says which of its four values this prompt is for, because it is the one
-    // question in the run whose answer opens three more.
-    assert.match(apns, /This question asks for the key id; the three after it ask/);
-});
-
-test('the questions a first-time reader meets name the thing and show an answer', async (t) => {
-    // Every question the wizard asks a terminal, read as a person who has never seen Crossbar. The
-    // assertion that matters is the person id's exact text: it is a template literal, and the `' + '`
-    // that used to sit inside it was printed at the screen rather than joined — a defect no
-    // answers-to-files test can see.
+test('the relay is asked about as a change, and the push relay names itself in the summary', async (t) => {
+    // Neither APNs nor Web Push is asked for any more, and the call relay is not a hostname typed
+    // blind: it defaults to this server, and the question is whether to put it somewhere else. The
+    // push relay is the one question of the two, and it offers the shared default — which the
+    // summary then names, because it is not this deployment's.
     const dir = deployment(t);
     const terminal = recordingTerminal([
+        'advanced',
+        'private',
+        'house.tailnet.ts.net', undefined,       // the address; the origin derived from it
+        'Abdullah', 'abdullah@dev', undefined,   // the first person, an administrator by default
+        undefined,                                // another person? no
+        undefined,                                // relay elsewhere? no — this server
+        undefined,                                // the push relay: the default offered
+        false, false,                             // no console password, no invitation
+    ]);
+    await runSetup({
+        dir, answers: {}, ask: terminal, log: () => {}, check: false, tailscale: '', spawn: () => 0,
+    });
+
+    const asked = (pattern) => {
+        const found = terminal.asked.find((question) => pattern.test(question.message));
+        assert.ok(found, `no question matched ${pattern}: ${terminal.asked.map((q) => q.message).join(' | ')}`);
+        return found;
+    };
+
+    // The relay is one line, and it is a yes-or-no about moving it — the old hostname question and
+    // its "blank for no relay" reading are gone from the prompt.
+    assert.match(asked(/Relay calls somewhere/).message, /other than this server/);
+    assert.equal(terminal.asked.some((question) => /relayed through a TURN server/.test(question.message)),
+        false, 'the long TURN question is not asked any more');
+
+    // The push relay is asked once, with the shared default as the value Enter takes, and no part
+    // of the Apple or Web Push vocabulary survives in the run.
+    const push = asked(/push relay/i);
+    assert.equal(push.defaultValue, 'https://crossbar-push-dev.ibnfaisalc.workers.dev');
+    assert.equal(terminal.asked.some((question) => /APNs|Apple|VAPID|Web Push/.test(question.message)),
+        false, 'a removed question is still being asked');
+
+    // The relay derived here is this server's own address, and it is in the file.
+    assert.match(envOf(dir), /^CROSSBAR_TURN_HOST=house\.tailnet\.ts\.net$/m);
+    assert.match(envOf(dir), /^CROSSBAR_TURN_SHARED_SECRET=[0-9a-f]{64}$/m);
+
+    const summary = terminal.notes.find((note) => /^Crossbar setup:\n/.test(note) && note.includes('Verified'));
+    assert.ok(summary, `the summary was not made: ${terminal.notes.join(' | ')}`);
+    // Both relays are named, and the default one says what the three names that change it are.
+    assert.match(summary, /Relay\s+house\.tailnet\.ts\.net · shared secret generated/);
+    assert.match(summary, /https:\/\/crossbar-push-dev\.ibnfaisalc\.workers\.dev/);
+    assert.match(summary, /CROSSBAR_PUSH_RELAY_URL, CROSSBAR_PUSH_RELAY_TOKEN, CROSSBAR_PUSH_RELAY_INSTALLATION_ID/);
+    assert.equal(/APNs|Web Push/.test(summary), false, `a removed row is still in the summary:\n${summary}`);
+});
+
+test('a relay named somewhere else is asked for by hostname, and a blank there is no relay', async (t) => {
+    // The one way to have no relay left: say the relay is elsewhere, then name nowhere. The
+    // summary is where the cost of that is read, in the words the question used to carry.
+    const dir = deployment(t);
+    const terminal = recordingTerminal([
+        'advanced', 'private',
+        'house.tailnet.ts.net', undefined,
+        'Abdullah', 'abdullah@dev', undefined, undefined,
+        true,                                     // relay elsewhere? yes
+        '',                                       // and then nothing — no relay
+        undefined, undefined,                     // the push relay default, no finishing steps
+    ]);
+    await runSetup({
+        dir, answers: {}, ask: terminal, log: () => {}, check: false, tailscale: '', spawn: () => 0,
+    });
+
+    assert.ok(terminal.asked.some((question) => question.message === 'The relay\'s hostname'));
+    const env = envOf(dir);
+    assert.equal(/^CROSSBAR_TURN_HOST=.+$/m.test(env), false, 'no relay host was written');
+    const summary = terminal.notes.find((note) => /^Crossbar setup:\n/.test(note) && note.includes('Verified'));
+    assert.match(summary, /not configured — calls still work, but some networks will fail/);
+});
+
+test('the short run asks the mode, the people and the password, and works the rest out', async (t) => {
+    // Basic's whole claim: three things a machine cannot work out, and everything else — the
+    // origin, the bind address, the relay, the secrets — filled in. The one address no machine can
+    // work out is a public name somebody owns, so that is the single extra question the list below
+    // turns up, and it is called out here rather than hidden.
+    const dir = deployment(t);
+    const terminal = recordingTerminal([
+        'basic',
+        'public',
+        'crossbar.example.com',     // the public name, which no machine can derive
+        'Abdullah Al-Faisal',       // the person: only a display name is asked
+        undefined,                  // another person? no
+        false,                      // no console password
+    ]);
+    await runSetup({
+        dir,
+        answers: {},
+        ask: terminal,
+        log: () => {},
+        check: false,
+        tailscale: '',
+        spawn: () => 0,
+        locals: ['192.168.1.10', '127.0.0.1', '169.254.1.9', '100.64.3.4', '203.0.113.7', 'fe80::1'],
+    });
+
+    assert.deepEqual(terminal.asked.map((question) => question.message), [
+        'Basic setup, or advanced?',
+        'How will people reach this deployment?',
+        'Public (open internet): the address people reach this deployment at',
+        'The first person: their display name',
+        'Another person?',
+        'Set the console password now? It guards the web console at /admin.',
+    ]);
+
+    // What was derived, in the file: the origin from the name, the bind address from this host (a
+    // routable address preferred over the private one), the relay on this server, and the shared
+    // push relay. The id comes from the display name, and the summary says so.
+    const env = envOf(dir);
+    assert.match(env, /^NETWORK_MODE_PUBLIC_ORIGIN=https:\/\/crossbar\.example\.com$/m);
+    assert.match(env, /^NETWORK_MODE_PUBLIC_BIND_ADDRESS=203\.0\.113\.7$/m);
+    assert.match(env, /^CROSSBAR_TURN_HOST=crossbar\.example\.com$/m);
+    assert.match(env, /^CROSSBAR_PUSH_RELAY_URL=https:\/\/crossbar-push-dev\.ibnfaisalc\.workers\.dev$/m);
+    assert.match(env, /^CROSSBAR_SESSION_SECRET=[0-9a-f]{64}$/m);
+    assert.deepEqual(JSON.parse(directoryOf(dir)).users.map((user) => user.id), ['abdullah-al-faisal']);
+    // The id was shown when it was derived, and it is in the summary as well.
+    assert.ok(terminal.notes.some((note) => /Abdullah Al-Faisal will be known as abdullah-al-faisal/.test(note)),
+        terminal.notes.join(' | '));
+    const summary = terminal.notes.find((note) => /^Crossbar setup:\n/.test(note) && note.includes('Verified'));
+    assert.match(summary, /abdullah-al-faisal/);
+});
+
+test('the long run is asked in short lines, and the person question names nobody else', async (t) => {
+    // Every question the wizard asks a terminal, read as a person who has never seen Crossbar. The
+    // questions are one line each: what used to be four lines of reasoning in a question is in the
+    // summary and in `deploy/README.md` (§2.2.1) instead.
+    const dir = deployment(t);
+    const terminal = recordingTerminal([
+        'advanced',
         'public',
         'calls.example.com', undefined, '203.0.113.7',   // hostname, origin (derived), bind address
-        'abdullah', 'Abdullah', 'abdullah@dev', undefined, undefined, // one person, not an admin: no
-        undefined, undefined, undefined,                  // relay, APNs and Web Push: each skipped
+        'Abdullah', 'abdullah@dev', undefined, undefined, // one person, an administrator, done
+        undefined, undefined,                             // relay: this server; push relay: the default
         false, false,                                     // no console password, no invitation
     ]);
     await runSetup({
@@ -413,6 +497,7 @@ test('the questions a first-time reader meets name the thing and show an answer'
         log: () => {},
         check: false,
         tailscale: '',
+        spawn: () => 0,
         locals: ['192.168.1.10', '127.0.0.1', '169.254.1.9', '100.64.3.4', '203.0.113.7', 'fe80::1', 'fd7a:115c:a1e0::b635:a0c'],
     });
 
@@ -422,48 +507,63 @@ test('the questions a first-time reader meets name the thing and show an answer'
         return found.message;
     };
 
-    // The mode question says what Tailscale is: a tailnet is not a word a first-timer has.
-    assert.match(messageOf(/reach this deployment/), /over Tailscale, a private network/);
-    // The person id: one clean question, and the one that is not about a value the machine knows.
-    assert.equal(terminal.asked.find((question) => /short id/.test(question.message)).message,
-        'The first person: the short id everybody else knows them by (for example: abdullah)');
-    // The login is needed in private mode and optional in public, and the question says both — the
-    // blank it used to invite was refused after the last question had been asked.
-    assert.match(messageOf(/Tailscale login/), /a private deployment finds people by this/);
+    // The choice at the very start: how much of the wizard to walk.
+    assert.equal(terminal.asked[0].message, 'Basic setup, or advanced?');
+    assert.equal(terminal.asked[0].kind, 'select');
+    assert.deepEqual(terminal.asked[0].options.map((option) => option.label), ['Basic', 'Advanced']);
+    // Every question is one line: none carries a newline, and every question except the bind
+    // address — which shows this host's own addresses, data rather than reasoning — is short
+    // enough for an eighty-column screen.
+    for (const question of terminal.asked) {
+        assert.equal(question.message.includes('\n'), false, `a question has a newline in it: ${question.message}`);
+        if (/web front end \(Caddy\)/.test(question.message)) continue;
+        assert.ok(question.message.length < 80, `a question is longer than a line: ${question.message}`);
+    }
+    // The mode question is a question; what a tailnet is lives in its hints, not in the line.
+    assert.equal(messageOf(/reach this deployment/), 'How will people reach this deployment?');
+    assert.match(terminal.asked.find((question) => /reach this deployment/.test(question.message))
+        .options.find((option) => option.value === 'private').hint, /your own devices, from anywhere/);
+    // The person question asks for a display name and nothing else: no id, and no example of one.
+    assert.equal(messageOf(/display name/), 'The first person: their display name');
+    assert.equal(terminal.asked.some((question) => /short id|for example: abdullah/.test(question.message)),
+        false, 'the old id question is still being asked');
     // The bind address is this host's address, so the question shows the host's own: no loopback,
     // no link-local, no tailnet, no IPv6 — the candidates are what a router could forward to.
     assert.match(messageOf(/web front end \(Caddy\)/),
         /this host's own IPv4 addresses: 192\.168\.1\.10, 203\.0\.113\.7$/);
-    // The origin is derived, so the question says the Enter key keeps what it is showing.
-    assert.match(messageOf(/invitation opens/), /press Enter to keep the one this question offers/);
-    // The relay is named, and so is where its value comes from when the relay is this server.
-    assert.match(messageOf(/relayed through a TURN server/), /if the relay runs on this server/);
+    // The login question keeps its one clause about when it matters.
+    assert.match(messageOf(/Tailscale login/), /abdullah: their Tailscale login/);
 });
 
 test('the notes and the summary say what the questions said, without a sentence broken in half', async (t) => {
     // A note is wrapped at spaces, so a newline written inside a sentence comes out as a line that
-    // ends early — the optional-material note said "the summary says what it went" / "without:".
-    // The notes are collected raw here, which is the one place that breakage is visible.
+    // ends early. The notes are collected raw here, which is the one place that breakage is
+    // visible, and the derived id is the note this run makes.
     const dir = deployment(t);
     const terminal = recordingTerminal([
-        'public',
-        'calls.example.com', undefined, '203.0.113.7',
-        'abdullah', 'Abdullah', '', undefined, undefined,
-        undefined, undefined, undefined,
-        false, false,
+        'advanced', 'private',
+        'house.tailnet.ts.net', undefined,
+        "O'Brien", 'obrien@dev', undefined, undefined,
+        true, '',                                 // relay elsewhere, then nowhere: no relay at all
+        undefined, false, false,
     ]);
-    await runSetup({ dir, answers: {}, ask: terminal, log: () => {}, check: false, tailscale: '' });
+    await runSetup({
+        dir, answers: {}, ask: terminal, log: () => {}, check: false, tailscale: '', spawn: () => 0,
+    });
 
-    const optional = terminal.notes.find((note) => note.includes('Relay'));
-    assert.ok(optional, `the optional-material note was not made: ${terminal.notes.join(' | ')}`);
-    assert.match(optional, /the summary says what it went without:/);
-    assert.doesNotMatch(optional, /went\nwithout/);
+    // The id rule, said back where a person can see it: the name keeps its apostrophe, the id does
+    // not, and the note is one line rather than a sentence split across two.
+    const said = terminal.notes.find((note) => note.includes('will be known as'));
+    assert.ok(said, `the derived id was not said: ${terminal.notes.join(' | ')}`);
+    assert.equal(said, "The person:\nO'Brien will be known as obrien.");
 
-    // The summary repeats the questions' own words, not a vocabulary of its own.
+    // The summary is where a blank's consequence is read now that the question is one line: no
+    // relay was named, and no relay secret was generated for one.
     const summary = terminal.notes.find((note) => /^Crossbar setup:\n/.test(note) && note.includes('Verified'));
     assert.ok(summary, `the summary was not made: ${terminal.notes.join(' | ')}`);
     assert.match(summary, /not configured — calls still work, but some networks will fail/);
     assert.match(summary, /session \(what signs a device in\) generated \(32 bytes of hex\)/);
+    assert.match(summary, /obrien/);
 });
 
 test('a generated secret is 32 bytes of hex, and a second run generates a different one', (t) => {
@@ -526,6 +626,31 @@ Module._load = function (request, parent, isMain) {
     assert.equal(result.status, 0, result.stderr);
     assert.equal(modeConfigured('public', path.join(dir, '.env')).configured, true);
     assert.equal(JSON.parse(directoryOf(dir)).users.length, 2);
+});
+
+test('a display name becomes the id everybody else knows them by', () => {
+    // The rule, with the two examples it is written for: lower case, spaces to `-`, and nothing
+    // but lower-case letters, digits and `-` kept.
+    assert.equal(shortIdFrom("O'Brien"), 'obrien');
+    assert.equal(shortIdFrom('Abdullah Al-Faisal'), 'abdullah-al-faisal');
+    assert.equal(shortIdFrom('  Mary   Jane  '), 'mary-jane');
+    assert.equal(shortIdFrom('Zoë-Ärger'), 'zo-rger');
+    // A name that derives nothing derives nothing, which is what makes the question ask again
+    // rather than write a person the directory file would then refuse.
+    assert.equal(shortIdFrom('!!!'), '');
+    assert.equal(shortIdFrom(''), '');
+    // An id has to start with a letter or a digit (`src/directory.js`), so the ends are trimmed.
+    assert.equal(shortIdFrom('-Bob'), 'bob');
+    assert.equal(shortIdFrom('Bob-'), 'bob');
+});
+
+test('the short run binds an address a name could point at', () => {
+    // The candidates are the same list the question shows; a globally routable address is what a
+    // domain can resolve to, so it wins over a private one. Nothing to pick leaves `''`, which is
+    // what makes the question fall back to being asked rather than guessed at.
+    assert.equal(ownBindAddress(['127.0.0.1', '192.168.1.10', '203.0.113.7', '100.64.3.4', 'fe80::1']), '203.0.113.7');
+    assert.equal(ownBindAddress(['10.0.0.5', '192.168.1.10']), '10.0.0.5');
+    assert.equal(ownBindAddress(['127.0.0.1', '::1', '100.64.3.4', '169.254.1.9']), '');
 });
 
 test('the NAT reading says what it measured, and could not determine what it cannot', () => {

@@ -46,18 +46,24 @@ const SETUP_USAGE = `node src/admin.js setup — ask what a fresh deployment nee
   answer has to come from one of the two: nothing is guessed for a value that changes what this
   deployment does, and what is missing is named rather than defaulted.
 
-  On a terminal the questions are drawn rather than typed at. The modes are a menu; each address
-  is a field with the value the deployment already holds — or the one derived from the name above
-  it — shown as the default Enter takes; the people are one field at a time, with another person
-  offered between them; and the run ends with a box saying what was chosen, what was written, and
-  which of the checks could be made here and which could not. --no-ask skips all of it, and
-  Ctrl-C leaves the terminal as it found it.
+  On a terminal the questions are drawn rather than typed at, and the first of them is how much of
+  the wizard to walk: Basic asks for the modes, the people and the console password and works
+  everything else out, and Advanced asks every setting. Then the modes are a menu; each address is
+  a field with the value the deployment already holds — or the one derived from the name above it —
+  shown as the default Enter takes; a person is named by their display name, from which the id
+  everybody else knows them by is derived; and the run ends with a box saying what was chosen, what
+  was written, and which of the checks could be made here and which could not. --no-ask skips all of
+  it, and Ctrl-C leaves the terminal as it found it.
 
+    --approach <basic|advanced>       how much to ask: basic takes the modes, the people and
+                                      the console password and works out everything else;
+                                      advanced asks every setting, with a value offered for each
+                                      (default: asked on a terminal, advanced otherwise)
     --mode <private|public|both>      how people reach this deployment: Tailscale only, open
                                       internet, or both
     --in-force <private|public>       which of them the file is put in
                                       (default: the one it already says, else private)
-    --private-hostname <name>         the address your people's phones dial over the tailnet,
+    --private-hostname <name>         the address people dial over the tailnet,
                                       e.g. crossbar.tailnet-name.ts.net
     --private-origin <url>            the web address invitations open (default https://<hostname>)
     --public-hostname <name>          the public name people reach this deployment at,
@@ -65,18 +71,15 @@ const SETUP_USAGE = `node src/admin.js setup — ask what a fresh deployment nee
     --public-origin <url>             the web address invitations open (default https://<hostname>)
     --public-bind-address <address>   this server's own address that Caddy listens on — never a
                                       wildcard
-    --people <json|@file>             the directory: [{ "id": …, "name": …, "login": …, "admin": … }]
+    --people <json|@file>             the directory: [{ "name": …, "login": …, "admin": … }] —
+                                      the id is derived from the name unless one is given
     --directory <file>                or a directory file to use as the people
-    --turn-host <host>                a TURN server for calls that cannot connect directly;
-                                      blank for none
+    --turn-host <host>                the call relay, when it is not this server; blank relays
+                                      through this deployment's own address
     --turn-secret <secret>            its shared secret (generated when a host is given)
-    --vapid-public-key <key>          Web Push, for waking a browser tab that is closed
-    --vapid-private-key <key>
-    --vapid-subject <mailto:|url>
-    --apns-key-id <id>                APNs, for ringing an iPhone whose screen is off
-    --apns-team-id <id>
-    --apns-key-path <file>
-    --apns-topic <bundle id>
+    --push-relay-url <url>            the push relay phones are rung through
+                                      (default: https://crossbar-push-dev.ibnfaisalc.workers.dev,
+                                      which the summary names)
     --session-secret <secret>         signs sessions (generated when the file holds none)
     --new-secrets                     generate new secrets even though the file holds some
     --password                        set the console password afterwards without asking
@@ -86,9 +89,10 @@ const SETUP_USAGE = `node src/admin.js setup — ask what a fresh deployment nee
     --skip-checks                     do not probe DNS or STUN afterwards
 
   The console password and the first invitation — one command each, both prompted or printed in
-  the terminal this one is running in — are questions at the end of a terminal run, both defaulting
-  to yes. --password and --invite answer them from a flag or from --answers and run them the same
-  way; with no terminal neither runs at all, and the summary says what is left to run by hand.
+  the terminal this one is running in — are questions at the end of an advanced terminal run, both
+  defaulting to yes; the basic run asks for the password and leaves the invitation in the summary
+  as a command. --password and --invite answer them from a flag or from --answers and run them the
+  same way; with no terminal neither runs at all, and the summary says what is left to run by hand.
 
   --browser serves the same questions as a form on a temporary page, and hands what is typed
   to the same engine this command runs — so the two cannot answer differently. It prints a URL

@@ -130,7 +130,11 @@ test('the private address is offered as the tailnet name Tailscale reports', asy
     const host = asked.find((question) => /dial over the tailnet/.test(question.message));
     assert.ok(host, 'the private hostname is asked');
     assert.equal(host.fallback, 'crossbar.tailnet-name.ts.net', 'the trailing dot is dropped');
-    assert.match(host.message, /Tailscale gives this machine one/, 'and the question says where it comes from');
+    // The question is one short line now: what Tailscale is, and what approves the machine, is a
+    // note beside the join and the runbook (§2.2.1), not the question. This machine has a name, so
+    // the line also says the field holds it.
+    assert.match(host.message, /^Private \(tailnet\): the address people dial over the tailnet/);
+    assert.match(host.message, /this machine is on your tailnet already/);
     const origin = asked.find((question) => /invitation opens/.test(question.message));
     assert.equal(origin.fallback, 'https://crossbar.tailnet-name.ts.net', 'the origin is derived from the address');
     // Offered is not enough: it has to be what landed in the file.
@@ -145,16 +149,15 @@ test('a machine with no Tailscale is asked a question that reads, and can be ans
         dir, answers: PRIVATE, ask: where.ui, check: false,
         tailscale: '/nonexistent/tailscale', log: () => {},
     });
-    // Type the address, then Enter through the origin and the three optional fields.
-    await press(where.input, 'house.tailnet.ts.net', '\r', '\r', '\r', '\r', '\r');
+    // Enter through the approach question, type the address, then Enter through the origin, the
+    // relay and the push relay.
+    await press(where.input, '\r', 'house.tailnet.ts.net', '\r', '\r', '\r', '\r');
     await run;
 
     const seen = where.seen();
-    // The wording is the point: it names the thing, says what it is for, and that Tailscale gives
-    // this machine one — so a reader who has never seen Crossbar can answer it.
-    assert.match(seen, /◆\s+Private \(tailnet\): the address your people.s phones dial over the tailnet/);
-    assert.match(seen, /Tailscale gives this machine one/);
-    assert.match(seen, /for example: crossbar\.tailnet-name\.ts\.net/);
+    // The wording is the point: it names the thing in one line, so a reader who has never seen
+    // Crossbar can answer it.
+    assert.match(seen, /◆\s+Private \(tailnet\): the address people dial over the tailnet/);
     // No default was invented without Tailscale: the field is empty until it is typed, and what
     // was typed is what the file holds.
     assert.match(fs.readFileSync(path.join(dir, '.env'), 'utf8'),
@@ -170,8 +173,8 @@ test('the console password and the first invitation are questions, defaulting to
         dir, answers: { mode: 'private', people: PEOPLE }, ask: where.ui, check: false, spawn,
         tailscale: '', log: () => {},
     });
-    // The address, the origin, the three optionals, then Enter at each finishing question.
-    await press(where.input, 'house.tailnet.ts.net', '\r', '\r', '\r', '\r', '\r', '\r', '\r');
+    // The approach, the address, the origin, the two relays, then Enter at each finishing question.
+    await press(where.input, '\r', 'house.tailnet.ts.net', '\r', '\r', '\r', '\r', '\r', '\r');
     await run;
 
     const seen = where.seen();
@@ -254,9 +257,9 @@ test('the machine is joined before the address is asked, and the name it got rep
     const run = runSetup({
         dir, answers: PRIVATE, ask: where.ui, check: false, tailscale: tailscale.file, log: () => {},
     });
-    // Enter at every question: the private address is what the join produced, and taking the
-    // offered value is the confirmation.
-    await press(where.input, '\r', '\r', '\r', '\r', '\r');
+    // Enter at every question — the approach, the address the join produced, the origin, the relay
+    // and the push relay: taking the offered value is the confirmation.
+    await press(where.input, '\r', '\r', '\r', '\r', '\r', '\r');
     await run;
 
     // The join ran here, as this account, naming the node after the deployment.
@@ -268,7 +271,7 @@ test('the machine is joined before the address is asked, and the name it got rep
     const asked = seen.indexOf('dial over the tailnet');
     assert.ok(joined >= 0, `the join is not reported:\n${seen}`);
     assert.ok(asked > joined, `the address was asked before the machine was joined:\n${seen}`);
-    assert.match(seen, /this machine is on your tailnet already: the field holds the name it answers at/,
+    assert.match(seen, /this machine is on your tailnet already, so the field holds the name it answers at/,
         'the address is not offered as a value to confirm');
     // And the offered value is what was written, both spellings of one address — in place of the
     // stale one, which nothing asked about.
@@ -285,8 +288,9 @@ test('a join that does not finish asks for the address rather than inventing one
     const run = runSetup({
         dir, answers: PRIVATE, ask: where.ui, check: false, tailscale: tailscale.file, log: () => {},
     });
-    // The address has to be typed, because nothing answered with one; then Enter through the rest.
-    await press(where.input, 'house.tailnet.ts.net', '\r', '\r', '\r', '\r', '\r');
+    // The address has to be typed, because nothing answered with one; then Enter through the rest
+    // — the approach first, then the origin, the relay and the push relay.
+    await press(where.input, '\r', 'house.tailnet.ts.net', '\r', '\r', '\r', '\r');
     await run;
 
     assert.match(tailscale.up(), /^up --hostname crossbar-finish-/, 'the join was not attempted at all');
@@ -299,7 +303,7 @@ test('a join that does not finish asks for the address rather than inventing one
     assert.match(seen, /re-run this install and the private address is set from that name/,
         'the instructions do not say what to do after');
     // Asked, not invented: the question is the one that reads, and what was typed is what landed.
-    assert.match(seen, /once you approve the machine on the link Tailscale shows/);
+    assert.match(seen, /◆\s+Private \(tailnet\): the address people dial over the tailnet/);
     assert.match(fs.readFileSync(path.join(dir, '.env'), 'utf8'),
         /^NETWORK_MODE_PRIVATE_HOSTNAME=house\.tailnet\.ts\.net$/m, 'what was typed is what was written');
 });

@@ -212,15 +212,31 @@ function joinTailnet({ command, dir, report, terminal, authkey, spawn }) {
 
 /** Every answer this wizard reads, in the order the questions are asked. */
 const ANSWER_KEYS = Object.freeze([
+    'approach',
     'mode', 'inForce',
     'privateHostname', 'privateOrigin',
     'publicHostname', 'publicOrigin', 'publicBindAddress',
     'people', 'directory',
     'turnHost', 'turnSecret',
-    'apnsKeyId', 'apnsTeamId', 'apnsKeyPath', 'apnsTopic',
-    'vapidPublicKey', 'vapidPrivateKey', 'vapidSubject',
+    'pushRelayUrl',
     'sessionSecret', 'newSecrets', 'password', 'invite',
 ]);
+
+/**
+ * The relay a phone is rung through when nobody names one of their own. A deployment that accepts
+ * this default rings through a shared development relay, which is why the summary names it and
+ * prints the three names that would point the deployment at another one — a stranger must not
+ * inherit somebody else's relay without being told.
+ */
+const DEFAULT_PUSH_RELAY_URL = 'https://crossbar-push-dev.ibnfaisalc.workers.dev';
+
+/** The three names that decide which relay this deployment rings through (`src/pushrelay.js`). */
+const PUSH_RELAY_KEYS = Object.freeze([
+    'CROSSBAR_PUSH_RELAY_URL', 'CROSSBAR_PUSH_RELAY_TOKEN', 'CROSSBAR_PUSH_RELAY_INSTALLATION_ID',
+]);
+
+/** The two ways a run can be walked: three questions with the rest derived, or every setting asked. */
+const APPROACHES = Object.freeze(['basic', 'advanced']);
 
 /** `publicBindAddress` is set by `--public-bind-address`, so the two spellings cannot drift. */
 const flagName = (key) => `--${key.replace(/[A-Z]/g, (letter) => `-${letter.toLowerCase()}`)}`;
@@ -384,16 +400,12 @@ function readState(dir) {
             session: settingIn(content, 'CROSSBAR_SESSION_SECRET'),
             turn: settingIn(content, 'CROSSBAR_TURN_SHARED_SECRET'),
         },
-        vapid: {
-            publicKey: settingIn(content, 'VAPID_PUBLIC_KEY'),
-            privateKey: settingIn(content, 'VAPID_PRIVATE_KEY'),
-            subject: settingIn(content, 'VAPID_SUBJECT'),
-        },
-        apns: {
-            keyId: settingIn(content, 'CROSSBAR_APNS_KEY_ID'),
-            teamId: settingIn(content, 'CROSSBAR_APNS_TEAM_ID'),
-            keyPath: settingIn(content, 'CROSSBAR_APNS_KEY_PATH'),
-            topic: settingIn(content, 'CROSSBAR_APNS_TOPIC'),
+        pushRelay: {
+            url: settingIn(content, 'CROSSBAR_PUSH_RELAY_URL'),
+            // Read for one thing only: the summary says whether a relay named there can actually
+            // ring, because a URL with no token is a transport that stays disabled. It is never
+            // printed.
+            token: settingIn(content, 'CROSSBAR_PUSH_RELAY_TOKEN'),
         },
     };
 }
@@ -413,39 +425,31 @@ const ADDRESS_QUESTIONS = Object.freeze({
         {
             key: 'privateHostname',
             name: 'HOSTNAME',
-            prompt: 'the address your people\'s phones dial over the tailnet — Tailscale gives this machine one,'
-                + ' and the installer sets it from the machine\'s own tailnet name once you approve the'
-                + ' machine on the link Tailscale shows (for example: crossbar.tailnet-name.ts.net)',
+            prompt: 'the address people dial over the tailnet',
             // Asked only when Tailscale answered with this machine's own name, which is the case the
             // join above exists for: then there is nothing to guess and the field already holds the
             // address, so the question says what the value is rather than what it is for. That is
             // the whole of "shown as a derived value to confirm" — the answer is offered, and Enter
             // keeping it is the confirmation.
-            settled: 'the address your people\'s phones dial over the tailnet — Tailscale gives this machine one,'
-                + ' and this machine is on your tailnet already: the field holds the name it answers at,'
-                + ' so press Enter to keep it (for example: crossbar.tailnet-name.ts.net)',
+            settled: 'the address people dial over the tailnet — this machine is on your tailnet already,'
+                + ' so the field holds the name it answers at',
         },
         {
             key: 'privateOrigin',
             name: 'ORIGIN',
-            prompt: 'the web address an invitation opens — the tailnet address above with https:// in front,'
-                + ' so press Enter to keep the one this question offers'
-                + ' (for example: https://crossbar.tailnet-name.ts.net)',
+            prompt: 'the web address an invitation opens',
         },
     ]),
     public: Object.freeze([
         {
             key: 'publicHostname',
             name: 'HOSTNAME',
-            prompt: 'the public address people reach this deployment at — a name you own whose DNS points at'
-                + ' this server (for example: calls.example.com)',
+            prompt: 'the address people reach this deployment at',
         },
         {
             key: 'publicOrigin',
             name: 'ORIGIN',
-            prompt: 'the web address an invitation opens — the public name above with https:// in front,'
-                + ' so press Enter to keep the one this question offers'
-                + ' (for example: https://calls.example.com)',
+            prompt: 'the web address an invitation opens',
         },
         {
             key: 'publicBindAddress',
@@ -454,8 +458,7 @@ const ADDRESS_QUESTIONS = Object.freeze({
             // one the machine can list: `ownAddressClause` puts this host's own addresses in the
             // question. No default is invented from them — which of them the router forwards to is
             // not knowable from inside — but it is not left for a person to look up either.
-            prompt: 'the one local address the web front end (Caddy) listens on — this server\'s own address,'
-                + ' never 0.0.0.0, which is every address at once (for example: 203.0.113.10)',
+            prompt: 'the local address the web front end (Caddy) listens on',
         },
     ]),
 });
@@ -488,15 +491,31 @@ function bindAddressProblem(mode, address) {
 }
 
 /**
+ * The choice that decides how much of the wizard a person meets: three questions with everything
+ * else worked out, or every setting with a value suggested. It is asked first, so a person who
+ * wants the short path is not walked through the long one to find it.
+ *
+ * The labels carry what each one asks, because the words "basic" and "advanced" on their own say
+ * nothing about what is left out of the first — and the reasoning for everything the short path
+ * derives lives in `deploy/README.md` (§2.2.1), which is where a person who wants to know *why*
+ * is sent.
+ */
+const APPROACH_QUESTION = 'Basic setup, or advanced?';
+const APPROACH_OPTIONS = Object.freeze([
+    { value: 'basic', label: 'Basic', hint: 'modes, people and the console password — the rest is worked out' },
+    { value: 'advanced', label: 'Advanced', hint: 'every setting, each with a suggested value' },
+]);
+
+/**
  * The one question that decides every other one, as a menu and as a line.
  *
- * Tailscale is named and said what it is here rather than left to the labels: this is the first
- * thing the wizard asks, the only thing `install.sh` has done about Tailscale by then is prepare
- * the daemon (§2.8.1), and a person who has never met the word cannot choose the mode that needs
- * it — or tell whether the tailnet the options name is one they have.
+ * Short by design: the labels and their hints are what say what each mode is, and the long reading
+ * of Tailscale — a private network between your own devices — is in `deploy/README.md` (§2.2.1)
+ * rather than in front of a question. The labels keep the name, because the mode that needs
+ * Tailscale cannot be chosen by somebody who has not met the word, and the hint is the one line
+ * that says what it means.
  */
-const MODE_QUESTION = 'How will your people reach this deployment — over Tailscale, a private network'
-    + ' between your own devices, over the open internet, or both?';
+const MODE_QUESTION = 'How will people reach this deployment?';
 
 /** The three answers `--mode` takes, as the menu they are chosen from, with what each one costs. */
 const MODE_OPTIONS = Object.freeze([
@@ -504,22 +523,6 @@ const MODE_OPTIONS = Object.freeze([
     { value: 'public', label: 'Open internet (public)', hint: 'needs a domain name that points here, and an open port' },
     { value: 'both', label: 'Both', hint: 'private now, public once its name points here' },
 ]);
-
-/**
- * What is about to be asked in step 4, said once rather than five times.
- *
- * One sentence per line, and no line broken by hand: `prompts.frames.wrap` breaks the body at
- * spaces, so a newline inside a sentence comes out as a line that ends where the source did —
- * "the summary says what it went" then "without:", which is what this note said before the
- * newline moved behind the colon.
- */
-const OPTIONAL_NOTE = `A deployment works without any of these, and the summary says what it went without:
-
-  Relay     a TURN server, for calls that cannot connect directly
-  APNs      an Apple push key, for ringing an iPhone whose screen is off
-  Web Push  a VAPID key pair, for waking a browser tab that is closed
-
-Blank at any of them skips it.`;
 
 const requiredIn = (mode) => [...MODE_REQUIRED[mode], ...WIZARD_REQUIRED[mode]];
 const blockKey = (mode, name) => `NETWORK_MODE_${mode.toUpperCase()}_${name}`;
@@ -539,12 +542,44 @@ function parseModes(value) {
     throw new SetupRefusal(`"${value}" is not a mode: --mode takes private, public, or both.`);
 }
 
+/** `basic` or `advanced` — the one choice at the start, refusing anything else by name. */
+function parseApproach(value) {
+    const wanted = String(value ?? '').trim().toLowerCase();
+    if (APPROACHES.includes(wanted)) return wanted;
+    throw new SetupRefusal(`"${value}" is not an approach: --approach takes basic or advanced.`);
+}
+
+/**
+ * The id a display name is known by: lower case, spaces turned into `-`, and nothing kept but
+ * lower-case letters, digits and `-` — `O'Brien` becomes `obrien`, `Abdullah Al-Faisal` becomes
+ * `abdullah-al-faisal`. A name that leaves nothing (punctuation only, or empty) derives nothing,
+ * and the question is asked again rather than answered with an unusable id.
+ *
+ * It is one rule in one place because it is asked in four: the terminal, a plain line, an answers
+ * file that names no id, and the browser page — and an id a person is known by that changed with
+ * the front end would be a different person.
+ *
+ * The ends are trimmed and the result cut to the 64 characters `src/directory.js` accepts, because
+ * `- Bob` and a 90-character name are both ids that file refuses — and this is the function that
+ * decides what an id is.
+ */
+function shortIdFrom(name) {
+    return String(name ?? '').toLowerCase()
+        .replace(/\s+/g, '-')
+        .replace(/[^a-z0-9-]/g, '')
+        .replace(/^-+|-+$/g, '')
+        .slice(0, 64)
+        .replace(/-+$/, '');
+}
+
 /** One person, as the line a person types and as the object an answers file holds. */
 function parsePersonLine(line) {
-    const [id, name, login, ...rest] = String(line).split(',').map((part) => part.trim());
-    if (!id || !name) {
-        throw new SetupRefusal(`"${line}" is not a person. Write one as "id, display name, login, admin" —`
-            + ' the login and the administrator flag may be left blank.');
+    const [name, login, ...rest] = String(line).split(',').map((part) => part.trim());
+    const id = shortIdFrom(name);
+    if (!name || !id) {
+        throw new SetupRefusal(`"${line}" is not a person. Write one as "display name, login, admin" —`
+            + ' the id is taken from the display name, and the login and the administrator flag may be'
+            + ' left blank.');
     }
     return { id, name, login: login || '', admin: rest.some((part) => /^(admin|yes|true|1)$/i.test(part)) };
 }
@@ -552,12 +587,16 @@ function parsePersonLine(line) {
 /** The same person, as an answers file or `--people` may hold them. */
 function normalizePerson(entry) {
     if (typeof entry === 'string') return parsePersonLine(entry);
-    const id = String(entry?.id ?? '').trim();
     const name = String(entry?.name ?? entry?.displayName ?? '').trim();
+    // An id in the answers is the one that wins — a script may name somebody whose display name
+    // would derive something else — and a person named without one has it derived the same way the
+    // terminal derives it.
+    const id = String(entry?.id ?? '').trim() || shortIdFrom(name);
     if (!id || !name) {
-        throw new SetupRefusal(`A person in --people needs an id and a name; "${JSON.stringify(entry)}" has`
-            + ' neither. One person is written as {"id": "abdullah", "name": "Abdullah", "login": "abdullah@dev",'
-            + ' "admin": true} — JSON, inside the array, or in a file named with @.');
+        throw new SetupRefusal(`A person in --people needs a display name; "${JSON.stringify(entry)}" has`
+            + ' none. One person is written as {"name": "Abdullah Al-Faisal", "login": "abdullah@dev",'
+            + ' "admin": true} — the id is derived from the name unless it is given too. JSON, inside the'
+            + ' array, or in a file named with @.');
     }
     return {
         id,
@@ -609,9 +648,18 @@ function directoryFromPeople(people) {
  * ask. A directory file already there is offered back first, because keeping it is the ordinary
  * case and naming people over it is the exception.
  *
+ * One question names a person: their display name. The id everybody else knows them by is derived
+ * from it (`shortIdFrom`) and **said back** in a note, so nobody has to guess what they will be
+ * shown as — and the note is what makes it one question instead of the two it used to be, a short
+ * id and a display name whose only difference was which one the app showed.
+ *
+ * `basic` leaves out the two questions a short run does not need: the first person administers the
+ * directory (the default the long run offers anyway), and a login is asked only where the
+ * deployment will need one (`needLogin`).
+ *
  * An empty list is the answer "keep what is there": the caller reads it that way.
  */
-async function askPeopleByFields(terminal, state) {
+async function askPeopleByFields(terminal, report, state, { basic = false, needLogin = false } = {}) {
     if (state.directory) {
         const kept = await terminal.confirm({
             message: `Keep the ${peopleCount(state.directory.users.length)} already in ${state.directoryPath}?`,
@@ -622,37 +670,32 @@ async function askPeopleByFields(terminal, state) {
     const people = [];
     for (;;) {
         const first = people.length === 0;
-        const someone = {
-            id: await terminal.text({
-                message: `${first ? 'The first person' : 'Another person'}: the short id everybody else`
-                    + ' knows them by (for example: abdullah)',
-                placeholder: 'abdullah',
-                validate: (value) => (value ? undefined : 'An id is how everybody else names them.'),
-            }),
-            name: await terminal.text({
-                message: 'their display name — what the app shows other people in place of that id'
-                    + ' (for example: Abdullah)',
-                placeholder: 'Abdullah',
-                validate: (value) => (value ? undefined : 'A name is what the app shows in place of the id.'),
-            }),
-            // The login is optional in public mode and needed in private mode, where the tailnet
-            // names the caller and a person without one cannot be found (§7). Saying both readings
-            // in the question is the whole fix: "leave blank if it does not" invited an answer the
-            // private run then refuses with `${id} has no login, and a person is found by theirs
-            // here` — after every other question had been asked.
-            login: await terminal.text({
-                message: 'their Tailscale login, if their tailnet account names them — a private deployment'
-                    + ' finds people by this, so it is needed there; a public one can leave it blank'
-                    + ' (for example: abdullah@dev)',
-                placeholder: 'abdullah@dev',
-            }),
-            admin: await terminal.confirm({
-                message: 'an administrator? — admins can invite people and change settings',
+        const name = await terminal.text({
+            message: `${first ? 'The first person' : 'Another person'}: their display name`,
+            validate: (value) => (shortIdFrom(value) ? undefined
+                : 'A name is needed: it becomes the id everybody else knows them by.'),
+        });
+        const id = shortIdFrom(name);
+        // The derived id, shown before the next question replaces this note: what they will be
+        // known as is not something they should have to work out from the name they typed.
+        report.note(`${name} will be known as ${id}.`, 'The person');
+        const someone = { id, name, login: '', admin: first };
+        // The login is optional in public mode and needed in private mode, where the tailnet names
+        // the caller and a person without one cannot be found (§7). Said in one line now: the
+        // question itself is short, and the reason the field matters is here and in the runbook.
+        if (!basic || needLogin) {
+            someone.login = await terminal.text({
+                message: `${id}: their Tailscale login` + (needLogin ? '' : ' (blank if they have none)'),
+            });
+        }
+        if (!basic) {
+            someone.admin = await terminal.confirm({
+                message: `${id}: an administrator?`,
                 initialValue: first,
-            }),
-        };
+            });
+        }
         people.push(someone);
-        if (!await terminal.confirm({ message: 'another person?', initialValue: false })) return people;
+        if (!await terminal.confirm({ message: 'Another person?', initialValue: false })) return people;
     }
 }
 
@@ -661,16 +704,16 @@ async function askPeopleByFields(terminal, state) {
  * line answers for the whole file: done when there is none yet, and "keep what is there" when
  * there is.
  *
- * The two readings of the login are said here too, for the reason the field's own question says
- * them: a private deployment needs one per person, and the note is the only thing a caller
- * without a prompter is asked.
+ * The line is a display name first, because the id is derived from it here exactly as the terminal
+ * derives it: a script and a person name a person the same way.
  */
-async function askPeopleByLines(ask, report, state) {
-    report.note(`One person per line, as "id, display name, login, admin", and a blank line to`
+async function askPeopleByLines(ask, report, state, { needLogin = false } = {}) {
+    report.note(`One person per line, as "display name, login, admin", and a blank line to`
         + ` ${state.directory ? `keep the ${peopleCount(state.directory.users.length)} already there` : 'say you are done'}.`
-        + ' The id and the display name are what the line needs. The login is their Tailscale'
-        + ' account, which a private deployment needs (it is how a caller is found) and a public one'
-        + ' can leave blank, and "admin" makes them an administrator.', 'The directory');
+        + ' The display name is what the line needs: the id everybody else knows them by is derived'
+        + ' from it. The login is their Tailscale account, which'
+        + `${needLogin ? ' this deployment needs (it is how a caller is found)' : ' is optional here'}, and`
+        + ' "admin" makes them an administrator.', 'The directory');
     const people = [];
     for (;;) {
         const named = await ask('Person', '');
@@ -690,6 +733,13 @@ async function askPeopleByLines(ask, report, state) {
  * the hostname with `https://` in front, the mode in force is the mode the file already says, and
  * the private address is the tailnet name this machine already has (`tailnet` below), which the
  * deployment cannot invent for itself and does not have to be asked for.
+ *
+ * The one question that is not answered from those three is the first: **how much of this to
+ * walk** (`approach`). It is a routing question rather than a value, so the flags do not answer
+ * it, and a terminal is asked it whenever there is one; with no terminal it is `advanced`, because
+ * a run that was not told to be short must not quietly derive. `basic` then fills in every address
+ * this machine can work out for itself and leaves the questions that cannot be derived, while
+ * `advanced` asks them all with their values offered.
  *
  * Where the questions go is two things, because they are not the same thing: `terminal` is the
  * prompter `src/prompt.js` builds, which draws a menu and a field and a confirmation, and `asker`
@@ -748,7 +798,24 @@ async function collectAnswers({ answers, state, asker, terminal, report, generat
         return value;
     };
 
-    // 1. Which modes. Nothing is complete until this is answered, and it decides every question
+    // 1. How much of the wizard to walk, and then which modes. The approach is asked first and is
+    //    a line of its own, so the short path is chosen rather than discovered; with no terminal it
+    //    is `advanced` unless an answer says otherwise, because the long path asks for every value
+    //    and derives none of them — a run that was not told to be short must not be.
+    const approachGiven = supplied('approach');
+    const approach = approachGiven !== null
+        ? parseApproach(approachGiven)
+        : (terminal
+            ? parseApproach(await terminal.select({
+                message: APPROACH_QUESTION,
+                options: APPROACH_OPTIONS,
+                // A fresh deployment is the short path's case; a file that already names a mode is
+                // a re-run, where the long path's offered defaults are what "change nothing" means.
+                initial: state.written ? 'advanced' : 'basic',
+            }))
+            : 'advanced');
+
+    // 2. Which modes. Nothing is complete until this is answered, and it decides every question
     //    after it, so it is refused on its own rather than listed beside the answers it shapes.
     const modeGiven = supplied('mode');
     let modeAnswer;
@@ -764,7 +831,21 @@ async function collectAnswers({ answers, state, asker, terminal, report, generat
     if (!modeAnswer) throw new SetupRefusal(noTerminalMessage(['mode'], Boolean(asker || terminal)));
     const modes = parseModes(modeAnswer);
 
-    // 2. The tailnet, before the address that names it. The private address is this machine's own
+    // Which of the chosen modes is in force, decided here because the people questions read it: it
+    // is not a question — the file already answers it, and when the file says nothing the answer is
+    // the default `loadConfig` uses, so writing it down changes nothing about which mode is in
+    // force.
+    const inForceAnswer = supplied('inForce');
+    const derivedInForce = state.written && modes.includes(state.written)
+        ? state.written
+        : (modes.includes('private') ? 'private' : 'public');
+    const inForce = String(inForceAnswer ?? derivedInForce);
+    if (!modes.includes(inForce)) {
+        throw new SetupRefusal(`--in-force is ${inForce}, which is not one of the modes being set up (${modes.join(', ')}).`);
+    }
+    const requireLogins = inForce === 'private';
+
+    // 3. The tailnet, before the address that names it. The private address is this machine's own
     //    tailnet name, and a machine with no name has to be asked blind — so the joining happens
     //    here, where the mode is known and the person is looking, and the name it produces is what
     //    the question below offers. Nothing when the mode set cannot include a private address:
@@ -775,7 +856,14 @@ async function collectAnswers({ answers, state, asker, terminal, report, generat
         joinedName = joinTailnet({ command: tailscale, dir: state.dir, report, terminal, authkey, spawn });
     }
 
-    // 3. The addresses each chosen mode is reached at.
+    // 4. The addresses each chosen mode is reached at.
+    //
+    //    The long run asks each one, with what the deployment already holds — or what the tailnet
+    //    name above makes true — offered as the value Enter takes. The short run fills in what this
+    //    machine can work out for itself: the tailnet name the join read back, an origin that is a
+    //    hostname with `https://` in front, and the address this host holds that a router could
+    //    forward to. The one address no machine can know is a public name somebody owns, so the
+    //    short run asks for exactly that and nothing else.
     const blocks = Object.fromEntries(MODES.map((mode) => [mode, { HOSTNAME: '', ORIGIN: '', BIND_ADDRESS: '' }]));
     for (const mode of modes) {
         for (const question of ADDRESS_QUESTIONS[mode]) {
@@ -802,7 +890,15 @@ async function collectAnswers({ answers, state, asker, terminal, report, generat
                 held: held || derived,
                 validate: bindProblem,
             };
-            const value = requiredIn(mode).includes(question.name) ? await needed(asking) : await line(asking);
+            // What the short run can fill in without asking: only an address it can work out, and
+            // never a public name, which is a fact about a domain and not about this machine. An
+            // answer from a flag or a file still wins over the derivation, the same as everywhere
+            // else — the short run fills in what nothing supplied, it does not overrule.
+            const given = supplied(question.key);
+            const worked = given === null ? (derived || (question.name === 'BIND_ADDRESS' ? ownBindAddress(locals) : '')) : '';
+            const value = approach === 'basic' && worked
+                ? worked
+                : (requiredIn(mode).includes(question.name) ? await needed(asking) : await line(asking));
             // The wildcard is refused wherever it came from: the field refuses it while it is
             // being typed, and this catches the same address arriving by flag or by answers file.
             const refused = bindProblem ? bindProblem(value) : null;
@@ -835,8 +931,8 @@ async function collectAnswers({ answers, state, asker, terminal, report, generat
         // come back as a list, and an empty one is "keep what is there".
         for (;;) {
             const named = terminal
-                ? await askPeopleByFields(terminal, state)
-                : await askPeopleByLines(asker, report, state);
+                ? await askPeopleByFields(terminal, report, state, { basic: approach === 'basic', needLogin: requireLogins })
+                : await askPeopleByLines(asker, report, state, { needLogin: requireLogins });
             if (named.length) { directory = directoryFromPeople(named); break; }
             if (state.directory) break;
             if (state.directoryProblem) throw new SetupRefusal(`${state.directoryProblem}. Name the people here, or fix it and run setup again.`);
@@ -852,56 +948,43 @@ async function collectAnswers({ answers, state, asker, terminal, report, generat
         misses.push('people');
     }
 
-    // 5. The optional material. Every one of these is skippable, and a deployment that skips one
-    //    says so in the report rather than failing later. Each question says so itself as well —
-    //    that a blank answer skips it, and what is lost by doing so — because the note above is
-    //    read once and the question is what a person answers; the owner stopped at the APNs one to
-    //    ask why a key was needed at all when another deployment already held one. The note is said
-    //    once, and only when somebody is there to answer it: a run of nothing but flags is
-    //    answering, not being asked.
-    if (asker || terminal) report.note(OPTIONAL_NOTE, 'Optional material');
-    const turnHost = await line({
-        key: 'turnHost',
-        message: 'If a call cannot connect directly, it is relayed through a TURN server. This is that'
-            + ' server\'s hostname, as people reach it — if the relay runs on this server that is this'
-            + ' deployment\'s own public address (for example: relay.example.com). The relay\'s shared'
-            + ' secret is generated for you. Blank for no relay: calls still work, but some networks'
-            + ' will fail',
-        held: state.turnHost,
-    });
-    const pushAnswered = ['apnsKeyId', 'apnsTeamId', 'apnsKeyPath', 'apnsTopic'].some((key) => supplied(key) !== null);
-    const apnsKeyId = await line({
-        key: 'apnsKeyId',
-        message: 'Push is optional (this is APNs, Apple\'s push service for iPhones): blank skips it — a'
-            + ' phone whose screen is off cannot be rung. An APNs key belongs to the Apple team, not'
-            + ' to this server, so a deployment serving the same app can use the key another one'
-            + ' already uses: carry across its key id (for example: ABC123DE45), its team id and its'
-            + ' topic. This question asks for the key id; the three after it ask for the team id, the'
-            + ' path to the .p8 file on this server, and the topic, the app\'s bundle id (for example:'
-            + ' com.example.crossbar)',
-        held: state.apns.keyId,
-    });
-    const apns = { keyId: apnsKeyId, teamId: state.apns.teamId, keyPath: state.apns.keyPath, topic: state.apns.topic };
-    if (apnsKeyId || pushAnswered) {
-        apns.teamId = await line({ key: 'apnsTeamId', message: 'APNs: the team id the key belongs to, from the same Apple developer account (for example: TEAM123456)', held: state.apns.teamId });
-        apns.keyPath = await line({ key: 'apnsKeyPath', message: 'APNs: the path to the .p8 key file on this server — copy the file there first, and let the account this deployment runs as read it (for example: /etc/crossbar/apns.p8)', held: state.apns.keyPath });
-        apns.topic = await line({ key: 'apnsTopic', message: 'APNs: the app\'s bundle id (for example: com.example.crossbar)', held: state.apns.topic });
+    // 5. The relay, and the relay that rings a phone. Neither is optional any more in the sense the
+    //    APNs and Web Push questions were: a call relay this server can run is the default, and so
+    //    is the shared push relay. What is optional is *changing* them, which is why the call relay
+    //    is one question — "somewhere else?" — before a hostname is ever typed.
+    //
+    //    The long run asks both; the short run takes the derived relay and the default push relay
+    //    without asking. A relay the file already names is never overwritten by a run that was not
+    //    told to change it, which is what keeps a second `setup` from moving a working relay.
+    const ownRelay = ownRelayHost(blocks);
+    const turnHostGiven = supplied('turnHost');
+    let turnHost;
+    if (turnHostGiven !== null) {
+        turnHost = String(turnHostGiven);
+    } else if (approach === 'advanced' && terminal) {
+        // Defaulted to "no" when the file names this server's own address or names nothing: then
+        // there is nothing else to say, and Enter keeps the relay on this box.
+        const elsewhere = await terminal.confirm({
+            message: 'Relay calls somewhere other than this server?',
+            initialValue: Boolean(state.turnHost && state.turnHost !== ownRelay),
+        });
+        turnHost = elsewhere
+            ? await line({
+                key: 'turnHost',
+                message: 'The relay\'s hostname',
+                held: state.turnHost && state.turnHost !== ownRelay ? state.turnHost : '',
+            })
+            : ownRelay;
+    } else {
+        // No terminal to ask on: the file's own relay, or this server's address. A blank at the
+        // hostname above is the one way to ask for no relay at all, and the summary says what that
+        // costs: calls still connect, but some networks fail.
+        turnHost = String(state.turnHost || ownRelay);
     }
-    const webPushAnswered = ['vapidPublicKey', 'vapidPrivateKey', 'vapidSubject'].some((key) => supplied(key) !== null);
-    const vapidPublicKey = await line({
-        key: 'vapidPublicKey',
-        message: 'Web Push is optional: blank skips it — a closed browser cannot be woken. To wake'
-            + ' one, Web Push needs a VAPID key pair: `npx web-push generate-vapid-keys` prints one'
-            + ' (run it after this install, or on any machine with web-push), and this question wants'
-            + ' the public key of that pair; the private key is the next question'
-            + ' (for example: BEl62iUYgUivxIkv69yViEuiBIa-Ib9-SkvMeAtA3LFgDzkrxZJjSgSnfckjBJuBkr3qBUYIHBQFLXYp5Nksh8)',
-        held: state.vapid.publicKey,
-    });
-    const vapid = { publicKey: vapidPublicKey, privateKey: state.vapid.privateKey, subject: state.vapid.subject };
-    if (vapidPublicKey || webPushAnswered) {
-        vapid.privateKey = await line({ key: 'vapidPrivateKey', message: 'Web Push: the private key from that pair — the second line `npx web-push generate-vapid-keys` printed (a long base64url string)', held: state.vapid.privateKey });
-        vapid.subject = await line({ key: 'vapidSubject', message: 'Web Push: a contact the push services can use if something is wrong with your keys, a mailto: or a URL (for example: mailto:you@example.com)', held: state.vapid.subject });
-    }
+    const pushRelayHeld = state.pushRelay.url || DEFAULT_PUSH_RELAY_URL;
+    const pushRelayUrl = approach === 'advanced'
+        ? await line({ key: 'pushRelayUrl', message: 'The push relay to use', held: pushRelayHeld })
+        : String(supplied('pushRelayUrl') ?? pushRelayHeld);
 
     // 6. What can be generated. A secret the file already holds is kept, because replacing the
     //    session secret signs every device out; `--new-secrets` is how somebody asks for that.
@@ -916,21 +999,10 @@ async function collectAnswers({ answers, state, asker, terminal, report, generat
     const turn = !turnHost ? state.secrets.turn
         : (turnGiven ? String(turnGiven) : (fresh ? '' : state.secrets.turn) || generate());
 
-    // Which of the chosen modes is in force. Not a question: the file already answers it, and when
-    // it says nothing the answer is the default `loadConfig` uses, so writing it down changes
-    // nothing about which mode is in force.
-    const inForceAnswer = supplied('inForce');
-    const derived = state.written && modes.includes(state.written)
-        ? state.written
-        : (modes.includes('private') ? 'private' : 'public');
-    const inForce = String(inForceAnswer ?? derived);
-    if (!modes.includes(inForce)) {
-        throw new SetupRefusal(`--in-force is ${inForce}, which is not one of the modes being set up (${modes.join(', ')}).`);
-    }
-
     if (misses.length) throw new SetupRefusal(noTerminalMessage(misses, Boolean(asker || terminal)));
 
     return {
+        approach,
         modes,
         inForce,
         blocks,
@@ -938,10 +1010,9 @@ async function collectAnswers({ answers, state, asker, terminal, report, generat
         // Logins are how somebody is found where the tailnet names the caller, which is what
         // `src/api.js` decides the same question from (`config.trustTailscaleHeaders`): required
         // in private mode, a record of who somebody is elsewhere in public mode.
-        requireLogins: inForce === 'private',
+        requireLogins,
         turnHost,
-        vapid,
-        apns,
+        pushRelayUrl,
         secrets: {
             session,
             turn,
@@ -973,7 +1044,7 @@ function answerHelp(key) {
         publicHostname: 'the public name people reach this deployment at, e.g. calls.example.com',
         publicOrigin: 'the web address an invitation opens, e.g. https://calls.example.com',
         publicBindAddress: 'this server\'s own address that Caddy listens on, never 0.0.0.0, e.g. 203.0.113.10',
-        people: 'the directory: a JSON array of { id, name, login, admin }, or @file naming one',
+        people: 'the directory: a JSON array of { name, login, admin } — the id is derived from the name — or @file naming one',
     }[key] || 'an answer this deployment needs';
 }
 
@@ -1000,19 +1071,10 @@ function composeEnv(state, resolved) {
         content = setEnvLine(content, 'CROSSBAR_TURN_HOST', resolved.turnHost);
         content = setEnvLine(content, 'CROSSBAR_TURN_SHARED_SECRET', resolved.secrets.turn);
     }
-    for (const [name, value] of Object.entries({
-        VAPID_PUBLIC_KEY: resolved.vapid.publicKey,
-        VAPID_PRIVATE_KEY: resolved.vapid.privateKey,
-        VAPID_SUBJECT: resolved.vapid.subject,
-        CROSSBAR_APNS_KEY_ID: resolved.apns.keyId,
-        CROSSBAR_APNS_TEAM_ID: resolved.apns.teamId,
-        CROSSBAR_APNS_KEY_PATH: resolved.apns.keyPath,
-        CROSSBAR_APNS_TOPIC: resolved.apns.topic,
-    })) {
-        // Blank means "not set up here, leave what is there": writing the name with nothing after
-        // it would say the capability is configured, and the two are not the same thing.
-        if (value) content = setEnvLine(content, name, value);
-    }
+    // The relay a phone is rung through, named so that the summary can say which one is in force.
+    // The token is not this question's: it is a server secret the relay's operator hands over, and
+    // it is set by hand in `.env` (the summary says which three names decide all of it).
+    if (resolved.pushRelayUrl) content = setEnvLine(content, 'CROSSBAR_PUSH_RELAY_URL', resolved.pushRelayUrl);
     return applyMode(content, resolved.inForce);
 }
 
@@ -1139,10 +1201,37 @@ function hostAddresses() {
  */
 function ownAddressClause(name, locals) {
     if (name !== 'BIND_ADDRESS') return '';
-    const own = (locals || []).map(String).filter((address) => !address.includes(':')
-        && !/^(127\.|169\.254\.|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.)/.test(address));
+    const own = ownAddresses(locals);
     return own.length ? ` — this host's own IPv4 addresses: ${own.join(', ')}` : '';
 }
+
+/**
+ * The addresses the clause above lists — and the list the short run chooses from, so that what is
+ * shown and what is derived are the same set. Link-local, loopback, the tailnet's own range and
+ * IPv6 are left out for the reasons above: none of them is where a router forwards 443.
+ */
+function ownAddresses(locals) {
+    return (locals || []).map(String).filter((address) => !address.includes(':')
+        && !/^(127\.|169\.254\.|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.)/.test(address));
+}
+
+/**
+ * The address the short run binds Caddy to, or `''` when there is no single answer to pick.
+ *
+ * The long run does not choose — which of these the router forwards 443 to is not knowable from
+ * inside, so it shows them and lets a person say. The short run has to choose something, so it
+ * prefers an address the internet could reach, which is the one a domain name would point at, and
+ * falls back to the first candidate. `''` leaves the question to be asked: a box whose only
+ * addresses are loopback, link-local or tailnet has nothing this could honestly fill in.
+ */
+function ownBindAddress(locals) {
+    const own = ownAddresses(locals);
+    const reachable = own.find((address) => !NOT_PUBLIC.test(address));
+    return reachable || own[0] || '';
+}
+
+/** The address a relay on this server is reached at: its public name, else its tailnet name. */
+const ownRelayHost = (blocks) => blocks.public?.HOSTNAME || blocks.private?.HOSTNAME || '';
 
 /**
  * What the address the internet sees says about this box, given the addresses it holds itself.
@@ -1272,24 +1361,28 @@ function chosenPairs(state, resolved) {
     }
     const people = resolved.directory?.users || state.directory?.users || [];
     const administrators = people.filter((user) => user.admin && user.enabled !== false).length;
+    // The ids are named here as well as at the question, because the id is derived from a display
+    // name and this box is where a person reads what they got: somebody who typed a name and
+    // looked away should be able to see what they are known as without re-running anything.
     pairs.push(['Directory', `${peopleCount(people.length)}, ${administrators}`
-        + ` administrator${administrators === 1 ? '' : 's'}`]);
-    // The relay's blank reading gives the same consequence the question did, in the same words: the
-    // summary is where a person reads what skipping it cost, and "media that cannot go direct stays
-    // direct" said it in a vocabulary the question never used.
+        + ` administrator${administrators === 1 ? '' : 's'}`
+        + (people.length ? ` — ${people.map((user) => user.id).join(', ')}` : '')]);
+    // The relay's blank reading gives the same consequence the question did: the summary is where
+    // a person reads what skipping it cost, and it is where "some networks will fail" belongs now
+    // that the question itself is one line.
     pairs.push(['Relay', resolved.turnHost
         ? `${resolved.turnHost} · shared secret ${secretWord(resolved.secrets.turnFrom)}`
         : 'not configured — calls still work, but some networks will fail']);
-    // APNs and Web Push are two optional features with two different consequences, so they are
-    // two rows: a missing APNs key is a phone whose screen is off that cannot be rung, and a
-    // missing VAPID pair is a closed browser tab that cannot be woken. One row said both, which
-    // read as one feature and made each half's absence sound like the other's.
-    pairs.push(['APNs', resolved.apns.keyId || resolved.apns.topic
-        ? `${resolved.apns.keyId}${resolved.apns.topic ? ` (${resolved.apns.topic})` : ''}`
+    // The relay a phone is rung through, named because it is not this deployment's: a stranger must
+    // not inherit somebody else's relay without being told which one it is. When the default is what
+    // is in force, the three names that would point the deployment elsewhere are printed beside it,
+    // and a relay with no token says so — a URL alone rings nothing (`src/pushrelay.js`).
+    const pushRelay = resolved.pushRelayUrl === DEFAULT_PUSH_RELAY_URL
+        ? `${resolved.pushRelayUrl} · change it with ${PUSH_RELAY_KEYS.join(', ')}`
+        : resolved.pushRelayUrl;
+    pairs.push(['Push relay', resolved.pushRelayUrl
+        ? `${pushRelay}${state.pushRelay.token ? '' : ' · no token yet, so nothing rings until CROSSBAR_PUSH_RELAY_TOKEN is set'}`
         : 'not configured — a phone whose screen is off cannot be rung']);
-    pairs.push(['Web Push', resolved.vapid.publicKey
-        ? 'configured — a closed browser tab can be woken'
-        : 'not configured — a closed browser cannot be woken']);
     // "session" is the one secret whose purpose a name cannot carry, and the one whose replacement
     // signs every device out (`--new-secrets`): said here, where the value is reported.
     pairs.push(['Secrets', `session (what signs a device in) ${secretWord(resolved.secrets.sessionFrom)}`
@@ -1368,18 +1461,25 @@ function reportSummary(report, state, resolved, { verified, checks, checked, wro
 // Both used to be printed as next steps, which left the two states that look finished but are not
 // — a console nobody can open, and no phone able to join. So they are asked here through the same
 // prompter as every other question, and the command runs in this terminal so its own prompt and
-// the token land where the person is looking.
+// the token land where the person is looking. The short run asks the password and stops there:
+// naming people and setting a password is what it is for, and the invitation is a code somebody
+// carries to a phone when they are ready, which the summary leaves as a command.
 //
 // Neither runs unattended. With no terminal there is nobody to answer the question and nobody to
 // read the code, so the step is left in the summary rather than guessed at. `--password` and
-// `--invite` answer them from `--answers` or from a flag, and an explicit false skips one without
-// asking.
+// `--invite` answer them from `--answers` or from a flag — including in the short run, where the
+// invitation is not asked — and an explicit false skips one without asking.
 
 /**
  * Ask, and run, the two finishing steps. Returns which of them ran to completion, so the summary
  * says what is left rather than repeating what was done.
+ *
+ * The short run asks the password and settles there: a password is something no machine can make,
+ * which is why it is one of the three things the short path asks for — while the first invitation
+ * is a code carried to a phone, and the summary leaves its command for whoever is ready to enrol.
+ * `--invite` still runs it, short run or long.
  */
-async function finishByHand({ answers, terminal, report, state, resolved, spawn }) {
+async function finishByHand({ answers, terminal, report, state, resolved, spawn, approach = 'advanced' }) {
     /** `true`/`false` when an answer or a flag decided it, `null` when nobody has yet. */
     const answered = (key) => {
         const value = answers[key];
@@ -1396,6 +1496,10 @@ async function finishByHand({ answers, terminal, report, state, resolved, spawn 
         const status = spawn(process.execPath, [path.join(__dirname, 'admin.js'), ...args], {
             cwd: state.dir, stdio: 'inherit', env: childEnv(),
         });
+        // The command owns the terminal while it runs and leaves the cursor wherever its own
+        // output ended. The wizard no longer knows what is on the screen above it, so it stops
+        // accounting for the rows it drew and lets what the command said stay there.
+        report.forget();
         return status === 0;
     };
 
@@ -1413,8 +1517,10 @@ async function finishByHand({ answers, terminal, report, state, resolved, spawn 
     }
 
     let invite = false;
-    if (answered('invite') ?? (await askNow('Invite somebody now? It prints a one-time code for their'
-        + ' phone, which is what lets them install the app and sign in.'))) {
+    const inviteWanted = answered('invite') ?? (approach === 'advanced'
+        ? await askNow('Invite somebody now? It prints a one-time code for their phone')
+        : false);
+    if (inviteWanted) {
         const admin = (resolved.directory?.users || state.directory?.users || [])
             .find((user) => user.admin && user.enabled !== false) || null;
         if (!admin) {
@@ -1528,7 +1634,9 @@ async function runSetup({
 
     // The two steps only a person can do, asked and run rather than left as next steps. With no
     // terminal the questions are not asked and the commands are not run; the summary says so.
-    const done = await finishByHand({ answers, terminal, report, state, resolved, spawn });
+    const done = await finishByHand({
+        answers, terminal, report, state, resolved, spawn, approach: resolved.approach,
+    });
 
     reportSummary(report, state, resolved, {
         verified,
@@ -1563,4 +1671,7 @@ module.exports = {
     tailnetName,
     parsePeople,
     parsePersonLine,
+    shortIdFrom,
+    ownBindAddress,
+    DEFAULT_PUSH_RELAY_URL,
 };

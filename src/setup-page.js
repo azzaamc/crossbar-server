@@ -42,7 +42,9 @@ const crypto = require('node:crypto');
 const http = require('node:http');
 
 const { modeConfigured } = require('./config');
-const { SetupRefusal, hostAddresses, readState, runSetup } = require('./setup');
+const {
+    SetupRefusal, hostAddresses, readState, runSetup, DEFAULT_PUSH_RELAY_URL,
+} = require('./setup');
 
 /** The one bind this page takes without being asked, and the only one that needs no justification. */
 const DEFAULT_BIND = '127.0.0.1';
@@ -228,6 +230,17 @@ th { font-weight: 600; font-size: 0.78rem; text-transform: uppercase; letter-spa
 
     <form id="setup">
         <fieldset>
+            <legend>How much to ask</legend>
+            <label>Basic, or advanced?
+                <span>Basic asks for the modes, the people and the console password, and works everything else out; advanced asks for every setting, with a value offered for each — the same two ways of running the command line wizard</span>
+                <select data-answer="approach">
+                    <option value="basic" selected>Basic</option>
+                    <option value="advanced">Advanced</option>
+                </select>
+            </label>
+        </fieldset>
+
+        <fieldset>
             <legend>Modes</legend>
             <label>How will people reach this deployment?
                 <span>over your Tailscale network only, over the open internet, or both</span>
@@ -278,8 +291,8 @@ th { font-weight: 600; font-size: 0.78rem; text-transform: uppercase; letter-spa
 
         <fieldset>
             <legend>The directory</legend>
-            <label>One person per line: "id, display name, login, admin"
-                <span>the id is a short username and the display name is what the app shows; the login and the word "admin" may be left blank</span>
+            <label>One person per line: "display name, login, admin"
+                <span>the id everybody else knows them by is derived from the display name — "Abdullah Al-Faisal" becomes abdullah-al-faisal; the login and the word "admin" may be left blank</span>
                 <textarea data-answer="people" rows="5" autocomplete="off" spellcheck="false"></textarea>
             </label>
             <label>Or a directory file to use as the people
@@ -290,41 +303,17 @@ th { font-weight: 600; font-size: 0.78rem; text-transform: uppercase; letter-spa
 
         <fieldset>
             <legend>Relay and push</legend>
-            <label>A TURN server, for calls that cannot connect directly
-                <span>its hostname, e.g. relay.example.com; blank for no relay</span>
+            <label>The call relay, if it is not this server
+                <span>blank relays through this deployment's own address, which is what a deployment with no relay of its own wants; a hostname here may instead name a relay somewhere else</span>
                 <input data-answer="turnHost" autocomplete="off" spellcheck="false">
             </label>
             <label>Its shared secret
                 <span>blank generates one</span>
                 <input data-answer="turnSecret" autocomplete="off" spellcheck="false">
             </label>
-            <label>An Apple push key id, for ringing an iPhone whose screen is off
-                <span>from your Apple developer account, e.g. ABC123DE45; blank skips APNs</span>
-                <input data-answer="apnsKeyId" autocomplete="off" spellcheck="false">
-            </label>
-            <label>APNs team id
-                <span>e.g. TEAM123456</span>
-                <input data-answer="apnsTeamId" autocomplete="off" spellcheck="false">
-            </label>
-            <label>The .p8 key file on this server
-                <span>e.g. /etc/crossbar/apns.p8</span>
-                <input data-answer="apnsKeyPath" autocomplete="off" spellcheck="false">
-            </label>
-            <label>The app's bundle id
-                <span>e.g. com.example.crossbar</span>
-                <input data-answer="apnsTopic" autocomplete="off" spellcheck="false">
-            </label>
-            <label>A VAPID public key, for waking a browser tab that is closed
-                <span>blank skips Web Push</span>
-                <input data-answer="vapidPublicKey" autocomplete="off" spellcheck="false">
-            </label>
-            <label>The VAPID private key
-                <span>a long base64 string</span>
-                <input data-answer="vapidPrivateKey" autocomplete="off" spellcheck="false">
-            </label>
-            <label>The VAPID contact subject
-                <span>a mailto: or a URL, e.g. mailto:you@example.com</span>
-                <input data-answer="vapidSubject" autocomplete="off" spellcheck="false">
+            <label>The push relay phones are rung through
+                <span>blank uses the shared relay, ${DEFAULT_PUSH_RELAY_URL}; whichever is in force is named in the summary, and the token that goes with it is set in .env</span>
+                <input data-answer="pushRelayUrl" autocomplete="off" spellcheck="false">
             </label>
         </fieldset>
 

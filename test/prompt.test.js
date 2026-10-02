@@ -358,6 +358,67 @@ test('a keypress means what Clack means by it, and a field takes what a person t
     assert.equal(steps.textStep(typed, stroke('', { name: 'left' })).caret, 2);
 });
 
+test('the next step takes the previous one off the screen, and the last note stays', async (t) => {
+    // The whole of requirement one: a question is a bounded area, and the question after it erases
+    // that area rather than being printed under it. The screen holds the current step, not the
+    // history of the run.
+    const where = terminal(t);
+    const first = where.ui.text({ message: 'the first question', defaultValue: 'one' });
+    await press(where.input, '\r');
+    assert.equal(await first, 'one');
+    assert.deepEqual(screenOf(where.written(), 80), [
+        '│',
+        '◇  the first question',
+        '│  one',
+    ]);
+
+    const second = where.ui.text({ message: 'the second question', defaultValue: 'two' });
+    await press(where.input, '\r');
+    assert.equal(await second, 'two');
+    // One frame on the screen: the first question is nowhere in what a person is looking at.
+    assert.deepEqual(screenOf(where.written(), 80), [
+        '│',
+        '◇  the second question',
+        '│  two',
+    ]);
+
+    // A note between two questions is a step too: it replaces the question before it, and the
+    // question after replaces it. Nothing of either is left above the last frame.
+    const noted = terminal(t);
+    const asked = noted.ui.text({ message: 'a question', defaultValue: 'x' });
+    await press(noted.input, '\r');
+    assert.equal(await asked, 'x');
+    noted.ui.note('the derived id, said between two questions', 'The directory');
+    const notedScreen = screenOf(noted.written(), 80);
+    assert.match(notedScreen[1], /^◇  The directory ─+╮$/);
+    assert.equal(notedScreen.some((line) => line.includes('a question')), false,
+        `the question above the note is still there: ${notedScreen.join(' / ')}`);
+
+    // The last note is a thing that stays: the outro after it is drawn under it rather than over
+    // it, so the summary this wizard ends with is still on the screen.
+    const summary = terminal(t);
+    summary.ui.note('Modes      private', 'Crossbar setup');
+    const afterNote = screenOf(summary.written(), 80);
+    summary.ui.outro('Set up.');
+    const afterOutro = screenOf(summary.written(), 80);
+    assert.deepEqual(afterOutro.slice(0, afterNote.length), afterNote, 'the summary is still there');
+    assert.equal(afterOutro.at(-1), '└  Set up.');
+
+    // A command the wizard ran in this terminal takes the region with it: what it printed is not
+    // the wizard's to erase, so `forget` stops accounting for it and the next step draws under it.
+    // This is asserted on what was written and not on `screenOf`, whose model of a bare `\n` is not
+    // a cooked terminal's (a note is drawn with the escape sequences and `\n`, which a terminal
+    // translates to a carriage return as well — the frames a prompt draws use `\r\n` themselves).
+    const afterACommand = terminal(t);
+    afterACommand.ui.note('a note before the command', 'Before');
+    const beforeForget = afterACommand.written().length;
+    afterACommand.ui.forget();
+    afterACommand.ui.note('a note after it', 'After');
+    const between = afterACommand.written().slice(beforeForget);
+    assert.equal(between.includes('\u001b[0J'), false, 'the region was erased after the command');
+    assert.match(afterACommand.written(), /After/, 'the note after the command is missing');
+});
+
 test('a run with no terminal is refused, and nothing is written anywhere', () => {
     const written = [];
     // Not a terminal on either end: an empty stream is exactly what a pipe, a file and a service's
