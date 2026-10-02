@@ -111,9 +111,17 @@ run install -d -m 0755 "$STAGE/crossbar-server-$VERSION"
 # second build embeds the first. Measured 2026-09-26: successive builds of one commit produced
 # 316K, 1.0M and 1.6M tarballs, each carrying the previous one inside it. Excluded here, so what
 # the tarball holds is the deployment rather than the last copy of it.
+#
+# `COPYFILE_DISABLE` because this is built on a Mac: without it, `tar` writes an AppleDouble `._name`
+# beside every entry that carries extended attributes, and an operator unpacking the release on a
+# Linux host meets `._test`, `._deploy`, `._.gitignore` and the rest of them. Measured 2026-10-02 on
+# the first real install-from-artefact run: 184 entries, and the `._` pairs were the first thing in
+# the listing. The `--exclude` is the belt to that braces, for a tree that already holds such files.
+export COPYFILE_DISABLE=1
 run tar -C "$SRC" -cf "$STAGE/tree.tar" \
     --exclude=./node_modules --exclude=./.git --exclude=./.env --exclude=./data \
-    --exclude='*.log' --exclude=./.DS_Store --exclude='./crossbar-server-*.tar.gz*' .
+    --exclude='*.log' --exclude=./.DS_Store --exclude='./._*' \
+    --exclude='./crossbar-server-*.tar.gz*' .
 run tar -C "$STAGE/crossbar-server-$VERSION" -xf "$STAGE/tree.tar"
 run rm -f "$STAGE/tree.tar"
 run tar -C "$STAGE" -czf "$OUT/$TARBALL" "crossbar-server-$VERSION"
