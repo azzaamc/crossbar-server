@@ -117,6 +117,11 @@ html, body {
 }
 
 .control .glyph { font-size: 16px; line-height: 1; }
+/* The user-agent's `[hidden] { display: none }` loses to `.control { display: flex }` above, so the
+   attribute on its own hides nothing — which is how an Answer button sat under a call nobody had
+   been invited to. Setting it from script instead would need an inline style, and the page is served
+   with `style-src 'self'`. */
+.control[hidden] { display: none; }
 .control[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); }
 .control.danger { border-color: #5a2a26; color: #f0c3bf; }
 .control:active { transform: scale(0.98); }
