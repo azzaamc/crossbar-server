@@ -546,8 +546,19 @@ install_public_front_door() { # install_public_front_door
     local dropin='/etc/systemd/system/caddy.service.d/crossbar-env.conf' tmp hostname bind
     if command -v caddy >/dev/null 2>&1; then
         say 'caddy is already installed'
-    elif ! run apt-get install -y caddy; then
-        die "apt could not install Caddy, and public mode is reached through it. Install it by hand (deploy/README.md §2.8 — its own package repository), then run this again: this step is re-applied, and nothing else about the deployment needs redoing."
+    else
+        if ! run apt-get install -y caddy; then
+            die "apt could not install Caddy, and public mode is reached through it. Install it by hand (deploy/README.md §2.8 — its own package repository), then run this again: this step is re-applied, and nothing else about the deployment needs redoing."
+        fi
+        # The binary, not the package. `apt-get install -y caddy` answers "caddy is already the
+        # newest version" for a package the system has registered but whose files are gone — the
+        # state a half-removed package leaves — and this step then dies at `env: 'caddy': No such
+        # file or directory` when it validates the Caddyfile, after the wizard has already
+        # succeeded. Measured 2026-10-02 on a first install. This is the same question the branch
+        # above asks, asked again after the install that was supposed to make it true.
+        if [ "$DRY_RUN" != '1' ] && ! command -v caddy >/dev/null 2>&1; then
+            die "apt reports caddy installed, but there is no caddy binary on PATH: the Caddyfile cannot be validated and public mode cannot be served. Reinstall it (deploy/README.md §2.8 — its own package repository), then run this again: this step is re-applied, and nothing else about the deployment needs redoing."
+        fi
     fi
 
     # A drop-in rather than an edit of the package's unit: an upgrade of Caddy replaces its unit
@@ -670,6 +681,14 @@ install_tailscale_package() {
     fi
     say 'installing Tailscale from its official install script (which adds its own package repository)'
     run_pipe 'curl -fsSL https://tailscale.com/install.sh | sh'
+    # The same fact `install_public_front_door` checks for Caddy, checked for the command this
+    # installer goes on to run: the install script answering 0 is not the same as `tailscale`
+    # existing, and a package the system has registered but whose binary is gone installs "fine"
+    # and leaves nothing to log in. Callers decide what the absence means — `install_tailscale`
+    # refuses and `prepare_tailscale` warns — so this returns rather than dies.
+    if [ "$DRY_RUN" != '1' ] && ! command -v "$TAILSCALE_BIN" >/dev/null 2>&1; then
+        return 1
+    fi
 }
 
 # Tailscale itself, installed, with `tailscaled` enabled and started. Split from the login below

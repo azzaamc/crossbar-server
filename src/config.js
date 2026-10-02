@@ -26,6 +26,10 @@ function loadDotEnv(filePath) {
 
 /** The file this configuration was read from — what a mode switch or a setting rewrites. */
 const ENV_FILE = path.resolve(process.cwd(), '.env');
+// What the environment held before `.env` reached it, captured here because `loadDotEnv` writes
+// into `process.env` and after that a name the file contributed is indistinguishable from one the
+// shell did. `environmentKeys` reports the names this project reads that were already there.
+const ENVIRONMENT_KEYS = Object.freeze(Object.keys(process.env));
 loadDotEnv(ENV_FILE);
 
 // ── What a `.env` may name ──────────────────────────────────────────────────────
@@ -143,6 +147,26 @@ function unreadEnvKeys(content) {
         unread.push({ key: name, suggestion: nearestEnvKey(name) });
     }
     return unread;
+}
+
+/**
+ * The names this deployment reads that the environment already holds, so a `.env` line for one of
+ * them never takes effect.
+ *
+ * The counterpart of `unreadEnvKeys`: that one is a name in the file that nothing reads, and this
+ * one is a name read from the environment instead of the file. `loadDotEnv` never overwrites a
+ * name the environment already sets — which is what makes the plain names the supported override
+ * for a run that is not a deployment — so an *empty* value in a shell (`NETWORK_MODE_PRIVATE_ORIGIN=`)
+ * silently beats a perfectly good line in `.env`. Measured 2026-10-02 on a first install, the
+ * operator's shell made `node src/admin.js password` refuse with "PUBLIC_ORIGIN or
+ * NETWORK_MODE_PRIVATE_ORIGIN must be an absolute URL" while `.env` held both origins correctly.
+ *
+ * Only the names on `ENV_KEYS` are reported: those are the ones this project reads, and the ones
+ * the wizard hands its children, so one of them is worth saying and anything else the shell
+ * carries is another tool's.
+ */
+function environmentKeys() {
+    return ENV_KEYS.filter((name) => ENVIRONMENT_KEYS.includes(name));
 }
 
 function bool(name, fallback = false) {
@@ -777,6 +801,7 @@ module.exports = {
     loadDotEnv,
     ENV_KEYS,
     unreadEnvKeys,
+    environmentKeys,
     bool,
     integer,
     text,

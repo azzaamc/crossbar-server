@@ -384,6 +384,41 @@ function modeConfiguredExitCode(mode, envPath) {
     return 1;
 }
 
+/**
+ * `node src/admin.js password` — the console's password, prompted twice and stored as a hash.
+ *
+ * Handled before `loadConfig`, deliberately, because a password is not a URL: this command reads
+ * and rewrites exactly one line of `.env`, and nothing about a mode, an origin or a secret has to
+ * resolve first. It used to run after `loadConfig`, so a file the server cannot load yet — the
+ * half-filled state `setup` exists for, or a name the environment has overridden — made it refuse
+ * with a message about origins (`PUBLIC_ORIGIN or NETWORK_MODE_PRIVATE_ORIGIN must be an absolute
+ * URL`) while the only file in play was the one it writes. Measured 2026-10-02 on a first install.
+ */
+async function setConsolePassword() {
+    const file = path.resolve(process.cwd(), '.env');
+    if (!fs.existsSync(file)) {
+        console.error('No .env here. Copy .env.example to .env first.');
+        return 1;
+    }
+    const tooShort = 'Use at least 12 characters: this one password is the whole of the console’s defence.';
+    const password = await askPassword('New console password',
+        (value) => (value.length < 12 ? tooShort : undefined));
+    if (password.length < 12) {
+        console.error(tooShort);
+        return 1;
+    }
+    if (password !== await askPassword('Again')) {
+        console.error('They did not match.');
+        return 1;
+    }
+    writeEnvFile(file, setEnvLine(fs.readFileSync(file, 'utf8'),
+        'CROSSBAR_ADMIN_PASSWORD_HASH', auth.hashPassword(password)));
+    console.log('Set, as a hash — the password itself is nowhere on this machine.');
+    console.log('It takes effect on the next start:');
+    console.log('  systemctl restart crossbar');
+    return 0;
+}
+
 async function main(argv) {
     const { command, options, positional } = parseArgs(argv);
     if (!command || command === 'help' || command === '--help') {
@@ -450,8 +485,15 @@ async function main(argv) {
         }
     }
 
+    // Handled before `loadConfig`, deliberately: a password is not a URL. The command needs
+    // nothing but the `.env` it reads one line from and writes one line back to, and a file the
+    // server cannot load yet must not stop it.
+    if (command === 'password') {
+        return setConsolePassword();
+    }
+
     const config = loadConfig();
-    // Opened only by the commands that need one, so `mode`, `password` and `doctor` work on a
+    // Opened only by the commands that need one, so `mode` and `doctor` work on a
     // box whose deployment is not complete yet — which is exactly when they are run.
     const store = NEEDS_STORE.has(command) ? openStore(config) : null;
     const now = new Date().toISOString();
@@ -551,31 +593,6 @@ async function main(argv) {
                 // device, and the registration it left at the relay outlives it.
                 await releaseAtRelay(config, store, deviceId);
                 return removed ? 0 : 1;
-            }
-
-            case 'password': {
-                const file = path.resolve(process.cwd(), '.env');
-                if (!fs.existsSync(file)) {
-                    console.error('No .env here. Copy .env.example to .env first.');
-                    return 1;
-                }
-                const tooShort = 'Use at least 12 characters: this one password is the whole of the console’s defence.';
-                const password = await askPassword('New console password',
-                    (value) => (value.length < 12 ? tooShort : undefined));
-                if (password.length < 12) {
-                    console.error(tooShort);
-                    return 1;
-                }
-                if (password !== await askPassword('Again')) {
-                    console.error('They did not match.');
-                    return 1;
-                }
-                writeEnvFile(file, setEnvLine(fs.readFileSync(file, 'utf8'),
-                    'CROSSBAR_ADMIN_PASSWORD_HASH', auth.hashPassword(password)));
-                console.log('Set, as a hash — the password itself is nowhere on this machine.');
-                console.log('It takes effect on the next start:');
-                console.log('  systemctl restart crossbar');
-                return 0;
             }
 
             case 'mode': {

@@ -46,7 +46,7 @@ const { spawnSync } = require('node:child_process');
 
 const {
     MODES, MODE_REQUIRED, applyMode, modeBlock, modeConfigured, setEnvLine, verifyEnvFile,
-    writeEnvFile, writtenMode,
+    writeEnvFile, writtenMode, ENV_KEYS, environmentKeys,
 } = require('./config');
 const directoryFile = require('./directory');
 const prompts = require('./prompt');
@@ -68,6 +68,24 @@ function generateSecret() {
 }
 
 /**
+ * The environment a command this wizard starts gets: everything this process has, minus every
+ * name this deployment reads out of `.env`.
+ *
+ * The wizard runs as the deployment's account in a shell a person is logged into, and every
+ * command it starts — `admin.js password`, `admin.js enroll` — inherits that shell. A name the
+ * shell happens to carry (an empty `NETWORK_MODE_PRIVATE_ORIGIN=`, a value exported for something
+ * else) then beats the file the wizard just wrote, and the child reads the shell rather than the
+ * deployment. Removing the names lets the child load `.env` fresh, which is exactly what the
+ * service does through `EnvironmentFile`; what is left — `PATH`, `HOME`, `TS_AUTHKEY` — is what a
+ * child genuinely needs from here.
+ */
+function childEnv(environment = process.env) {
+    const env = { ...environment };
+    for (const name of ENV_KEYS) delete env[name];
+    return env;
+}
+
+/**
  * The tailnet name this machine is already reachable at, or `''` — `tailscale status --json`'s
  * `Self.DNSName` with the trailing dot dropped, which is the same value the front door will serve
  * and the same one `diagnostics`' private check reasons about.
@@ -80,7 +98,9 @@ function generateSecret() {
  * and a real run leaves it as `tailscale` on `PATH`.
  */
 function tailnetName(command = 'tailscale') {
-    const result = spawnSync(command, ['status', '--json'], { encoding: 'utf8', timeout: TAILSCALE_TIMEOUT_MS });
+    const result = spawnSync(command, ['status', '--json'], {
+        encoding: 'utf8', timeout: TAILSCALE_TIMEOUT_MS, env: childEnv(),
+    });
     if (result.error || result.status !== 0 || !result.stdout) return '';
     try {
         const dnsName = JSON.parse(result.stdout)?.Self?.DNSName;
@@ -169,8 +189,8 @@ function joinTailnet({ command, dir, report, terminal, authkey, spawn }) {
     // with the key in the environment, which is where `tailscale up` reads it from, so it appears
     // in neither the process list nor the transcript.
     const options = authkey
-        ? { stdio: 'inherit', env: { ...process.env, TS_AUTHKEY: authkey } }
-        : { stdio: 'inherit' };
+        ? { stdio: 'inherit', env: { ...childEnv(), TS_AUTHKEY: authkey } }
+        : { stdio: 'inherit', env: childEnv() };
     const status = spawn(command, ['up', '--hostname', hostname], options);
     const after = String(tailnetName(command) || '');
     if (status === 0 && after) {
@@ -325,9 +345,14 @@ function settingIn(content, name, fallback = '') {
 function readState(dir) {
     const envPath = path.join(dir, '.env');
     const templatePath = path.join(dir, '.env.example');
+    const template = fs.existsSync(templatePath) ? fs.readFileSync(templatePath, 'utf8') : '';
     const hasEnv = fs.existsSync(envPath);
-    const content = hasEnv ? fs.readFileSync(envPath, 'utf8')
-        : (fs.existsSync(templatePath) ? fs.readFileSync(templatePath, 'utf8') : '');
+    const content = hasEnv ? fs.readFileSync(envPath, 'utf8') : template;
+    // `install.sh` seeds `.env` by copying `.env.example` a moment before this runs, so an `.env`
+    // byte-for-byte equal to the template is an unconfigured deployment rather than a re-run of
+    // something. The intro says which, because "this deployment already has a .env" on a first
+    // install reads like a second one.
+    const seeded = hasEnv && template !== '' && content === template;
     const directoryPath = path.resolve(dir, settingIn(content, 'DIRECTORY_CONFIG_PATH', './data/directory.json'));
 
     let directory = null;
@@ -345,6 +370,7 @@ function readState(dir) {
         envPath,
         templatePath,
         hasEnv,
+        seeded,
         content,
         written: writtenMode(content),
         block: Object.fromEntries(MODES.map((mode) => [mode, modeBlock(content, mode)])),
@@ -1254,13 +1280,16 @@ function chosenPairs(state, resolved) {
     pairs.push(['Relay', resolved.turnHost
         ? `${resolved.turnHost} · shared secret ${secretWord(resolved.secrets.turnFrom)}`
         : 'not configured — calls still work, but some networks will fail']);
-    const push = [
-        resolved.apns.keyId || resolved.apns.topic ? `APNs ${resolved.apns.keyId}${resolved.apns.topic ? ` (${resolved.apns.topic})` : ''}` : '',
-        resolved.vapid.publicKey ? 'Web Push' : '',
-    ].filter(Boolean);
-    pairs.push(['Push', push.length
-        ? push.join(' · ')
-        : 'not configured — a phone whose screen is off cannot be rung, and a closed browser cannot be woken']);
+    // APNs and Web Push are two optional features with two different consequences, so they are
+    // two rows: a missing APNs key is a phone whose screen is off that cannot be rung, and a
+    // missing VAPID pair is a closed browser tab that cannot be woken. One row said both, which
+    // read as one feature and made each half's absence sound like the other's.
+    pairs.push(['APNs', resolved.apns.keyId || resolved.apns.topic
+        ? `${resolved.apns.keyId}${resolved.apns.topic ? ` (${resolved.apns.topic})` : ''}`
+        : 'not configured — a phone whose screen is off cannot be rung']);
+    pairs.push(['Web Push', resolved.vapid.publicKey
+        ? 'configured — a closed browser tab can be woken'
+        : 'not configured — a closed browser cannot be woken']);
     // "session" is the one secret whose purpose a name cannot carry, and the one whose replacement
     // signs every device out (`--new-secrets`): said here, where the value is reported.
     pairs.push(['Secrets', `session (what signs a device in) ${secretWord(resolved.secrets.sessionFrom)}`
@@ -1360,9 +1389,13 @@ async function finishByHand({ answers, terminal, report, state, resolved, spawn 
     const askNow = async (message) => (terminal
         ? Boolean(await terminal.confirm({ message, initialValue: true }))
         : false);
+    // The child reads `.env` itself, as the service does; it is handed no name this deployment
+    // reads, so a value in the operator's shell cannot beat the file (`childEnv`).
     const runInTerminal = (args, title, note) => {
         report.note(note, title);
-        const status = spawn(process.execPath, [path.join(__dirname, 'admin.js'), ...args], { cwd: state.dir, stdio: 'inherit' });
+        const status = spawn(process.execPath, [path.join(__dirname, 'admin.js'), ...args], {
+            cwd: state.dir, stdio: 'inherit', env: childEnv(),
+        });
         return status === 0;
     };
 
@@ -1436,7 +1469,21 @@ async function runSetup({
     const state = readState(dir);
     const { asker, terminal } = askLayer(ask);
     const report = makeReport(terminal, log);
-    report.intro(`Crossbar setup${state.hasEnv ? ' — this deployment already has a .env' : ''}`);
+    report.intro(`Crossbar setup${state.seeded
+        ? ' — a first setup: .env is the copy of .env.example the installer seeded'
+        : state.hasEnv ? ' — this deployment already has a .env' : ''}`);
+    // The counterpart of `unreadEnvKeys`: a name this project reads that the shell already holds
+    // beats `.env` in every command started from that shell, and the symptom names the setting
+    // rather than the shell it came from. Said once, up front, because it is the operator's shell
+    // that has to change and nothing later in the run would point there.
+    const fromEnvironment = environmentKeys();
+    if (fromEnvironment.length) {
+        report.note(`Set in this shell's environment, so read in preference to .env by every`
+            + ` command started from it — \`node src/admin.js ...\` included: ${fromEnvironment.join(', ')}.`
+            + ' A stale or empty value here names the setting in the symptom, not the shell it came'
+            + ' from. Unset them and run this again if that is not what you meant.',
+        'The environment is overriding .env');
+    }
     // The join happens inside, and only for a mode set that includes private: a public-only run
     // never spawns Tailscale.
     const resolved = await collectAnswers({

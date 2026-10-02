@@ -117,12 +117,23 @@ run install -d -m 0755 "$STAGE/crossbar-server-$VERSION"
 # Linux host meets `._test`, `._deploy`, `._.gitignore` and the rest of them. Measured 2026-10-02 on
 # the first real install-from-artefact run: 184 entries, and the `._` pairs were the first thing in
 # the listing. The `--exclude` is the belt to that braces, for a tree that already holds such files.
+#
+# `--no-xattrs` because the attributes themselves are a second, independent way the same thing
+# leaks: `COPYFILE_DISABLE` stops the `._name` files, but libarchive still writes a
+# `LIBARCHIVE.xattr.com.apple.provenance` pax header for every entry that carries an attribute —
+# and macOS itself puts that attribute on every file it creates, so that is every entry. GNU tar on
+# the deploying host then prints `tar: Ignoring unknown extended header keyword
+# 'LIBARCHIVE.xattr.com.apple.provenance'` once per entry while unpacking: measured 2026-10-02 on
+# the built artefact, 92 entries and 92 warnings. BSD tar *hides* pax headers when it lists with
+# `-t`, which is how an earlier check of these passed while doing nothing — verify with GNU tar
+# (`gtar`), never with the macOS tar that wrote the archive. `--no-xattrs` is accepted by both GNU
+# tar and bsdtar, so the script still builds on either host.
 export COPYFILE_DISABLE=1
-run tar -C "$SRC" -cf "$STAGE/tree.tar" \
+run tar -C "$SRC" -cf "$STAGE/tree.tar" --no-xattrs \
     --exclude=./node_modules --exclude=./.git --exclude=./.env --exclude=./data \
     --exclude='*.log' --exclude=./.DS_Store --exclude='./._*' \
     --exclude='./crossbar-server-*.tar.gz*' .
-run tar -C "$STAGE/crossbar-server-$VERSION" -xf "$STAGE/tree.tar"
+run tar -C "$STAGE/crossbar-server-$VERSION" -xf "$STAGE/tree.tar" --no-xattrs
 run rm -f "$STAGE/tree.tar"
 # Deleted rather than merely excluded, because excluding them from the *inner* tar is not enough on
 # macOS: `tar` there restores extended attributes on extraction and writes a `._name` beside them
@@ -131,7 +142,7 @@ run rm -f "$STAGE/tree.tar"
 # the release with GNU tar on the host, not with the BSD tar that wrote it: that one *hides* these
 # entries when it lists them, which is how the mistake survived a check.
 run find "$STAGE/crossbar-server-$VERSION" -name '._*' -delete
-run tar -C "$STAGE" -czf "$OUT/$TARBALL" "crossbar-server-$VERSION"
+run tar -C "$STAGE" -czf "$OUT/$TARBALL" --no-xattrs "crossbar-server-$VERSION"
 
 # `sha256sum` on Debian, `shasum -a 256` on the Mac this may be built on. Both write
 # `<hash>  <name>` and both verify with `-c`, so the file means the same thing on either host and
